@@ -58,3 +58,21 @@ glfw
 PyOpenGL
 # pytorch-lightning is needed only to unpickle the Omnidata checkpoint, not for training.
 pytorch-lightning
+# einops is the only runtime dependency of the vendored VGGT (thirdparty/vggt) that we did not
+# already have. It is pure Python with no dependencies of its own, so it cannot perturb the
+# torch/numpy resolution above.
+#
+# VGGT itself is deliberately NOT listed here: its own requirements pin torch==2.3.1 and
+# numpy==1.26.1, which collide with the pins at the top of this file, so `uv pip compile` would
+# fail or try to downgrade torch. It is vendored as the git submodule thirdparty/vggt (pinned to
+# a288dd0f14786c93483e45524328726ab7b1b4ce) and imported via sys.path, the same way this repo
+# already vendors lietorch and the rasterizer. `git submodule update --init` fetches it.
+einops
+# 3D reconstruction metrics for scripts/eval_recon.py, which run_replica.py and the full-run A/B
+# scripts call. trimesh was already imported by eval_recon.py but never installed, so that script
+# could not run at all before this. Both are numpy-only, so unlike VGGT they resolve cleanly here
+# and need no vendoring. The eval package's config.py hard-codes the author's cluster path for
+# ground-truth meshes, but that is dead code for us: run_evaluation prefers full_path_to_gt_ply,
+# which eval_recon.py always supplies.
+trimesh
+evaluate_3d_reconstruction @ git+https://github.com/eriksandstroem/evaluate_3d_reconstruction_lib@9b3cc08be5440db9c375cc21e3bd65bb4a337db7

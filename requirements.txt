@@ -43,6 +43,8 @@ contourpy==1.3.3
 cycler==0.12.1
 dash==4.4.0
 decorator==5.3.1
+einops==0.8.2
+evaluate-3d-reconstruction @ git+https://github.com/eriksandstroem/evaluate_3d_reconstruction_lib@9b3cc08be5440db9c375cc21e3bd65bb4a337db7
 evo==1.37.0
 executing==2.2.1
 fastjsonschema==2.21.2
@@ -154,6 +156,7 @@ torchmetrics==1.9.0
 torchvision==0.24.0+cu130
 tqdm==4.69.0
 traitlets==5.15.1
+trimesh==4.12.2
 triton==3.5.0
 typing-extensions==4.16.0
 typing-inspection==0.4.2

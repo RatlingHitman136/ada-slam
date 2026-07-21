@@ -156,3 +156,5 @@ cache
 data
 figures/*.pdf
 outputs
+*.safetensors
+pretrained_models/vggt/*

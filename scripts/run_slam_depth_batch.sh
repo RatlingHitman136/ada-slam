@@ -15,7 +15,7 @@
 # Scenes to process. Replica has: room0 room1 room2 office0 office1 office2 office3 office4
 SCENES=(room0 room1 room2 office0 office1 office2 office3 office4)
 
-FRACTION=40            # percent of each sequence to process (frames = N * FRACTION / 100)
+FRACTION=100            # percent of each sequence to process (frames = N * FRACTION / 100)
 START=0                # first frame index; use with FRACTION to take a middle/late slice
 
 DATA_ROOT=data/Replica            # expects <DATA_ROOT>/<scene>/colors and optionally /depths
