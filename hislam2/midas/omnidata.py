@@ -73,7 +73,9 @@ class OmnidataModel:
 
         self.model = DPTDepthModel(backbone=self.backbone, num_channels=self.channel)
 
-        checkpoint = torch.load(self.model_path, map_location=device)
+        # torch >= 2.6 defaults weights_only=True; the Omnidata checkpoint is a full
+        # pytorch-lightning pickle, so it needs the permissive loader.
+        checkpoint = torch.load(self.model_path, map_location=device, weights_only=False)
         assert "state_dict" in checkpoint, "No state_dict found in checkpoint"
 
         state_dict = {}

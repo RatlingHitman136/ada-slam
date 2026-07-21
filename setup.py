@@ -18,12 +18,10 @@ setup(
             extra_compile_args={
                 'cxx': ['-O3'],
                 'nvcc': ['-O3',
-                    '-gencode=arch=compute_60,code=sm_60',
-                    '-gencode=arch=compute_61,code=sm_61',
-                    '-gencode=arch=compute_70,code=sm_70',
-                    '-gencode=arch=compute_75,code=sm_75',
-                    '-gencode=arch=compute_80,code=sm_80',
-                    '-gencode=arch=compute_86,code=sm_86',
+                    # CUDA 13 dropped Pascal/Volta: nvcc hard-errors on compute_60/61/70.
+                    # Ada (RTX 40xx) is sm_89; the PTX line keeps forward compatibility.
+                    '-gencode=arch=compute_89,code=sm_89',
+                    '-gencode=arch=compute_89,code=compute_89',
                 ]
             }),
     ],
@@ -48,12 +46,10 @@ setup(
             extra_compile_args={
                 'cxx': ['-O2'], 
                 'nvcc': ['-O2',
-                    '-gencode=arch=compute_60,code=sm_60', 
-                    '-gencode=arch=compute_61,code=sm_61', 
-                    '-gencode=arch=compute_70,code=sm_70', 
-                    '-gencode=arch=compute_75,code=sm_75',
-                    '-gencode=arch=compute_80,code=sm_80',
-                    '-gencode=arch=compute_86,code=sm_86',                 
+                    # CUDA 13 dropped Pascal/Volta: nvcc hard-errors on compute_60/61/70.
+                    # Ada (RTX 40xx) is sm_89; the PTX line keeps forward compatibility.
+                    '-gencode=arch=compute_89,code=sm_89',
+                    '-gencode=arch=compute_89,code=compute_89',
                 ]
             }),
     ],
