@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <cstdint>   // gcc 13 + CUDA 13 no longer pull this in transitively (uint32_t)
+
 #include <iostream>
 #include <vector>
 #include "rasterizer.h"
