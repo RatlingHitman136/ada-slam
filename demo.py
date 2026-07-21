@@ -93,6 +93,7 @@ if __name__ == '__main__':
 
     parser.add_argument("--droidvis", action="store_true")
     parser.add_argument("--gsvis", action="store_true")
+    parser.add_argument("--dump_slam_depth", action="store_true", help="dump post-global-BA SLAM depth + poses to slam_depth.npz")
 
     parser.add_argument("--start", type=int, default=0, help="start frame")
     parser.add_argument("--length", type=int, default=100000, help="number of frames to process")

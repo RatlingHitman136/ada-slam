@@ -149,6 +149,23 @@ class Hi2:
         self.backend(4)
         self.backend(8)
         del self.backend
+
+        # dump the tracker's own depth while disps/disps_up/poses are still mutually
+        # consistent - traj_filler re-upsamples disps_up and gs.finalize overwrites poses
+        if getattr(self.args, 'dump_slam_depth', False):
+            t = self.video.counter.value
+            out = f'{self.args.output}/slam_depth.npz'
+            np.savez_compressed(out,
+                tstamp      = self.video.tstamp[:t].cpu().numpy(),
+                disps       = self.video.disps[:t].cpu().numpy(),
+                disps_up    = self.video.disps_up[:t].numpy(),
+                poses       = self.video.poses[:t].cpu().numpy(),
+                images      = self.video.images[:t].numpy(),
+                intrinsics  = self.video.intrinsics[0].cpu().numpy() * 8,
+                dscales     = self.video.dscales[:t].cpu().numpy(),
+                disps_prior = self.video.disps_prior[:t].cpu().numpy())
+            print(f'saved SLAM depth for {t} keyframes to {out}')
+
         poses_pos = self.video.poses[:self.video.counter.value].clone()
         dposes = SE3(poses_pos).inv() * SE3(poses_pre)
         dscale = torch.ones(self.video.counter.value, 1)
