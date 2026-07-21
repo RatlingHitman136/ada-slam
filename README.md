@@ -56,34 +56,47 @@
   </ol>
 </details>
 
-## Update (12. May 2025)
-We have made updates to the CUDA kernel in HI-SLAM2. As a result, it is necessary to recompile the kernel. Please run the following command after pulling the latest changes to ensure everything works properly:
-```Bash
-python setup.py install
-```
-
 ## Getting Started
+
+This fork targets **CUDA 13 / PyTorch 2.9 / Python 3.12** — the upstream conda + CUDA 11.8
+instructions no longer apply. Setup is a single script.
+
 1. Clone the repo with submodules
 ```Bash
-git clone --recursive https://github.com/Willyzw/HI-SLAM2
+git clone --recursive git@github.com:RatlingHitman136/ada-slam.git
+cd ada-slam
 ```
 
-2. Create a new Conda environment and then activate it. Please note that we use the PyTorch version compiled by CUDA 11.8 in the `environment.yaml` file.
+2. Run the setup script
 ```Bash
-conda env create -f environment.yaml
-conda activate hislam2
+./setup_env.sh --with-weights
 ```
 
-3. Compile the CUDA kernel extensions (takes about 10 minutes). Please note that this process assume you have CUDA 11 installed, not 12. To look into the installed CUDA version, you can run `nvcc --version` in the terminal.
-```Bash
-python setup.py install
-```
+That one command:
+- installs [uv](https://docs.astral.sh/uv/) into `~/.local/bin` if it is not already there
+- fetches the submodules and applies `patches/lietorch.patch` — lietorch is a git submodule, so
+  its CUDA 13 fixes cannot be committed to this repo directly and ship as a patch instead
+- creates a venv at `.venv` and installs the pinned dependencies from `requirements.txt`
+- compiles the four CUDA extensions (~10 minutes)
+- verifies that real CUDA kernels actually execute
 
-4. Download the pretrained weights of Omnidata models for generating depth and normal priors
-```Bash
-wget https://zenodo.org/records/10447888/files/omnidata_dpt_normal_v2.ckpt -P pretrained_models
-wget https://zenodo.org/records/10447888/files/omnidata_dpt_depth_v2.ckpt -P pretrained_models
-```
+`--with-weights` additionally downloads the 3.9 GB Omnidata depth/normal checkpoints into
+`pretrained_models/`; drop the flag if you already have them. The script is safe to re-run —
+every step detects work that is already done and skips it. Add `--force-rebuild` to recompile
+the extensions.
+
+Useful knobs:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TORCH_CUDA_ARCH_LIST` | `8.9+PTX` | Target GPU arch — `8.6+PTX` for A6000/3090, `9.0+PTX` for H100 |
+| `ADASLAM_VENV` | `<repo>/.venv` | Where the venv is created |
+| `CUDA_MODULE` | `cuda/13.0.1` | lmod module to load when `nvcc` is not on `PATH` |
+
+On non-Ada GPUs, also change `compute_89` in `setup.py` and `patches/lietorch.patch`.
+
+A CUDA toolkit (`nvcc`) is required to **build** the extensions, but not to run them — PyTorch
+ships its own CUDA runtime.
 
 ## Data Preparation
 ### Replica
