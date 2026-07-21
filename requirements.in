@@ -1,0 +1,60 @@
+# HI-SLAM2 dependencies for CUDA 13 / PyTorch 2.9 / Python 3.12.
+#
+# This is the hand-edited source file. It holds only the pins that are load-bearing,
+# i.e. the ones where a wrong resolution breaks the build. Everything else floats here
+# and gets locked to an exact version in requirements.txt.
+#
+#   edit this  ->  requirements.in
+#   install     ->  requirements.txt   (fully pinned, generated after a verified run)
+#
+# Install with (the index-strategy flag is REQUIRED, not optional -- see below):
+#   uv pip install --index-strategy unsafe-best-match -r requirements.in
+#
+# Regenerate the lockfile with:
+#   uv pip compile --index-strategy unsafe-best-match requirements.in -o requirements.txt
+#
+# Why --index-strategy unsafe-best-match: uv gives --extra-index-url *priority* over
+# --index-url, so PyPI wins for `torch` and the +cu130 builds are never seen, failing with
+# "no version of torch==2.9.0+cu130". The flag makes uv consider all indexes for every
+# package. Both indexes here are official (pytorch.org, pypi.org), so the dependency-
+# confusion risk the flag normally guards against does not apply.
+
+--index-url https://download.pytorch.org/whl/cu130
+--extra-index-url https://pypi.org/simple
+--find-links https://data.pyg.org/whl/torch-2.9.0+cu130.html
+
+# --- load-bearing pins ---
+# torch 2.9.0 is the newest release with a matching prebuilt torch-scatter cu130 wheel.
+# torch itself goes up to 2.13.0+cu130, but torch-scatter does not follow, and building
+# it from sdist means compiling CUDA by hand. Bump these three together or not at all.
+torch==2.9.0+cu130
+torchvision==0.24.0+cu130
+torch-scatter==2.1.2+pt29cu130
+
+# opencv-python 5.x is now `latest` on PyPI. An unpinned install silently pulls a brand-new
+# major release; HI-SLAM2 is written against the 4.x API.
+opencv-python<5
+
+# numpy 2.x is correct here and confirmed working (open3d 0.19 declares no upper bound).
+# This guard is only against a future 3.0.
+numpy<3
+
+# --- floats here, exact versions land in requirements.txt ---
+ninja
+scipy
+matplotlib
+pyyaml
+tqdm
+rich
+munch
+plyfile
+imgviz
+timm
+torchmetrics
+evo
+open3d
+PyGLM
+glfw
+PyOpenGL
+# pytorch-lightning is needed only to unpickle the Omnidata checkpoint, not for training.
+pytorch-lightning
