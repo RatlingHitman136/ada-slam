@@ -1,11 +1,14 @@
-"""LoRA-adapt VGGT on HI-SLAM2 SLAM depth + poses (prototype).
+"""LoRA-adapt VGGT on HI-SLAM2's own depth + poses (prototype).
 
 One keyframe = one sample, placed FIRST in the sequence so VGGT's predictions land in that
 keyframe's coordinate frame (verified: extrinsic[0] is identity to 5e-4). Around it we attach a
 random number of neighbouring non-keyframe frames, so the adapter works both monocular - the way
 MotionFilter.prior_extractor calls it today - and with a few frames of context.
 
-  depth supervision : frame 0 only (we only have SLAM depth for keyframes)
+  depth supervision : frame 0 only (we only have depth for keyframes), from the directory
+                      export_slam_depth.py --depth_source wrote - Gaussian-rendered by default,
+                      which is both closer to GT and rendered from the same post-refinement
+                      trajectory that traj_full.txt below holds
   pose supervision  : all frames, from traj_full.txt, rebased to the keyframe
 
 Only the aggregator (main transformer) is adapted; depth_head, camera_head and patch_embed stay
@@ -55,10 +58,24 @@ DEPTH_SPACE = 'depth'                   # 'disparity' (as HI-SLAM2 consumes it) 
 COUPLED_SCALE = False                   # True = one scale shared by depth and pose
 SUPERVISE_FOV = False
 
-VGGT_HW = (294, 518)                    # 21x14 by 37x14
+VGGT_HW = (294, 518)                    # 21x14 by 37x14; aspect 1.76, suits Replica's 344x616
 SEED = 0
 
 # ==============================================================================
+
+
+def parse_hw(s):
+    """'H,W' -> (H, W), validated against VGGT's 14x14 patch grid.
+
+    Worth overriding per dataset: data.frame() resizes straight to VGGT_HW without letterboxing,
+    so a mismatched aspect ratio squashes the image off VGGT's training distribution. TUM's
+    400x544 stream (aspect 1.36) wants 378,518, not the Replica default.
+    """
+    h, w = (int(x) for x in s.replace('x', ',').split(','))
+    if h % 14 or w % 14:
+        raise ValueError(f'--vggt_hw {h},{w}: both dims must be divisible by 14')
+    return h, w
+
 
 
 # ------------------------------------------------------------------ LoRA
@@ -123,9 +140,15 @@ def tum_to_c2w(row):
 
 
 class SceneData:
-    def __init__(self, scene_dir, image_dir):
+    def __init__(self, scene_dir, image_dir, depth_source='rendered'):
         self.scene_dir, self.image_dir = scene_dir, image_dir
         self.files = sorted(os.listdir(image_dir))
+
+        # written by export_slam_depth.py --depth_source; both hold float32 .npy in SLAM units
+        self.ddir, self.mdir = f'depth_{depth_source}', f'mask_{depth_source}'
+        if not os.path.isdir(f'{scene_dir}/{self.ddir}'):
+            raise SystemExit(f'{scene_dir}/{self.ddir} not found - re-run export_slam_depth.py '
+                             f'with --depth_source {depth_source}')
 
         traj = np.loadtxt(f'{scene_dir}/traj_full.txt')
         self.c2w = {int(r[0]): tum_to_c2w(r) for r in traj}
@@ -135,6 +158,7 @@ class SceneData:
         # intrinsics: stored at the tracker's 344x616, rescale to the VGGT input size
         fx, fy, cx, cy = np.load(f'{scene_dir}/intrinsics.npy')
         probe = mono_stream_resize(cv2.imread(os.path.join(image_dir, self.files[0])))
+        self.stream_hw = probe.shape[:2]
         sy, sx = VGGT_HW[0] / probe.shape[0], VGGT_HW[1] / probe.shape[1]
         self.K = np.array([[fx * sx, 0, cx * sx], [0, fy * sy, cy * sy], [0, 0, 1]], np.float64)
 
@@ -144,8 +168,8 @@ class SceneData:
         return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
     def kf_target(self, t):
-        d = np.load(f'{self.scene_dir}/depth_slam/{t:06d}.npy')
-        m = cv2.imread(f'{self.scene_dir}/mask_slam/{t:06d}.png', cv2.IMREAD_GRAYSCALE) > 127
+        d = np.load(f'{self.scene_dir}/{self.ddir}/{t:06d}.npy')
+        m = cv2.imread(f'{self.scene_dir}/{self.mdir}/{t:06d}.png', cv2.IMREAD_GRAYSCALE) > 127
         d = cv2.resize(d, (VGGT_HW[1], VGGT_HW[0]), interpolation=cv2.INTER_NEAREST)
         m = cv2.resize(m.astype(np.uint8), (VGGT_HW[1], VGGT_HW[0]), interpolation=cv2.INTER_NEAREST) > 0
         return torch.from_numpy(d).float(), torch.from_numpy(m & (d > 0))
@@ -276,21 +300,39 @@ def eval_depth(model, data, single_view=True):
 # ------------------------------------------------------------------ main
 
 def main():
+    global VGGT_HW
     ap = argparse.ArgumentParser()
     ap.add_argument('--scene', default='outputs/replica/room0_p40')
     ap.add_argument('--images', default='data/Replica/room0/colors')
     ap.add_argument('--epochs', type=int, default=EPOCHS)
     ap.add_argument('--steps', type=int, default=STEPS_PER_EPOCH)
     ap.add_argument('--skip_eval', action='store_true')
+    ap.add_argument('--vggt_hw', default=None, metavar='H,W',
+                    help=f'VGGT input size, dims divisible by 14 (default {VGGT_HW[0]},{VGGT_HW[1]}). '
+                         'Match the stream aspect ratio; TUM wants 378,518.')
+    ap.add_argument('--depth_source', choices=('rendered', 'slam'), default='rendered',
+                    help='which export_slam_depth.py target to supervise on (default rendered)')
     args = ap.parse_args()
+
+    if args.vggt_hw:
+        VGGT_HW = parse_hw(args.vggt_hw)
 
     torch.manual_seed(SEED)
     rng = np.random.default_rng(SEED)
     out = f'{args.scene}/lora-vggt'
     os.makedirs(out, exist_ok=True)
 
-    data = SceneData(args.scene, args.images)
-    print(f"scene {args.scene}: {len(data.kf)} keyframes, frames {data.t_min}..{data.t_max}")
+    data = SceneData(args.scene, args.images, args.depth_source)
+    print(f"scene {args.scene}: {len(data.kf)} keyframes, frames {data.t_min}..{data.t_max}, "
+          f"supervised on {data.ddir}/")
+    sh, sw = data.stream_hw
+    skew = (VGGT_HW[1] / VGGT_HW[0]) / (sw / sh)
+    print(f"stream {sw}x{sh} (aspect {sw/sh:.3f}) -> VGGT {VGGT_HW[1]}x{VGGT_HW[0]} "
+          f"(aspect {VGGT_HW[1]/VGGT_HW[0]:.3f}), squash {skew:.3f}x")
+    if not 0.95 < skew < 1.05:
+        print(f"  WARNING: aspect ratios differ by {abs(1-skew)*100:.0f}%. data.frame() resizes "
+              f"without letterboxing, so VGGT sees a distorted image. Consider --vggt_hw "
+              f"{14*round(518*sh/sw/14)},518")
 
     model, n_wrapped = load_model()
     trainable = [p for p in model.parameters() if p.requires_grad]
@@ -347,6 +389,7 @@ def main():
     cfg = {'rank': RANK, 'alpha': ALPHA, 'targets': list(LORA_TARGETS),
            'lora_patch_embed': LORA_PATCH_EMBED, 'epochs': args.epochs, 'steps': args.steps,
            'lr': LR, 'lambda_pose': LAMBDA_POSE, 'depth_space': DEPTH_SPACE,
+           'depth_source': args.depth_source,
            'coupled_scale': COUPLED_SCALE, 'p_single_view': P_SINGLE_VIEW,
            'max_left': MAX_LEFT, 'max_right': MAX_RIGHT, 'radius': RADIUS,
            'vggt_hw': list(VGGT_HW), 'weights': WEIGHTS, 'scene': args.scene,

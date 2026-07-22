@@ -10,28 +10,37 @@
 
 # ==============================================================================
 #  PARAMETERS
+#
+#  Every value below can be overridden from the environment, so the same script serves other
+#  datasets without a fork. With nothing set it behaves exactly as it always has (Replica).
+#    SCENES=rgbd_dataset_freiburg1_room DATA_ROOT=data/TUM ... ./scripts/run_slam_depth_batch.sh
 # ==============================================================================
 
-# Scenes to process. Replica has: room0 room1 room2 office0 office1 office2 office3 office4
-SCENES=(room0 room1 room2 office0 office1 office2 office3 office4)
+# Scenes to process, space-separated. Replica has:
+#   room0 room1 room2 office0 office1 office2 office3 office4
+read -ra SCENES <<< "${SCENES:-room0 room1 room2 office0 office1 office2 office3 office4}"
 
-FRACTION=100            # percent of each sequence to process (frames = N * FRACTION / 100)
-START=0                # first frame index; use with FRACTION to take a middle/late slice
+FRACTION=${FRACTION:-100}   # percent of each sequence to process (frames = N * FRACTION / 100)
+START=${START:-0}      # first frame index; use with FRACTION to take a middle/late slice
 
-DATA_ROOT=data/Replica            # expects <DATA_ROOT>/<scene>/colors and optionally /depths
-OUT_ROOT=outputs/replica          # symlinked to /storage/user/treh/adaslam_outputs
-CONFIG=config/replica_config.yaml
-CALIB=calib/replica.txt
+DATA_ROOT=${DATA_ROOT:-data/Replica}       # expects <DATA_ROOT>/<scene>/colors and optionally /depths
+OUT_ROOT=${OUT_ROOT:-outputs/replica}      # symlinked to /storage/user/treh/adaslam_outputs
+CONFIG=${CONFIG:-config/replica_config.yaml}
+CALIB=${CALIB:-calib/replica.txt}
+BUFFER=${BUFFER:-}     # keyframe buffer; empty = demo.py's default of N/10 + 150. Real handheld
+                       # data keyframes far more densely than Replica's 89-per-2000 - set it.
 
-FILTER_THRESH=0.005    # depth_filter disparity agreement threshold (larger = looser mask)
-MIN_COUNT=2            # min agreeing neighbours out of 6 (lower = looser mask, more pixels)
+DEPTH_SOURCE=${DEPTH_SOURCE:-rendered}  # training target: rendered (Gaussian) | slam (1/disps_up)
 
-SKIP_EXISTING=1        # 1 = skip scenes that already have slam_depth.npz
-MIN_FREE_VRAM_MB=8000  # abort if the shared GPU has less than this free
+FILTER_THRESH=${FILTER_THRESH:-0.005}  # depth_filter disparity agreement threshold (larger = looser mask)
+MIN_COUNT=${MIN_COUNT:-2}   # min agreeing neighbours out of 6 (lower = looser mask, more pixels)
 
-VENV=/usr/stud/treh/envs/adaslam
-CUDA_MODULE=cuda/13.0.1
-TORCH_ARCH="8.9+PTX"
+SKIP_EXISTING=${SKIP_EXISTING:-1}      # 1 = skip scenes that already have slam_depth.npz
+MIN_FREE_VRAM_MB=${MIN_FREE_VRAM_MB:-8000}  # abort if the shared GPU has less than this free
+
+VENV=${VENV:-/usr/stud/treh/envs/adaslam}
+CUDA_MODULE=${CUDA_MODULE:-cuda/13.0.1}
+TORCH_ARCH=${TORCH_ARCH:-8.9+PTX}
 
 # ==============================================================================
 
@@ -59,9 +68,10 @@ if [ "$FREE" -lt "$MIN_FREE_VRAM_MB" ]; then
 fi
 
 echo "scenes    : ${SCENES[*]}"
-echo "fraction  : ${FRACTION}% from frame ${START}"
+echo "data      : ${DATA_ROOT}  (config ${CONFIG}, calib ${CALIB})"
+echo "fraction  : ${FRACTION}% from frame ${START}${BUFFER:+, buffer ${BUFFER}}"
 echo "output    : ${OUT_ROOT}/<scene>_p${FRACTION}"
-echo "mask      : filter_thresh=${FILTER_THRESH} min_count=${MIN_COUNT}"
+echo "target    : depth_${DEPTH_SOURCE}/  (mask filter_thresh=${FILTER_THRESH} min_count=${MIN_COUNT})"
 echo "GPU free  : ${FREE} / ${TOTAL} MiB"
 echo
 
@@ -84,7 +94,12 @@ for SCENE in "${SCENES[@]}"; do
     fi
     mkdir -p "$OUT"
 
-    # GT depths are optional - absent for own-data captures, which just disables the table
+    # GT depths are optional - absent for own-data captures, which just disables the table.
+    # They go to the EXPORT only, never to demo.py: eval_utils.py:50-52 zeroes the rendered depth
+    # wherever GT is invalid, and on real sensors (TUM: 24% holes, on exactly the hard surfaces)
+    # that would both shrink the training set and tie its mask to where the Kinect happened to
+    # work. The export table is unaffected - it masks on (gt > 0) & mask anyway. All that is lost
+    # is final_result.json's mean_l1, which is meaningless on a monocular run regardless.
     GT=()
     [ -d "$SEQ/depths" ] && GT=(--gtdepthdir "$SEQ/depths")
 
@@ -95,8 +110,9 @@ for SCENE in "${SCENES[@]}"; do
         echo "[$SCENE] slam_depth.npz exists - skipping SLAM run"
     else
         T0=$SECONDS
+        BUF=(); [ -n "$BUFFER" ] && BUF=(--buffer "$BUFFER")
         python demo.py \
-            --imagedir "$SEQ/colors" "${GT[@]}" \
+            --imagedir "$SEQ/colors" "${BUF[@]}" \
             --config "$CONFIG" --calib "$CALIB" --output "$OUT" \
             --start "$START" --length "$LEN" \
             --dump_slam_depth > "$OUT/log.txt" 2>&1
@@ -109,7 +125,7 @@ for SCENE in "${SCENES[@]}"; do
     fi
 
     python scripts/export_slam_depth.py \
-        --result "$OUT" "${GT[@]}" \
+        --result "$OUT" "${GT[@]}" --depth_source "$DEPTH_SOURCE" \
         --filter_thresh "$FILTER_THRESH" --min_count "$MIN_COUNT" \
         2>&1 | grep -v Warning | tee "$OUT/export.txt"
     if [ ! -f "$OUT/poses_slam.txt" ]; then
@@ -126,7 +142,7 @@ echo "SUMMARY"
 printf '  %-12s %7s %7s %9s   %s\n' scene kfs rendered size "depth L1 (global scale)"
 for SCENE in "${DONE[@]}"; do
     OUT="$OUT_ROOT/${SCENE}_p${FRACTION}"
-    KFS=$(find -L "$OUT/depth_slam" -name '*.npy' | wc -l)
+    KFS=$(find -L "$OUT/depth_$DEPTH_SOURCE" -name '*.npy' 2>/dev/null | wc -l)
     REND=$(find -L "$OUT/renders/depth_after_opt" -type f 2>/dev/null | wc -l)
     SIZE=$(du -sh "$OUT" | cut -f1)
     L1=$(awk '/SLAM depth/{s=$NF} /Gaussian-rendered/{r=$NF} /Omnidata/{o=$NF}

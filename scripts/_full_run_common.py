@@ -51,6 +51,8 @@ def build_parser(description):
     p.add_argument('--length', type=int, default=100000)
     p.add_argument('--voxel_size', type=float, default=0.006)
     p.add_argument('--mesh_weight', type=float, default=2.0)
+    p.add_argument('--skip_mesh', action='store_true',
+                   help='no GT mesh for this dataset (TUM RGB-D); skip TSDF + eval_recon')
     p.add_argument('--weights', default=os.path.join(_ROOT, 'pretrained_models/droid.pth'))
     p.add_argument('--buffer', type=int, default=-1)
     p.add_argument('--undistort', action='store_true')
@@ -235,7 +237,7 @@ def evaluate(args, label):
         res['hislam2_eval'] = json.load(open(pj))
 
     res['render'] = split_render_metrics(args)
-    res['mesh'] = run_mesh(args)
+    res['mesh'] = None if args.skip_mesh else run_mesh(args)
 
     json.dump(res, open(f'{args.output}/ab_results.json', 'w'), indent=2, default=float)
     return res
@@ -271,7 +273,9 @@ def main(label, patch=None, extra_args=None):
         extra_args(parser)
     args = parser.parse_args()
     if patch is not None:
-        patch(args)                       # installs the depth prior before Hi2 is built
+        # installs the depth prior before Hi2 is built; may refine the label now that it knows
+        # which variant of the prior it actually loaded
+        label = patch(args) or label
     if not args.skip_slam:
         torch.multiprocessing.set_start_method('spawn')
         n_kf = run_slam(args)

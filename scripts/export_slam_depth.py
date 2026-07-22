@@ -1,9 +1,19 @@
-"""Export the SLAM depth dumped by `demo.py --dump_slam_depth` into training-ready files.
+"""Export the depth produced by `demo.py --dump_slam_depth` into training-ready files.
 
 Reads slam_depth.npz (written in Hi2.terminate() right after global BA) and produces per-keyframe
 depth / mask / image files plus a TUM pose list. With --gtdepthdir it also reports scale-aligned
 depth L1 for the SLAM depth, the Gaussian-rendered depth and the JDSA-aligned Omnidata prior, so
 the three can be compared as supervision targets.
+
+`--depth_source` picks which of them is exported:
+
+    rendered (default)  renders/depth_after_opt/, the Gaussian map's expected depth
+    slam                1/disps_up straight from the npz
+
+Rendered wins on measured accuracy (0.0133 vs 0.0324 m global-scale L1 on Replica room0) and on
+consistency: it is rendered from the post-refinement trajectory that traj_full.txt also holds,
+while the npz is deliberately dumped *before* gs.finalize() overwrites video.poses (hi2.py:155).
+Both write float32 .npy, so only the directory name differs downstream.
 
 Depths stay in raw SLAM units (mean depth ~= 2.0, set by video.normalize() with
 scale_multiplier: 2.0). They are not metric; the comparison below fits a global scale first.
@@ -66,6 +76,10 @@ def main():
     parser.add_argument("--filter_thresh", type=float, default=0.005, help="disparity agreement threshold")
     parser.add_argument("--min_count", type=int, default=2, help="min agreeing neighbours out of 6")
     parser.add_argument("--no_export", action="store_true", help="only report metrics, write nothing")
+    parser.add_argument("--depth_source", choices=('rendered', 'slam'), default='rendered',
+                        help="which depth to export as the training target: the Gaussian-rendered "
+                             "depth (default, ~2.4x closer to GT and consistent with traj_full.txt) "
+                             "or the tracker's own 1/disps_up")
     args = parser.parse_args()
 
     d = np.load(f'{args.result}/slam_depth.npz')
@@ -88,20 +102,50 @@ def main():
     depth[~np.isfinite(depth)] = 0.0
 
     if not args.no_export:
-        for sub in ('depth_slam', 'mask_slam', 'image'):
+        # 'rendered' is the Gaussian map's expected depth after the colour refinement. It is the
+        # better target on two counts: measurably closer to GT (0.0133 vs 0.0324 m on Replica
+        # room0), and rendered from the SAME post-refinement trajectory that traj_full.txt holds,
+        # whereas 1/disps_up is dumped before the refinement overwrites video.poses (hi2.py:155).
+        ddir, mdir = f'depth_{args.depth_source}', f'mask_{args.depth_source}'
+        for sub in (ddir, mdir, 'image'):
             os.makedirs(f'{args.result}/{sub}', exist_ok=True)
+
+        kept, missing = [], []
         for i in range(K):
             idx = int(tstamp[i])
-            np.save(f'{args.result}/depth_slam/{idx:06d}.npy', depth[i].astype(np.float32))
-            cv2.imwrite(f'{args.result}/mask_slam/{idx:06d}.png', (mask[i] * 255).astype(np.uint8))
+            if args.depth_source == 'rendered':
+                rf = f'{args.result}/renders/depth_after_opt/{idx:06d}.png'
+                if not os.path.exists(rf):
+                    missing.append(idx)
+                    continue
+                # dequantize once here so downstream keeps a single float32 .npy loader
+                dep = cv2.imread(rf, cv2.IMREAD_ANYDEPTH).astype(np.float32) / 6553.5
+            else:
+                dep = depth[i].astype(np.float32)
+
+            np.save(f'{args.result}/{ddir}/{idx:06d}.npy', dep)
+            cv2.imwrite(f'{args.result}/{mdir}/{idx:06d}.png',
+                        ((mask[i] & (dep > 0)) * 255).astype(np.uint8))
             rgb = d['images'][i].transpose(1, 2, 0)          # stored RGB (mono_stream converts)
             cv2.imwrite(f'{args.result}/image/{idx:06d}.jpg', cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+            kept.append(i)
 
+        if not kept:
+            raise SystemExit(f"no {args.depth_source} depth found - "
+                             f"{args.result}/renders/depth_after_opt/ is empty or absent, so the "
+                             f"run probably died before eval_rendering")
+        if missing:
+            print(f"WARNING: {len(missing)} of {K} keyframes have no render and were skipped: "
+                  f"{missing[:8]}{' ...' if len(missing) > 8 else ''}")
+
+        # only the exported keyframes: lora_adapt_vggt.py takes its keyframe list from this file
+        # and would then look for depth files that were never written
         # same convention as demo.py save_trajectory: TUM, camera-to-world
         poses_wc = SE3(poses).inv().data.cpu().numpy()
         np.savetxt(f'{args.result}/poses_slam.txt',
-                   np.concatenate([tstamp[:, None], poses_wc], axis=1))
-        print(f"wrote depth_slam/ mask_slam/ image/ poses_slam.txt to {args.result}")
+                   np.concatenate([tstamp[kept][:, None], poses_wc[kept]], axis=1))
+        print(f"wrote {ddir}/ {mdir}/ image/ poses_slam.txt to {args.result} "
+              f"({len(kept)} keyframes)")
 
     if args.gtdepthdir is None:
         return
