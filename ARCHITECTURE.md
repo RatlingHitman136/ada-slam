@@ -9,7 +9,7 @@ Splatting map. It is built from three lineages, and the folder layout mirrors th
 | **DROID-SLAM** | dense flow-based tracking, factor graph, dense BA | `hislam2/{factor_graph,track_*,depth_video,motion_filter}.py`, `hislam2/geom`, `hislam2/modules`, `src/` |
 | **Omnidata / DPT (MiDaS)** | monocular depth + normal priors | `hislam2/midas/` |
 | **MonoGS / 3DGS / RaDe-GS** | Gaussian map, rasterizer, GUI | `hislam2/gaussian/`, `thirdparty/diff-gaussian-rasterization` |
-| **VGGT** *(this fork, §9)* | alternative depth prior, LoRA-adapted on SLAM depth | `thirdparty/vggt`, `scripts/lora_adapt_vggt.py`, `scripts/run_full_vggt.py` |
+| **VGGT** *(this fork, §9)* | alternative depth prior, LoRA-adapted on SLAM depth | `thirdparty/vggt`, `scripts/run_pipeline.py`, `scripts/lora_adapt_vggt.py` |
 
 The HI-SLAM2-specific contributions on top of those are: **JDSA** (joint depth–scale
 adjustment, `geom/ba.py`), **PGBA** (Sim(3) pose-graph + bundle adjustment for loop closure,
@@ -70,7 +70,7 @@ and depth/normal priors and the Gaussian map run at full resolution (`disps_up`)
 
 | File | Purpose |
 |---|---|
-| `demo.py` | **Entry point.** Spawns a reader `Process` that decodes/resizes/undistorts images into a `Queue`, constructs `Hi2` lazily on the first frame (needs the image size), loops `hi2.track(...)` until the last frame, then `hi2.terminate()` and writes `traj_kf.txt`, `traj_full.txt`, `intrinsics.npy`. CLI: `--imagedir --calib --config --output --gtdepthdir --buffer --undistort --cropborder --start --length --droidvis --gsvis --dump_slam_depth`. `mono_stream` and `save_trajectory` are module-level and reused by the §9 scripts rather than duplicated. |
+| `demo.py` | **Entry point.** Spawns a reader `Process` that decodes/resizes/undistorts images into a `Queue`, constructs `Hi2` lazily on the first frame (needs the image size), loops `hi2.track(...)` until the last frame, then `hi2.terminate()` and writes `traj_kf.txt`, `traj_full.txt`, `intrinsics.npy`. CLI: `--imagedir --calib --config --output --gtdepthdir --buffer --undistort --cropborder --start --length --droidvis --gsvis --dump_slam_depth`. `scripts/run_pipeline.py` re-implements this loop (`mono_stream`, `save_trajectory`, `stream_resize`) rather than importing it, so the two must be kept in step by hand. |
 | `tsdf_integrate.py` | Post-process: fuses the **rendered** depth/colour images from `outputs/<seq>/renders/*_after_opt` with `traj_full.txt` into an Open3D `VoxelBlockGrid` and extracts a triangle mesh (`tsdf_mesh_w<weight>.ply`). Depth PNGs are 16-bit scaled by 6553.5. |
 | `setup.py` | Builds two CUDA extensions: `droid_backends` (from `src/`) and `lietorch` (from `thirdparty/lietorch`). Fork change: gencode fixed to `compute_89/sm_89` (CUDA 13 rejects Pascal/Volta arches). Note it calls `setup()` **twice**, so `pip install .` would only build the first — use `python setup.py install`. |
 | `setup_env.sh` | One-shot environment bootstrap: installs `uv`, syncs submodules (`--force`), applies `patches/lietorch.patch`, loads the `cuda/13.0.1` lmod module, creates `.venv`, installs `requirements.txt`, builds all four extensions, optionally downloads the Omnidata weights (`--with-weights`), then verifies real kernels execute. Idempotent; `--force-rebuild` recompiles. |
@@ -305,15 +305,15 @@ Vendored DPT/MiDaS code, used **only** for inference of the Omnidata checkpoints
 | `download_replica.sh` | Downloads the **NICE-SLAM rendered** Replica sequences + culled GT meshes into `data/Replica`. (Not the raw Facebook Replica release.) |
 | `preprocess_replica.py` | Symlinks `results/frame*` → `colors/`, `results/depth*` → `depths/`, converts `traj.txt` (4×4) to TUM format `traj_tum.txt`. |
 | `preprocess_scannet.py` | Writes `calib.txt` from `intrinsic_color.txt` and converts per-frame pose files to a single TUM `traj.txt` (NaN poses zeroed). |
-| `preprocess_tum.py` | Turns a raw TUM RGB-D sequence into the Replica layout (§10): associates rgb↔depth↔groundtruth by timestamp, undistorts both images and depth, crops the undistortion border, rescales depth 5000→6553.5, and writes `colors/%06d.png depths/%06d.png traj_tum.txt calib.txt`. Undistortion happens **here** rather than via `demo.py --undistort`, because `_full_run_common.py:31 stream_resize` does not undistort when re-deriving GT frames. |
+| `preprocess_tum.py` | Turns a raw TUM RGB-D sequence into the Replica layout (§10): associates rgb↔depth↔groundtruth by timestamp, undistorts both images and depth, crops the undistortion border, rescales depth 5000→6553.5, and writes `colors/%06d.png depths/%06d.png traj_tum.txt calib.txt`. Undistortion happens **here** rather than via `demo.py --undistort`, because `run_pipeline.py:stream_resize` does not undistort when re-deriving GT frames. |
 | `preprocess_owndata.py` | For casual video: extracts every frame to `images/`, every 10th (max 100) to `images_colmap/`, runs the full COLMAP pipeline (OPENCV camera model) to estimate intrinsics, writes `calib.txt`. |
 | `run_replica.py` | Full Replica benchmark: runs `demo.py` per sequence, `evo_ape` for ATE, reads the render metrics, runs TSDF fusion at 6 mm, aligns the mesh with the evo Sim(3) transform, then `eval_recon.py`; averages everything. |
 | `run_scannet.py` | Same for the 8 selected ScanNet scenes (`--cropborder 12`, 15 mm voxels, keyframe-only render metrics, no 3D recon eval). |
 | `eval_recon.py` | Mesh evaluation: accuracy / completion / completion-ratio via KD-trees and `evaluate_3d_reconstruction`, plus an optional 2D depth-L1 metric that renders random in-room views of GT vs. reconstruction with Open3D. **Note:** its `trimesh` import was never satisfied before this fork installed it, so this script (and `run_replica.py`'s recon metrics) could not run at all. |
 
-The VGGT track adds eight more — see §9: `run_pipeline.py`, `export_slam_depth.py`,
-`run_slam_depth_batch.sh`, `lora_adapt_vggt.py`, `_full_run_common.py`,
-`run_full_{omnidata,vggt}.py`, `temp_run_ab_comparison.sh`, `run_tum_experiment.sh`.
+The VGGT track adds three more — see §9: `run_pipeline.py` (the one driver: extract → adapt →
+A/B test), plus `export_slam_depth.py` and `lora_adapt_vggt.py`, which remain as standalone
+single-stage tools.
 
 ---
 
@@ -321,7 +321,9 @@ The VGGT track adds eight more — see §9: `run_pipeline.py`, `export_slam_dept
 
 Five files: `replica_config.yaml`, `scannet_config.yaml`, `owndata_config.yaml`, `euroc_config.yaml`,
 `tum_config.yaml` (§10 — ScanNet's real-sensor preset with `skip_blur`, `pgba.active`, exposure
-compensation, and `mono_depth_alpha: 0.01`).
+compensation, and `mono_depth_alpha: 0.01`). `run_pipeline.py` generates a sixth at runtime,
+`OUT_EXTRACT/extract_config.yaml`, which `inherit_from`s one of these and overrides the keyframe
+thresholds for the extract run only (§9.2.1).
 
 - **`Dataset`** — `pcd_downsample(_init)`: how aggressively new Gaussians are subsampled from a
   keyframe; `point_size` + `adaptive_pointsize`: initial Gaussian scale; `scale_multiplier`:
@@ -365,20 +367,25 @@ Caveat on `final_result.json`'s `mean_l1`: `eval_utils.py:62` compares metric GT
 harness recomputes it after a global median-ratio scale fit (~0.02 m) — that is the meaningful
 number.
 
-With `--dump_slam_depth` and the §9 scripts, a run additionally produces:
+The §9 pipeline writes to two trees: `OUT_EXTRACT` (the training-data run) and
+`OUT_TEST/<scene>_<arm>/` (one per A/B arm). Each is a normal `outputs/<seq>/` as above, plus:
 
 ```
-slam_depth.npz            post-global-BA SLAM state: tstamp, disps (1/8), disps_up (full),
+OUT_EXTRACT/
+  extract_config.yaml     generated; inherit_from CONFIG + the EXTRACT_KF_* knobs. Extract only
+  slam_depth.npz          post-global-BA SLAM state: tstamp, disps (1/8), disps_up (full),
                           poses (w2c), images, intrinsics, dscales, disps_prior
-depth_<src>/%06d.npy      per-keyframe training depth, float32, SLAM units. <src> is
-                          export_slam_depth.py's --depth_source: `rendered` (default, the
-                          Gaussian map's expected depth) or `slam` (1/disps_up)
-mask_<src>/%06d.png       multi-view consistency mask (droid_backends.depth_filter) & depth > 0
-image/%06d.jpg            the matching keyframe RGB
-poses_slam.txt            keyframe poses, TUM c2w, same convention as traj_kf.txt
-export.txt                the depth-source accuracy table
-lora-vggt/                adapter.safetensors (~48 MB), config.json, train_log.json
-ab_results.json           A/B metrics, split seen/unseen
+  depth_<src>/%06d.npy    per-keyframe training depth, float32, SLAM units. <src> is
+                          DEPTH_SOURCE: `rendered` (the Gaussian map's expected depth) or
+                          `slam` (1/disps_up)
+  mask_<src>/%06d.png     multi-view consistency mask (droid_backends.depth_filter) & depth > 0
+  image/%06d.jpg          the matching keyframe RGB
+  poses_slam.txt          keyframe poses, TUM c2w, same convention as traj_kf.txt
+  export.txt              the depth-source accuracy table (read this first)
+  lora-vggt/              adapter.safetensors (~48 MB), config.json, train_log.json
+
+OUT_TEST/<scene>_<arm>/
+  ab_results.json         that arm's metrics, split seen/unseen at split_at
 ```
 
 ---
@@ -411,6 +418,9 @@ Known rough edges:
   points at it. Dead references.
 - `hislam2/gaussian/gui/gl_render/`, `midas/midas_net*.py`, `geom/graph_utils.py` and
   `DroidNet.forward` are vendored/training-path code not exercised by `demo.py`.
+- `scripts/run_pipeline.py` deliberately duplicates rather than imports: `demo.py`'s stream/track
+  loop, `export_slam_depth.py`'s export, and `lora_adapt_vggt.py`'s LoRA and losses all exist
+  twice. Self-containment was the trade — a fix in one copy does not reach the other.
 - `GSBackEnd` inherits `mp.Process` but is driven inline; mapping and tracking are
   serialised in the main process. The GUI, the DROID visualiser and `PGOBuffer.spin` are
   the only genuine extra processes (plus `demo.py`'s image reader).
@@ -430,77 +440,99 @@ Known rough edges:
 specifically **cross-frame scale inconsistency**: it is the only depth source that gets *worse*
 under a single global scale fit (0.0611 → 0.0836 m), while SLAM and Gaussian-rendered depth both
 improve. The idea is to LoRA-adapt VGGT on HI-SLAM2's own depth for a scene, then swap it in
-for Omnidata on the rest of that scene. The supervision target is the **Gaussian-rendered** depth
-by default (`--depth_source rendered`): it is 2.4× closer to GT than `1/disps_up` (0.0133 vs
+for Omnidata on the rest of that scene. The better supervision target is the **Gaussian-rendered**
+depth (`DEPTH_SOURCE = 'rendered'`): it is 2.4× closer to GT than `1/disps_up` (0.0133 vs
 0.0324 m global-scale L1 on room0) and, unlike the npz dump, it is produced from the same
-post-refinement trajectory that `traj_full.txt` supplies for the pose loss.
+post-refinement trajectory that `traj_full.txt` supplies for the pose loss. `run_pipeline.py`
+nevertheless currently ships `DEPTH_SOURCE = 'slam'`, matching the §9.4 Replica runs.
 
 ### 9.1 Pipeline
 
-Two ways to run it. `scripts/run_pipeline.py` is one self-contained file that does all three
-stages in one process, with every parameter a CAPITAL constant at its top (no CLI, no
-environment) — including knobs for how many keyframes the extract run produces and an 80/20
-train/val split of those keyframes for the adapter. The chain below is the original route, still
-the one to use for batching many Replica scenes at once (`run_slam_depth_batch.sh`).
+**`scripts/run_pipeline.py` is the only way to run it.** One self-contained file, three stages in
+one process, every parameter a CAPITAL constant in the block at its top — no CLI, no environment:
 
 ```
-demo.py --dump_slam_depth                        →  slam_depth.npz  (post-global-BA state)
-  └─ scripts/export_slam_depth.py                →  depth_slam/ mask_slam/ image/ poses_slam.txt
-       └─ scripts/run_slam_depth_batch.sh        (batch the above over scenes / sequence fractions)
-            └─ scripts/lora_adapt_vggt.py        →  <scene>/lora-vggt/adapter.safetensors
-                 └─ scripts/temp_run_ab_comparison.sh
-                      ├─ scripts/run_full_omnidata.py   (arm A, stock prior)
-                      └─ scripts/run_full_vggt.py       (arm B, adapted VGGT depth)
-                           └─ both via scripts/_full_run_common.py
+python scripts/run_pipeline.py        # from the repo root, adaslam venv active
+
+  1 extract   SLAM over the first FRACTION% of the sequence (generated extract_config.yaml)
+              → slam_depth.npz → depth_<src>/ mask_<src>/ image/ poses_slam.txt + export.txt
+  2 adapt     LoRA-adapt VGGT on a TRAIN subset of those keyframes, depth L1 reported on a
+              held-out VAL subset  → lora-vggt/adapter.safetensors
+  3 test      one full-sequence arm per entry in ARMS, differing ONLY in the depth prior,
+              then evo ATE → TSDF → Sim(3) align → eval_recon + render metrics, and a
+              comparison table split at the frame the adapter's training data ended
 ```
 
-`run_full_vggt.py --adapter none` runs stock VGGT-1B for a one-off sanity check; no driver
-exercises it.
+`ARMS` selects the arms: `omnidata` (baseline), `vggt_lora` (the adapted prior), and
+`vggt_base` (stock VGGT-1B, the §10.2 sanity arm, off by default). `STAGES` skips stages,
+`SKIP_EXISTING` reuses finished ones — `STAGES = ('test',)` re-runs just the A/B against an
+adapter already on disk.
+
+The earlier route — a shell/CLI chain of `run_slam_depth_batch.sh`, `run_full_{omnidata,vggt}.py`,
+`_full_run_common.py`, `temp_run_ab_comparison.sh` and `run_tum_experiment.sh` — has been
+**deleted**. Everything it did lives in `run_pipeline.py`; batching several scenes now means
+editing `SCENE` and re-running, or driving the file from a loop.
+
+Dataset preprocessing is deliberately *not* part of it: run `scripts/preprocess_tum.py` (or
+`preprocess_replica.py`) once by hand first.
 
 ### 9.2 The scripts
 
 | File | Purpose |
 |---|---|
-| `run_pipeline.py` | **The single-file entry point.** Extract → adapt → test in one process, no arguments and no environment variables: everything is a CAPITAL constant in the block at the top. Imports nothing from `demo.py` or the other drivers — the code it needs is inlined (`stream_resize` / `mono_stream` / `save_trajectory` / the SLAM loop from `demo.py`, the export and its accuracy table from `export_slam_depth.py`, LoRA + `SceneData` + losses from `lora_adapt_vggt.py`, the prior monkey-patch from `run_full_vggt.py`, ATE/mesh/render metrics from `_full_run_common.py`, the comparison table from `temp_run_ab_comparison.sh`) — but does import `hislam2/` and `thirdparty/vggt`, and still drives `evo_ape`, `tsdf_integrate.py` and `eval_recon.py` as subprocesses. Adds two things the chain below cannot do: `EXTRACT_KF_*` knobs that steer **how many keyframes the extract run produces**, written into a generated `extract_config.yaml` that `inherit_from`s the base config and is passed to the extract run *only* — the A/B arms are always handed the unmodified `CONFIG`, which `stage_test` asserts, so a denser training set can never masquerade as a tracking change in the comparison — note the binding gate is `keyframe_thresh`, not the motion filter: over 204 TUM frames `(thresh, keyframe_thresh) = (2.4, 4.0)` gave 43 keyframes, `(1.2, 4.0)` only 45, `(1.2, 1.5)` 83, because `track_frontend.py:49-52` prunes back whatever the motion filter proposes — and a **train/val split** of the exported keyframes (`LORA_TRAIN_FRAC`, `LORA_SPLIT_MODE`) so the adapter's depth L1 is reported on held-out keyframes instead of on its own training set. `STAGES` skips stages, `SKIP_EXISTING` reuses finished ones. |
-| `export_slam_depth.py` | Turns `slam_depth.npz` into training-ready per-keyframe files. `--depth_source` picks the target: `rendered` (default, from `renders/depth_after_opt/`) or `slam` (`1/disps_up`); both are written as float32 `.npy` so only the directory name differs downstream, and `poses_slam.txt` lists **only** the exported keyframes because `lora_adapt_vggt.py` takes its keyframe list from it. Builds the confidence mask with `droid_backends.depth_filter` (≥2 of 6 temporal neighbours agree — the recipe in `util/droid_visualization.py:104-110`; arrays **must** be sliced to the real keyframe count or trailing frames match unused buffer slots). Also reports scale-aligned depth L1 for SLAM vs Gaussian-rendered vs JDSA-aligned-Omnidata depth, in both per-frame and global-scale columns — the gap between those columns *is* the cross-frame-consistency diagnostic. |
-| `run_slam_depth_batch.sh` | Batches SLAM + export over scenes at a chosen sequence fraction (`FRACTION`), with a shared-GPU VRAM gate and skip-if-done. Params at top, each overridable from the environment so other datasets need no fork; the defaults are Replica. |
-| `lora_adapt_vggt.py` | The adaptation. One keyframe = one sample, placed **first** in the sequence so VGGT predicts in that keyframe's frame (verified: `extrinsic[0]` is identity to 5e-4, and rebased poses match SLAM GT to 0.04°). Depth supervises frame 0 only; poses supervise all frames, rebased to the keyframe. A random number of neighbouring non-keyframes ride along, so the adapter works monocular *and* with context. LoRA is hand-rolled (~40 lines, no `peft`): rank 16 on `attn.{qkv,proj}` + `mlp.{fc1,fc2}` across the aggregator's 24+24 blocks → 12.58 M trainable, 1.07 % of 1.17 B. Heads and `patch_embed` stay frozen; gradients reach the aggregator *through* them. |
-| `_full_run_common.py` | Shared A/B harness: replicates `demo.py`'s loop, then evo ATE → TSDF → **Sim(3) align** → `eval_recon.py`, and recomputes PSNR/SSIM/depth-L1 per frame from the saved renders so everything can be split seen/unseen. |
-| `run_full_{omnidata,vggt}.py` | The arms. Thin by design — sharing the harness is what keeps the comparison honest. `run_full_vggt.py` takes `--adapter none` for the un-adapted arm, and prefers the `vggt_hw` recorded in the adapter's `config.json` over `--vggt_hw`, so inference cannot silently run at a resolution the adapter never saw. |
-| `temp_run_ab_comparison.sh` | Runs arm A, then arm B, then prints the comparison (baseline absolute, then absolute + delta). Refuses to compare arms whose `split_at` disagrees. Params overridable from the environment; `GTMESH=` (empty) selects `--skip_mesh` for datasets with no GT mesh. Temporary/experimental. |
-| `run_tum_experiment.sh` | §10's single entry point: preprocess → SLAM+export → LoRA → A/B, each stage skip-if-done, with a VRAM re-check before every GPU stage. Threads one `DEPTH_SOURCE` through the export and the adaptation so the adapter cannot train on a target other than the one exported. |
+| `run_pipeline.py` | **The single entry point** — see §9.2.1 for what each stage does. Imports nothing from `demo.py` or from `scripts/`: the code it needs is inlined, so it depends only on `hislam2/`, `thirdparty/vggt`, and three CLIs it drives as subprocesses (`evo_ape`, `tsdf_integrate.py`, `scripts/eval_recon.py`). That self-containment is the point — the file is the experiment. |
+| `export_slam_depth.py` | Standalone version of the extract stage's second half, for when a `slam_depth.npz` already exists (e.g. from a bare `demo.py --dump_slam_depth`). Turns it into training-ready per-keyframe files. `--depth_source` picks the target: `rendered` (default, from `renders/depth_after_opt/`) or `slam` (`1/disps_up`); both are written as float32 `.npy` so only the directory name differs downstream, and `poses_slam.txt` lists **only** the exported keyframes because `lora_adapt_vggt.py` takes its keyframe list from it. Builds the confidence mask with `droid_backends.depth_filter` (≥2 of 6 temporal neighbours agree — the recipe in `util/droid_visualization.py:104-110`; arrays **must** be sliced to the real keyframe count or trailing frames match unused buffer slots). Also reports scale-aligned depth L1 for SLAM vs Gaussian-rendered vs JDSA-aligned-Omnidata depth, in both per-frame and global-scale columns — the gap between those columns *is* the cross-frame-consistency diagnostic. |
+| `lora_adapt_vggt.py` | Standalone version of the adapt stage (`run_pipeline.py` carries its own copy plus the train/val split). One keyframe = one sample, placed **first** in the sequence so VGGT predicts in that keyframe's frame (verified: `extrinsic[0]` is identity to 5e-4, and rebased poses match SLAM GT to 0.04°). Depth supervises frame 0 only; poses supervise all frames, rebased to the keyframe. A random number of neighbouring non-keyframes ride along, so the adapter works monocular *and* with context. LoRA is hand-rolled (~40 lines, no `peft`): rank 16 (`run_pipeline.py` defaults to 8) on `attn.{qkv,proj}` + `mlp.{fc1,fc2}` across the aggregator's 24+24 blocks → 12.58 M trainable, 1.07 % of 1.17 B. Heads and `patch_embed` stay frozen; gradients reach the aggregator *through* them. |
+
+Both standalone scripts predate `run_pipeline.py` and are the only surviving pieces of the old
+CLI chain; nothing drives them any more, and the A/B stage has no standalone equivalent at all.
+
+#### 9.2.1 Inside `run_pipeline.py`
+
+| Stage / part | What it does |
+|---|---|
+| `stage_extract` | Writes a generated `extract_config.yaml` that `inherit_from`s `CONFIG` and applies the `EXTRACT_KF_*` knobs, then runs SLAM over the first `FRACTION`% of the sequence with the `hi2.py` depth dump enabled, then exports. The generated config is given to **this run only**; `stage_test` asserts the arms get the unmodified `CONFIG`, so a denser training set can never masquerade as a tracking change in the comparison. Note the binding gate is `keyframe_thresh` (`EXTRACT_KF_REDUNDANT_THRESH`), not the motion filter: over 204 TUM frames `(thresh, keyframe_thresh) = (2.4, 4.0)` gave 43 keyframes, `(1.2, 4.0)` only 45, `(1.2, 1.5)` 83, because `track_frontend.py:49-52` prunes back whatever the motion filter proposes. GT depth is routed to the export only, never to `Hi2` (§9.3). |
+| `stage_adapt` | LoRA on VGGT, as in `lora_adapt_vggt.py`, plus a **train/val split** of the exported keyframes (`LORA_TRAIN_FRAC`, `LORA_SPLIT_MODE`) so depth L1 is reported on held-out keyframes rather than on the adapter's own training set. `LORA_KEEP_BEST` optionally snapshots on val improvement instead of saving the last epoch. |
+| `stage_test` | One full-sequence run per entry in `ARMS`, then `evaluate` + the comparison table. Captures the stock `MotionFilter.prior_extractor` **once** and restores it before every arm, so a VGGT arm's monkey-patch cannot leak into a later Omnidata arm and silently make it a second VGGT arm. |
+| `install_vggt_prior` / `vggt_prior_extractor` | The monkey-patch that swaps the depth prior. Normals stay Omnidata, so **depth is the only variable between arms**. Undoes `motion_filter.py`'s ImageNet normalisation (§9.3) and prefers the `vggt_hw` recorded in the adapter's `config.json` over the `VGGT_HW` constant, so inference cannot run at a resolution the adapter never saw. |
+| `run_ate` / `run_mesh` / `split_render_metrics` / `evaluate` | The metrics harness: evo ATE (Sim(3)-aligned), TSDF fuse → Sim(3)-align → `eval_recon.py` (skipped when `GT_MESH is None`, as on TUM), and PSNR/SSIM/depth-L1 recomputed per frame from the saved renders so every number can be **split seen/unseen** at `split_at`. `run_mesh` retries down `VOXEL_FALLBACKS` when marching cubes OOMs on the shared GPU and records which size won. |
+| `compare` | Prints the baseline in absolutes and every other arm as absolute + delta; refuses to print mesh rows when the arms' `voxel_size` disagree. |
+| `free_vram` / `gpu_gate` | Shared-workstation hygiene: `MIN_FREE_VRAM_MB` is re-checked before every GPU stage, and VRAM is force-released between stages (§8's last rough edge is why this is needed at all). |
 
 ### 9.3 Traps that silently corrupt results
 
 - **`prior_extractor` receives an ImageNet-normalised tensor** (`motion_filter.py:88-89`), but
-  VGGT expects `[0,1]` and normalises internally (`aggregator.py:205`). `run_full_vggt.py` undoes
-  it; forgetting to would just quietly make VGGT worse.
+  VGGT expects `[0,1]` and normalises internally (`aggregator.py:205`). `vggt_prior_extractor`
+  undoes it; forgetting to would just quietly make VGGT worse.
 - **The TSDF mesh must be Sim(3)-aligned before scoring.** SLAM scale is arbitrary (~1.3× here)
   and `eval_recon`'s ICP is rigid-only, so skipping the alignment gives ~0.7 m accuracy instead of
-  ~0.03 m. `run_replica.py:46` does this; the harness does too.
+  ~0.03 m. `run_replica.py:46` does this; `run_pipeline.py:run_mesh` does too.
 - **Scale estimates in the losses must not be detached.** Detaching makes a loss only *look*
   scale-invariant — the optimiser then sees a gradient rewarding a shrinking prediction, and
   translations collapse toward zero. This diverged the first overfit test 12×.
-- **Both A/B arms must use the same TSDF voxel size.** Marching-cubes allocation fails at 0.006
-  when the shared GPU is busy; the harness has a fallback ladder and records `voxel_size`, and the
-  comparison refuses to print mesh rows if the two arms disagree.
+- **Every A/B arm must use the same TSDF voxel size.** Marching-cubes allocation fails at 0.006
+  when the shared GPU is busy; `run_mesh` has a fallback ladder (`VOXEL_FALLBACKS`) and records
+  `voxel_size`, and `compare` refuses to print mesh rows if the arms disagree.
 - VGGT's aggregator returns `None` for uncached layers (only 4/11/17/23 are kept, deliberately,
   so layer indices stay stable — `aggregator.py:196`). Any per-frame slicing of the token list
   must preserve those `None`s.
 - **`VGGT_HW` must match the tracking stream's aspect ratio, and must match across VGGT arms.**
-  Both `lora_adapt_vggt.py:frame()` and `vggt_prior_extractor` resize straight to it with no
-  letterboxing, so a mismatched aspect squashes the image off VGGT's training distribution — the
-  `(294, 518)` default suits Replica's 344×616 but distorts TUM's 400×544 by ~30 %. Two guards:
-  `lora_adapt_vggt.py` warns and suggests a value when the ratios differ by >5 %, and
-  `run_full_vggt.py` reads the adapter's recorded `vggt_hw` in preference to the CLI. Any arm run
-  with `--adapter none` has no adapter to read, so it must be given `--vggt_hw` explicitly or it
-  would differ from the adapted arm in input resolution as well as in adaptation.
-- **Never pass `--gtdepthdir` to `demo.py` on a run whose renders will become training data.**
+  Both the adapter's `frame()` and `vggt_prior_extractor` resize straight to it with no
+  letterboxing, so a mismatched aspect squashes the image off VGGT's training distribution —
+  `(294, 518)` suits Replica's 344×616, and `run_pipeline.py`'s current `(378, 518)` suits TUM's
+  400×544, which the Replica value would distort by ~30 %. Two guards: the adapt stage warns and
+  suggests a value when the ratios differ by >5 %, and `install_vggt_prior` reads the adapter's
+  recorded `vggt_hw` in preference to the `VGGT_HW` constant. The `vggt_base` arm has no adapter
+  to read, so it silently takes `VGGT_HW` — set that to the value the adapted arm was trained at
+  or the two VGGT arms differ in input resolution as well as in adaptation.
+- **Never pass GT depth to `Hi2` on a run whose renders will become training data.**
   `eval_utils.py:50-52` zeroes the rendered depth wherever the GT depth is invalid. Replica's GT is
   dense so it is a no-op there, but TUM's Kinect GT is ~24 % holes sitting on exactly the hard
   surfaces (shiny, dark, far) — supervising on that discards a quarter of the pixels and ties the
-  training mask to where the sensor happened to work. `run_slam_depth_batch.sh` therefore routes
-  `--gtdepthdir` to `export_slam_depth.py` only. Nothing is lost: the export's accuracy table masks
+  training mask to where the sensor happened to work. `stage_extract` therefore calls `run_slam`
+  with `gtdepthdir=None` and hands `DEPTHS` to the export only; the same applies to a manual
+  `demo.py --dump_slam_depth` run, which must be given no `--gtdepthdir`. Nothing is lost: the
+  export's accuracy table masks
   on `(gt > 0) & mask` regardless, and the only casualty is `final_result.json`'s `mean_l1`, which
   §7 already documents as meaningless on a monocular run. The A/B arms *do* keep it — there the
   masking is correct, since depth cannot be scored where there is no GT.
@@ -523,9 +555,9 @@ not test the difficult-lighting premise that motivated the work.
 Experiment outputs live in `outputs/ab_{depth,disp}_p{40,100}/` (the `depth`/`disp` suffix is
 `DEPTH_SPACE`, the `p` number the sequence fraction the adapter trained on).
 
-Note those runs predate `--depth_source` and supervised on `slam` depth (`1/disps_up`), which is
-the less accurate target and is dumped *before* the refinement that produces the poses they were
-trained against. `--depth_source slam` reproduces them exactly.
+Note those runs predate the choice of supervision target and used `slam` depth (`1/disps_up`),
+which is the less accurate target and is dumped *before* the refinement that produces the poses
+they were trained against. `DEPTH_SOURCE = 'slam'` reproduces them exactly.
 
 §10 moves the same experiment onto real data, which is what the Replica null asks for next.
 
@@ -538,14 +570,11 @@ Replica cannot test the premise: it is synthetic, well-lit and slow-moving. TUM 
 auto-exposure, a genuine loop, sparse and holed GT depth. Nothing needs downloading; the sequence
 is mirrored at `/storage/group/dataset_mirrors/01_incoming/TUM_RGBD_Dataset/`.
 
-**One command runs everything:** `./scripts/run_tum_experiment.sh` (~2 h 15, four skip-if-done
-stages: preprocess → SLAM+export → LoRA → A/B). Parameters at the top of the file; `STAGES=lora`
-re-runs a single stage.
-
-`python scripts/run_pipeline.py` is the single-file alternative for the last three of those
-stages (preprocessing stays `preprocess_tum.py`, run once by hand). Prefer it when tuning: it is
-the only route with keyframe-density knobs and a held-out val set for the adapter, and every
-parameter is in one block instead of spread over three shell headers.
+**Two commands run everything:** `python scripts/preprocess_tum.py` once (§10.1), then
+`python scripts/run_pipeline.py` (~2 h 15 for extract → adapt → A/B). Every parameter is a
+constant at the top of `run_pipeline.py`; `STAGES` re-runs a single stage and `SKIP_EXISTING`
+reuses what is already on disk. `SCENE` selects the sequence — `rgbd_dataset_freiburg1_desk` at
+the moment, `rgbd_dataset_freiburg1_room` for the loop-closure case described below.
 
 ### 10.1 Making TUM look like Replica
 
@@ -558,16 +587,17 @@ Two properties of its output are load-bearing:
   `lora_adapt_vggt.py:131` keys poses by `int(timestamp)`, and `1305031910.765238` truncates to the
   same integer for ~30 consecutive frames, silently collapsing the pose dict.
 - **`colors/` and `depths/` 1:1 by index.** `eval_utils.py:47`, `export_slam_depth.py:122` and
-  `_full_run_common.py:193` all index GT depth by RGB frame number. `run_tum_experiment.sh` asserts
-  this before any GPU work.
+  `run_pipeline.py:split_render_metrics` all index GT depth by RGB frame number.
+  `run_pipeline.py:main` asserts this before any GPU work.
 
-**Undistortion happens offline, not via `demo.py --undistort/--cropborder`.**
-`_full_run_common.py:31 stream_resize` re-derives the GT frame with resize only, so the runtime
-flags would compare undistorted renders against distorted GT. Preprocessing undistorts colour
+**Undistortion happens offline, not via `UNDISTORT`/`CROP_BORDER` (or `demo.py
+--undistort/--cropborder`).** `split_render_metrics` re-derives the GT frame with `stream_resize`
+only, so the runtime flags would compare undistorted renders against distorted GT — `main()` warns
+if either is set. Preprocessing undistorts colour
 (bilinear) and depth (nearest — interpolating across a depth discontinuity invents surfaces, and
 blending with an invalid 0 drags real depths down), crops the measured black border, rescales depth
 5000 → 6553.5, and writes a distortion-free `calib.txt`. Measured for fr1: 18 px border →
-604×444 → **400×544** at tracking resolution, and `--vggt_hw 378,518` to match that aspect.
+604×444 → **400×544** at tracking resolution, hence `VGGT_HW = (378, 518)` to match that aspect.
 
 Verified end to end on the real data: 0.000 % black pixels after the crop, processed depth median
 within 0.4 % of the raw file, and warping frame 0 forward with the written calib + GT poses + GT
@@ -586,8 +616,8 @@ The first number to check is `export.txt`'s per-frame vs global depth-L1 columns
 row. On Replica room0 they read 0.0735 / 0.2078 — that 2.8× blow-up under a single global scale
 *is* the cross-frame inconsistency this whole track targets. If TUM shows it too, there is headroom;
 if it does not, expect another null, and the honest reading is that the prior was never the
-bottleneck. A `run_full_vggt.py --adapter none --vggt_hw 378,518` run would separate that from
-"VGGT is simply the better prior", but it is not part of the driver.
+bottleneck. Adding `'vggt_base'` to `ARMS` (stock VGGT-1B, no adapter) separates that from
+"VGGT is simply the better prior"; it is off by default because it costs a third full run.
 
 Second, check `export.txt`'s Gaussian-rendered row: it is the training target, so its L1 bounds
 what the adapter can learn. On Replica it was 0.0133 m; if TUM's is much worse, the supervision
