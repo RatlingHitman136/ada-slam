@@ -48,7 +48,7 @@ from tqdm import tqdm
 # ==============================================================================
 
 # ---------------------------------------------------------------- data (preprocessing is NOT here)
-SCENE   = 'rgbd_dataset_freiburg1_room'
+SCENE   = 'rgbd_dataset_freiburg1_desk'
 DATA    = f'data/TUM/{SCENE}'          # preprocess_tum.py's output layout
 COLORS  = f'{DATA}/colors'
 DEPTHS  = f'{DATA}/depths'             # None if the dataset has no GT depth
