@@ -53,7 +53,7 @@ from common import stream_resize
 # ==============================================================================
 
 # ---------------------------------------------------------------- data (preprocessing is NOT here)
-SCENE   = 'rgbd_dataset_freiburg1_desk'
+SCENE   = 'rgbd_dataset_freiburg1_room'
 DATA    = f'data/TUM/{SCENE}'          # preprocess_tum.py's output layout
 COLORS  = f'{DATA}/colors'
 DEPTHS  = f'{DATA}/depths'             # None if the dataset has no GT depth
@@ -70,7 +70,7 @@ UNDISTORT   = False
 CROP_BORDER = 0
 
 # ---------------------------------------------------------------- run control
-STAGES           = ('extract', 'adapt', 'test')
+STAGES           = ('adapt',)
 SKIP_EXISTING    = False               # reuse a stage's output if it is already on disk
 MIN_FREE_VRAM_MB = 10000               # shared GPU: re-checked before every GPU stage
 FRACTION         = 40                  # % of the sequence the adapter trains on; also SPLIT_AT
@@ -125,7 +125,7 @@ LORA = LoRAConfig(
 ADAPT = AdaptConfig(
     depth_source=DEPTH_SOURCE, stream_res=STREAM_RES,
     p_single_view=1, max_left=4, max_right=4, radius=8,
-    epochs=10, batch_size=2,
+    epochs=1, batch_size=2,
     lr=1e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
     depth_space='disparity',   # 'depth' | 'disparity'
     coupled_scale=True, min_mask_pixels=16, seed=0, log_every=20,
@@ -135,7 +135,7 @@ ADAPT = AdaptConfig(
     eval_on_val=True,          # depth L1 on held-out keyframes, base vs adapted
     eval_on_train=True,        # also on the train subset, so the train/val gap is visible
     eval_every_epoch=True,     # False = only before training and after the last epoch
-    eval_max_kf=100,           # evenly subsample each eval subset to at most this many; 0 = no cap
+    eval_max_kf=5,           # evenly subsample each eval subset to at most this many; 0 = no cap
     keep_best=False)           # False = save the last epoch (report-only, the default);
                                # True  = snapshot whenever val L1 improves and save that instead
 

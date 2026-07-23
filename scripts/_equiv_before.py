@@ -11,27 +11,24 @@ Three stages, run in ONE process, each skipped if its output already exists:
   3 test     two (or three) full-sequence arms differing ONLY in the depth prior, then a
              side-by-side comparison split at the frame the adapter's training data ended
 
-Every parameter lives in the block below - no command line, no environment. Extract and test use
-CAPITAL constants; the adapt stage takes the LORA and ADAPT dataclass literals, which are the
-same thing in a different shape (nothing in ada-slam/adapt/ carries a default of its own).
+Every parameter is a CAPITAL constant in the block below - no command line, no environment.
 Dataset preprocessing is deliberately NOT here; run scripts/preprocess_tum.py first.
 
-Stage 2 lives in ada-slam/adapt/ and is reached through LoRAVGGT; stages 1 and 3 are still
-inline here, and the code they need from demo.py and export_slam_depth.py is duplicated rather
-than imported (see ARCHITECTURE.md §8 for the provenance and §9.5 for where this is going).
-It imports the system under test (hislam2/, thirdparty/vggt) and drives three standalone CLIs as
-subprocesses: evo_ape, tsdf_integrate.py and scripts/eval_recon.py.
+This file imports nothing from demo.py or the other scripts/ drivers: the code it needs from
+them is inlined (see ARCHITECTURE.md for the provenance). It does import the system under test
+(hislam2/, thirdparty/vggt) and drives three standalone CLIs as subprocesses: evo_ape,
+tsdf_integrate.py and scripts/eval_recon.py.
 """
 import os    # nopep8
 import sys   # nopep8
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))       # nopep8
 sys.path.insert(0, _ROOT)                                                 # nopep8
-sys.path.insert(0, os.path.join(_ROOT, 'ada-slam'))                       # nopep8
 sys.path.insert(0, os.path.join(_ROOT, 'hislam2'))                        # nopep8
 sys.path.insert(0, os.path.join(_ROOT, 'thirdparty/vggt'))                # nopep8
 import contextlib
 import gc
 import json
+import math
 import re
 import resource
 import subprocess
@@ -41,19 +38,17 @@ import types
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.multiprocessing import Process, Queue
 from tqdm import tqdm
-
-from adapt import AdaptConfig, LoRAConfig, LoRAVGGT
-from common import stream_resize
 
 # ==============================================================================
 #  PARAMETERS
 # ==============================================================================
 
 # ---------------------------------------------------------------- data (preprocessing is NOT here)
-SCENE   = 'rgbd_dataset_freiburg1_desk'
+SCENE   = 'rgbd_dataset_freiburg1_room'
 DATA    = f'data/TUM/{SCENE}'          # preprocess_tum.py's output layout
 COLORS  = f'{DATA}/colors'
 DEPTHS  = f'{DATA}/depths'             # None if the dataset has no GT depth
@@ -70,7 +65,7 @@ UNDISTORT   = False
 CROP_BORDER = 0
 
 # ---------------------------------------------------------------- run control
-STAGES           = ('extract', 'adapt', 'test')
+STAGES           = ('adapt',)
 SKIP_EXISTING    = False               # reuse a stage's output if it is already on disk
 MIN_FREE_VRAM_MB = 10000               # shared GPU: re-checked before every GPU stage
 FRACTION         = 40                  # % of the sequence the adapter trains on; also SPLIT_AT
@@ -109,35 +104,29 @@ MASK_MIN_COUNT      = 1           # min agreeing neighbours out of 6
 MASK_MIN_DISP_RATIO = 0.5         # drop pixels below this fraction of the frame's mean disparity
 
 # ---------------------------------------------------------------- adapt (LoRA on VGGT)
-# The stage itself lives in ada-slam/adapt/; these two literals are the whole of its knob panel,
-# and nothing in that package carries a default of its own.
-#
-# LORA is the model/adapter STRUCTURE - it is what gets recorded into the adapter's config.json
-# and read back by LoRAVGGT.from_adapter, so an arm always runs the model its adapter was trained
-# in even if these values move afterwards. ADAPT is the training run, which no adapter re-reads.
-LORA = LoRAConfig(
-    weights='pretrained_models/vggt',
-    vggt_hw=(378, 518),        # dims %14; MUST match the tracking stream's aspect (§9.3)
-    rank=8, alpha=16,
-    targets=('attn.qkv', 'attn.proj', 'mlp.fc1', 'mlp.fc2'),
-    patch_embed=False)         # False = adapt only the alternating-attention stack
+VGGT_WEIGHTS = 'pretrained_models/vggt'
+VGGT_HW      = (378, 518)     # dims %14; MUST match the tracking stream's aspect (§9.3)
+LORA_RANK, LORA_ALPHA = 8, 16
+LORA_TARGETS     = ('attn.qkv', 'attn.proj', 'mlp.fc1', 'mlp.fc2')
+LORA_PATCH_EMBED = False
+EPOCHS = 1
+BATCH_SIZE = 2
+LR, WEIGHT_DECAY, GRAD_CLIP, LAMBDA_POSE = 1e-4, 0.0, 1.0, 1.0
+DEPTH_SPACE, COUPLED_SCALE = 'disparity', True     # 'depth' | 'disparity'
+P_SINGLE_VIEW, MAX_LEFT, MAX_RIGHT, RADIUS = 1, 4, 4, 8
+MIN_MASK_PIXELS, LOG_EVERY = 16, 20
+SEED = 0
 
-ADAPT = AdaptConfig(
-    depth_source=DEPTH_SOURCE, stream_res=STREAM_RES,
-    p_single_view=1, max_left=4, max_right=4, radius=8,
-    epochs=10, batch_size=2,
-    lr=1e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
-    depth_space='disparity',   # 'depth' | 'disparity'
-    coupled_scale=True, min_mask_pixels=16, seed=0, log_every=20,
-    # ---- train / val split over the exported keyframes ----
-    train_frac=0.8,            # 1.0 = train on every keyframe, no val set
-    split_mode='stride',       # 'stride' (every Nth held out) | 'contiguous' (tail) | 'random'
-    eval_on_val=True,          # depth L1 on held-out keyframes, base vs adapted
-    eval_on_train=True,        # also on the train subset, so the train/val gap is visible
-    eval_every_epoch=True,     # False = only before training and after the last epoch
-    eval_max_kf=100,           # evenly subsample each eval subset to at most this many; 0 = no cap
-    keep_best=False)           # False = save the last epoch (report-only, the default);
-                               # True  = snapshot whenever val L1 improves and save that instead
+# ---- adapter train / val split over the exported keyframes ----
+LORA_TRAIN_FRAC   = 0.8       # 1.0 = train on every keyframe, no val set
+LORA_SPLIT_MODE   = 'stride'  # 'stride' (every Nth held out) | 'contiguous' (tail) | 'random'
+LORA_EVAL_ON_VAL  = True      # depth L1 on held-out keyframes, base vs adapted
+LORA_EVAL_ON_TRAIN = True     # also on the train subset, so the train/val gap is visible
+LORA_EVAL_EVERY_EPOCH = True  # False = only before training and after the last epoch
+LORA_EVAL_MAX_KF  = 5       # evenly subsample each eval subset to at most this many; 0 = no cap
+LORA_KEEP_BEST    = False     # False = save the last epoch (report-only, the default);
+                              # True  = snapshot the LoRA state whenever val L1 improves and
+                              #         save that instead
 
 # ---------------------------------------------------------------- test (A/B arms)
 ARMS        = ('omnidata', 'vggt_lora')   # 'vggt_base' = stock VGGT-1B, the §10.2 third arm
@@ -228,6 +217,15 @@ def tee(path):
 
 def banner(title):
     print(f'\n{"=" * 78}\n=== {title}\n{"=" * 78}')
+
+
+def stream_resize(img, res=STREAM_RES):
+    """The resize the tracker sees. ONE definition, used by the reader, the LoRA data loader and
+    the render metrics - they must agree or renders and GT stop lining up pixel for pixel."""
+    h0, w0 = img.shape[:2]
+    h1 = int(h0 * np.sqrt(res / (h0 * w0)))
+    w1 = int(w0 * np.sqrt(res / (h0 * w0)))
+    return cv2.resize(img, (w1 - w1 % 8, h1 - h1 % 8))
 
 
 # ==============================================================================
@@ -510,10 +508,424 @@ def export_slam_depth(out):
 
 
 # ==============================================================================
+#  STAGE 2 - LoRA adaptation of VGGT
+# ==============================================================================
+
+class LoRALinear(nn.Module):
+    """y = W0 x + (B A) x * alpha/r, with B zero-initialised so the adapter starts as identity."""
+
+    def __init__(self, base: nn.Linear, rank: int, alpha: int):
+        super().__init__()
+        self.base = base
+        self.base.weight.requires_grad_(False)
+        if self.base.bias is not None:
+            self.base.bias.requires_grad_(False)
+        self.scaling = alpha / rank
+        self.A = nn.Parameter(torch.zeros(rank, base.in_features))
+        self.B = nn.Parameter(torch.zeros(base.out_features, rank))
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+
+    def forward(self, x):
+        return self.base(x) + F.linear(F.linear(x, self.A), self.B) * self.scaling
+
+
+def inject_lora(model):
+    """Wrap the targeted Linears inside the aggregator's frame/global blocks."""
+    blocks = list(model.aggregator.frame_blocks) + list(model.aggregator.global_blocks)
+    if LORA_PATCH_EMBED and hasattr(model.aggregator.patch_embed, 'blocks'):
+        blocks += list(model.aggregator.patch_embed.blocks)
+
+    n = 0
+    for blk in blocks:
+        for tgt in LORA_TARGETS:
+            parent_path, _, leaf = tgt.rpartition('.')
+            parent = blk.get_submodule(parent_path) if parent_path else blk
+            child = getattr(parent, leaf, None)
+            if isinstance(child, nn.Linear):
+                setattr(parent, leaf, LoRALinear(child, LORA_RANK, LORA_ALPHA))
+                n += 1
+    return n
+
+
+def lora_state_dict(model):
+    return {k: v.detach().cpu() for k, v in model.state_dict().items()
+            if k.endswith('.A') or k.endswith('.B')}
+
+
+def load_vggt(adapter=None):
+    """VGGT-1B with LoRA injected, optionally loading an adapter. Shared by stage 2 and stage 3."""
+    from safetensors.torch import load_file
+    from vggt.models.vggt import VGGT
+    model = VGGT.from_pretrained(VGGT_WEIGHTS)
+    model.point_head, model.track_head = None, None       # not supervised
+    for p in model.parameters():
+        p.requires_grad_(False)
+    n = inject_lora(model)
+    if adapter is not None:
+        missing = model.load_state_dict(load_file(adapter), strict=False)
+        assert not missing.unexpected_keys, missing.unexpected_keys
+    return model.cuda(), n
+
+
+def vggt_forward(model, images):
+    """Aggregator once; depth head on frame 0 only; camera head on everything."""
+    tok, ps_idx = model.aggregator(images[None])
+    # this build caches only layers 4/11/17/23 and leaves the rest None to save memory
+    # (aggregator.py:196) - the frame slice must preserve those Nones
+    tok0 = [t[:, :1] if t is not None else None for t in tok]
+    depth, _ = model.depth_head(tok0, images[None][:, :1], ps_idx)
+    pose_enc = model.camera_head(tok)[-1]
+    return depth[0, 0, :, :, 0], pose_enc[0]
+
+
+def tum_to_c2w(row):
+    from scipy.spatial.transform import Rotation
+    T = np.eye(4)
+    T[:3, :3] = Rotation.from_quat(row[4:8]).as_matrix()
+    T[:3, 3] = row[1:4]
+    return T
+
+
+def split_keyframes(kf):
+    """Train / val split over the exported keyframe list.
+
+    'stride' holds out every Nth keyframe, so val covers the whole trained region and the val
+    curve is not confounded by the scene changing. Its caveat is that a held-out keyframe's
+    neighbours are visually near-identical to trained ones, so it measures memorisation more than
+    generalisation; 'contiguous' is the opposite trade.
+    """
+    kf = list(kf)
+    if LORA_TRAIN_FRAC >= 1.0 or len(kf) < 5:
+        return kf, []
+    if LORA_SPLIT_MODE == 'stride':
+        val = kf[::max(2, int(round(1.0 / (1.0 - LORA_TRAIN_FRAC))))]
+    elif LORA_SPLIT_MODE == 'contiguous':
+        val = kf[int(round(len(kf) * LORA_TRAIN_FRAC)):]
+    elif LORA_SPLIT_MODE == 'random':
+        perm = np.random.default_rng(SEED).permutation(len(kf))
+        val = sorted(kf[i] for i in perm[int(round(len(kf) * LORA_TRAIN_FRAC)):])
+    else:
+        raise SystemExit(f'LORA_SPLIT_MODE={LORA_SPLIT_MODE!r} is not stride/contiguous/random')
+    vset = set(val)
+    return [t for t in kf if t not in vset], val
+
+
+class SceneData:
+    """One keyframe = one sample, placed FIRST in the sequence so VGGT's predictions land in that
+    keyframe's coordinate frame (verified: extrinsic[0] is identity to 5e-4). Around it we attach
+    a random number of neighbouring non-keyframe frames, so the adapter works both monocular - the
+    way MotionFilter.prior_extractor calls it - and with a few frames of context."""
+
+    def __init__(self, scene_dir, image_dir):
+        self.scene_dir, self.image_dir = scene_dir, image_dir
+        self.files = sorted(os.listdir(image_dir))
+
+        self.ddir, self.mdir = f'depth_{DEPTH_SOURCE}', f'mask_{DEPTH_SOURCE}'
+        if not os.path.isdir(f'{scene_dir}/{self.ddir}'):
+            raise SystemExit(f'{scene_dir}/{self.ddir} not found - re-run the extract stage with '
+                             f'DEPTH_SOURCE = {DEPTH_SOURCE!r}')
+
+        traj = np.loadtxt(f'{scene_dir}/traj_full.txt')
+        self.c2w = {int(r[0]): tum_to_c2w(r) for r in traj}
+        self.t_min, self.t_max = int(traj[0, 0]), int(traj[-1, 0])
+        self.kf = [int(t) for t in np.loadtxt(f'{scene_dir}/poses_slam.txt')[:, 0]]
+        self.train_kf, self.val_kf = split_keyframes(self.kf)
+
+        # intrinsics: stored at the tracker's resolution, rescale to the VGGT input size
+        fx, fy, cx, cy = np.load(f'{scene_dir}/intrinsics.npy')
+        probe = stream_resize(cv2.imread(os.path.join(image_dir, self.files[0])))
+        self.stream_hw = probe.shape[:2]
+        sy, sx = VGGT_HW[0] / probe.shape[0], VGGT_HW[1] / probe.shape[1]
+        self.K = np.array([[fx * sx, 0, cx * sx], [0, fy * sy, cy * sy], [0, 0, 1]], np.float64)
+
+    def frame(self, t):
+        img = cv2.cvtColor(cv2.imread(os.path.join(self.image_dir, self.files[t])),
+                           cv2.COLOR_BGR2RGB)
+        img = cv2.resize(stream_resize(img), (VGGT_HW[1], VGGT_HW[0]),
+                         interpolation=cv2.INTER_AREA)
+        return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+
+    def kf_target(self, t):
+        d = np.load(f'{self.scene_dir}/{self.ddir}/{t:06d}.npy')
+        m = cv2.imread(f'{self.scene_dir}/{self.mdir}/{t:06d}.png', cv2.IMREAD_GRAYSCALE) > 127
+        d = cv2.resize(d, (VGGT_HW[1], VGGT_HW[0]), interpolation=cv2.INTER_NEAREST)
+        m = cv2.resize(m.astype(np.uint8), (VGGT_HW[1], VGGT_HW[0]),
+                       interpolation=cv2.INTER_NEAREST) > 0
+        return torch.from_numpy(d).float(), torch.from_numpy(m & (d > 0))
+
+    def neighbours(self, t, rng, n_left, n_right):
+        """Random non-keyframe neighbours within RADIUS; edge keyframes take from the other side."""
+        left = [x for x in range(max(t - RADIUS, self.t_min), t) if x in self.c2w]
+        right = [x for x in range(t + 1, min(t + RADIUS, self.t_max) + 1) if x in self.c2w]
+        want = n_left + n_right
+        n_left, n_right = min(n_left, len(left)), min(n_right, len(right))
+        # keyframes at the sequence ends have no frames on one side; make up the shortfall from
+        # the other side so the requested context size is still met where the frames exist
+        n_right = min(n_right + (want - n_left - n_right), len(right))
+        n_left = min(n_left + (want - n_left - n_right), len(left))
+        picks = list(rng.choice(left, n_left, replace=False)) + \
+            list(rng.choice(right, n_right, replace=False))
+        return sorted(int(x) for x in picks)
+
+    def sample(self, rng, t=None, single=None):
+        from vggt.utils.pose_enc import extri_intri_to_pose_encoding
+        t = int(rng.choice(self.train_kf)) if t is None else t
+        if single is None:
+            single = rng.random() < P_SINGLE_VIEW
+        nb = [] if single else self.neighbours(t, rng, rng.integers(1, MAX_LEFT + 1),
+                                               rng.integers(1, MAX_RIGHT + 1))
+        seq = [t] + nb
+
+        images = torch.stack([self.frame(x) for x in seq])
+        gt_depth, mask = self.kf_target(t)
+
+        # rebase every pose so the keyframe is the world origin -> frame 0 is identity
+        kf_c2w = self.c2w[t]
+        extr = np.stack([(np.linalg.inv(self.c2w[x]) @ kf_c2w)[:3] for x in seq])
+        K = np.broadcast_to(self.K, (len(seq), 3, 3))
+        gt_enc = extri_intri_to_pose_encoding(
+            torch.from_numpy(extr).float()[None], torch.from_numpy(K.copy()).float()[None],
+            image_size_hw=VGGT_HW)[0]
+        return images, gt_depth, mask, gt_enc, seq
+
+
+def _median_scale(pred, gt, mask):
+    """Median ratio. Deliberately NOT detached.
+
+    Detaching makes the loss only *look* scale-invariant: the optimiser then sees a gradient that
+    rewards shrinking the prediction, even though rescaling is a no-op once the scale is recomputed
+    on the next forward pass. Letting the gradient flow through the ratio makes the loss genuinely
+    invariant, so it can only push shape, never overall magnitude.
+    """
+    return gt[mask].median() / pred[mask].median().clamp(min=1e-6)
+
+
+def depth_loss(pred_depth, gt_depth, mask, scale=None):
+    """Returns (loss, depth-space scale). The returned scale is always expressed in DEPTH terms,
+    even when the loss is computed in disparity, so callers can compare it against the pose scale."""
+    if mask.sum() < MIN_MASK_PIXELS:
+        return pred_depth.sum() * 0.0, None
+    p, g = pred_depth.clamp(min=1e-3), gt_depth.clamp(min=1e-3)
+    inv = DEPTH_SPACE == 'disparity'
+    if inv:
+        p, g = 1.0 / p, 1.0 / g
+    # a scale supplied by the caller (COUPLED_SCALE) is a depth scale; in disparity space the
+    # equivalent multiplier is its reciprocal
+    s = _median_scale(p, g, mask) if scale is None else (1.0 / scale if inv else scale)
+    loss = (g[mask] - s * p[mask]).abs().mean()
+    return loss, (1.0 / s if inv else s)
+
+
+def pose_loss(pred_enc, gt_enc):
+    """Translation (independently norm'd) + quaternion, over the non-reference frames."""
+    if pred_enc.shape[0] < 2:
+        z = pred_enc.sum() * 0.0
+        return z, z, None
+    tp, tg = pred_enc[1:, :3], gt_enc[1:, :3]
+    # same reasoning as _median_scale: normalising by a *detached* predicted norm lets the
+    # translations collapse toward zero at no loss cost. Keep the gradient in the normaliser.
+    np_, ng = tp.norm(dim=-1).mean().clamp(min=1e-6), tg.norm(dim=-1).mean().clamp(min=1e-6)
+    l_t = F.huber_loss(tp / np_, tg / ng)
+
+    qp = F.normalize(pred_enc[1:, 3:7], dim=-1)
+    qg = F.normalize(gt_enc[1:, 3:7], dim=-1)
+    l_r = (1.0 - (qp * qg).sum(-1).abs()).mean()      # abs handles quaternion sign ambiguity
+    return l_t, l_r, (ng / np_).detach()
+
+
+@torch.no_grad()
+def eval_depth(model, data, kfs):
+    """Scale-aligned masked depth L1 over a keyframe subset, same metric as the export table."""
+    if not kfs:
+        return None
+    if LORA_EVAL_MAX_KF and len(kfs) > LORA_EVAL_MAX_KF:
+        pick = np.linspace(0, len(kfs) - 1, LORA_EVAL_MAX_KF).round().astype(int)
+        kfs = [kfs[i] for i in sorted(set(pick.tolist()))]
+    was_training = model.training
+    model.eval()
+    rng = np.random.default_rng(SEED)
+    errs = []
+    for t in kfs:
+        images, gt, mask, _, _ = data.sample(rng, t=t, single=True)
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            pred, _ = vggt_forward(model, images.cuda())
+        l, _ = depth_loss(pred.float(), gt.cuda(), mask.cuda())
+        errs.append(l.item())
+    model.train(was_training)
+    return float(np.mean(errs))
+
+
+def train_lora(scene_dir):
+    """LoRA-adapt VGGT on the exported depth + poses, reporting train/val depth L1."""
+    from safetensors.torch import save_file
+
+    torch.manual_seed(SEED)
+    rng = np.random.default_rng(SEED)
+    out = f'{scene_dir}/lora-vggt'
+    os.makedirs(out, exist_ok=True)
+
+    data = SceneData(scene_dir, COLORS)
+    print(f'scene {scene_dir}: {len(data.kf)} keyframes, frames {data.t_min}..{data.t_max}, '
+          f'supervised on {data.ddir}/')
+    print(f'split {LORA_SPLIT_MODE} @ {LORA_TRAIN_FRAC}: {len(data.train_kf)} train / '
+          f'{len(data.val_kf)} val keyframes')
+    if not data.val_kf:
+        print('  note: empty val set - val eval and LORA_KEEP_BEST are disabled')
+
+    sh_, sw = data.stream_hw
+    skew = (VGGT_HW[1] / VGGT_HW[0]) / (sw / sh_)
+    print(f'stream {sw}x{sh_} (aspect {sw/sh_:.3f}) -> VGGT {VGGT_HW[1]}x{VGGT_HW[0]} '
+          f'(aspect {VGGT_HW[1]/VGGT_HW[0]:.3f}), squash {skew:.3f}x')
+    if not 0.95 < skew < 1.05:
+        print(f'  WARNING: aspect ratios differ by {abs(1-skew)*100:.0f}%. SceneData.frame() '
+              f'resizes without letterboxing, so VGGT sees a distorted image. Consider VGGT_HW = '
+              f'({14*round(518*sh_/sw/14)}, 518)')
+
+    model, n_wrapped = load_vggt()
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    n_train = sum(p.numel() for p in trainable)
+    n_total = sum(p.numel() for p in model.parameters())
+    print(f'LoRA r={LORA_RANK} on {n_wrapped} Linears -> {n_train/1e6:.2f}M trainable '
+          f'/ {n_total/1e9:.2f}B ({100*n_train/n_total:.2f}%)')
+
+    def evaluate_subsets(tag):
+        row = {'tag': tag}
+        if LORA_EVAL_ON_TRAIN:
+            row['train_l1'] = eval_depth(model, data, data.train_kf)
+        if LORA_EVAL_ON_VAL:
+            row['val_l1'] = eval_depth(model, data, data.val_kf)
+        cells = '  '.join(f'{k.split("_")[0]} {v:.4f}' for k, v in row.items()
+                          if k != 'tag' and v is not None)
+        if cells:
+            print(f'  depth L1 [{tag:>5}]  {cells}')
+        return row
+
+    print(f'evaluating base VGGT ({DEPTH_SPACE} space, masked, scale-aligned):')
+    history = [evaluate_subsets('base')]
+
+    model.train()                        # enables the aggregator's gradient checkpointing
+    opt = torch.optim.AdamW(trainable, lr=LR, weight_decay=WEIGHT_DECAY)
+    log, t0 = [], time.time()
+    best = {'val_l1': float('inf'), 'epoch': None, 'state': None}
+
+    if not data.train_kf:
+        raise SystemExit('no training keyframes - lower LORA_TRAIN_FRAC or check the export')
+    steps_per_epoch = math.ceil(len(data.train_kf) / BATCH_SIZE)
+    print(f'{len(data.train_kf)} train keyframes / batch {BATCH_SIZE} = {steps_per_epoch} '
+          f'optimiser steps per epoch, {EPOCHS * steps_per_epoch} in total')
+
+    for epoch in range(EPOCHS):
+        # every training keyframe exactly once per epoch, in a fresh order each time
+        order = [int(t) for t in rng.permutation(data.train_kf)]
+        run = []
+        for step in range(steps_per_epoch):
+            batch = order[step * BATCH_SIZE:(step + 1) * BATCH_SIZE]   # the tail batch is shorter
+            opt.zero_grad(set_to_none=True)
+            acc = {'loss': [], 'l_depth': [], 'l_trans': [], 'l_rot': [], 'scale_ratio': [],
+                   'S': []}
+
+            for t in batch:
+                images, gt, mask, gt_enc, seq = data.sample(rng, t=t)
+                images, gt, mask, gt_enc = images.cuda(), gt.cuda(), mask.cuda(), gt_enc.cuda()
+
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                    pred_depth, pred_enc = vggt_forward(model, images)
+                pred_depth, pred_enc = pred_depth.float(), pred_enc.float()
+
+                l_t, l_r, pose_scale = pose_loss(pred_enc, gt_enc)
+                l_d, depth_scale = depth_loss(pred_depth, gt, mask,
+                                              scale=pose_scale if COUPLED_SCALE else None)
+                loss = l_d + LAMBDA_POSE * (l_t + l_r)
+
+                # divide before backward: accumulating the MEAN over the batch is what makes this
+                # equivalent to one wider batch, and keeps the gradient magnitude (and so GRAD_CLIP
+                # and LR) independent of BATCH_SIZE
+                (loss / len(batch)).backward()
+
+                acc['loss'].append(loss.item())
+                acc['l_depth'].append(l_d.item())
+                acc['l_trans'].append(l_t.item())
+                acc['l_rot'].append(l_r.item())
+                acc['S'].append(len(seq))
+                # depth and pose scale agreed to 1% on the pretrained model; if they diverge during
+                # training the adapter is breaking depth/pose consistency
+                if pose_scale is not None and depth_scale is not None:
+                    acc['scale_ratio'].append((depth_scale / pose_scale).item())
+
+            torch.nn.utils.clip_grad_norm_(trainable, GRAD_CLIP)
+            opt.step()
+
+            rec = {'epoch': epoch, 'step': step, 'kfs': batch, 'S': acc['S'],
+                   **{k: float(np.mean(v)) for k, v in acc.items()
+                      if k not in ('S',) and v}}
+            log.append(rec)
+            run.append(rec['loss'])
+
+            if step % LOG_EVERY == 0:
+                print(f'  e{epoch} s{step:4d}/{steps_per_epoch}  '
+                      f'loss {np.mean(run[-LOG_EVERY:]):.4f}  (d {rec["l_depth"]:.4f} '
+                      f't {rec["l_trans"]:.4f} r {rec["l_rot"]:.4f})  B={len(batch)} '
+                      f'S={acc["S"]}  {torch.cuda.max_memory_allocated()/2**30:.1f}GiB')
+        print(f'epoch {epoch}: mean loss {np.mean(run):.4f} over {len(order)} keyframes  '
+              f'({time.time()-t0:.0f}s elapsed)')
+
+        if LORA_EVAL_EVERY_EPOCH or epoch == EPOCHS - 1:
+            row = evaluate_subsets(f'e{epoch}')
+            history.append(row)
+            v = row.get('val_l1')
+            if LORA_KEEP_BEST and v is not None and v < best['val_l1']:
+                best = {'val_l1': v, 'epoch': epoch, 'state': lora_state_dict(model)}
+
+    keep = LORA_KEEP_BEST and best['state'] is not None
+    save_file(best['state'] if keep else lora_state_dict(model), f'{out}/adapter.safetensors')
+
+    cfg = {'rank': LORA_RANK, 'alpha': LORA_ALPHA, 'targets': list(LORA_TARGETS),
+           'lora_patch_embed': LORA_PATCH_EMBED, 'epochs': EPOCHS, 'batch_size': BATCH_SIZE,
+           'steps_per_epoch': steps_per_epoch, 'samples_per_epoch': len(data.train_kf),
+           'lr': LR, 'weight_decay': WEIGHT_DECAY, 'grad_clip': GRAD_CLIP,
+           'lambda_pose': LAMBDA_POSE, 'depth_space': DEPTH_SPACE, 'depth_source': DEPTH_SOURCE,
+           'coupled_scale': COUPLED_SCALE, 'p_single_view': P_SINGLE_VIEW,
+           'max_left': MAX_LEFT, 'max_right': MAX_RIGHT, 'radius': RADIUS,
+           'vggt_hw': list(VGGT_HW), 'weights': VGGT_WEIGHTS, 'scene': scene_dir,
+           'trainable_params': n_train, 'seed': SEED,
+           'split_mode': LORA_SPLIT_MODE, 'train_frac': LORA_TRAIN_FRAC,
+           'n_train_kf': len(data.train_kf), 'n_val_kf': len(data.val_kf),
+           'val_kf': data.val_kf, 'keep_best': LORA_KEEP_BEST,
+           'saved_epoch': best['epoch'] if keep else EPOCHS - 1,
+           'eval_history': history}
+    json.dump(cfg, open(f'{out}/config.json', 'w'), indent=2)
+    json.dump(log, open(f'{out}/train_log.json', 'w'))
+
+    # ---- summary: the val row is the one that means something ----
+    print(f'\ndepth L1 (masked, scale-aligned, {DEPTH_SPACE} space):')
+    print(f'  {"":<8}' + ''.join(f'{r["tag"]:>10}' for r in history))
+    for key, name in (('train_l1', 'train'), ('val_l1', 'val')):
+        if any(r.get(key) is not None for r in history):
+            print(f'  {name:<8}' + ''.join(
+                f'{r[key]:>10.4f}' if r.get(key) is not None else f'{"n/a":>10}' for r in history))
+    if LORA_KEEP_BEST and best['epoch'] is not None:
+        print(f'  saved epoch {best["epoch"]} (best val L1 {best["val_l1"]:.4f})')
+    print(f'saved adapter ({n_train/1e6:.1f}M params) to {out}')
+
+    del model, trainable, opt, data
+    free_vram()
+
+
+# ==============================================================================
 #  STAGE 3 - the A/B arms
 # ==============================================================================
 
-_VGGT = None            # the LoRAVGGT, held only for the duration of a VGGT arm
+_VGGT_MODEL = None      # held only for the duration of a VGGT arm
+_VGGT_HW = VGGT_HW
+
+
+@torch.no_grad()
+def _vggt_depth(images):
+    """Depth for a single frame. Skips camera_head, and runs the DPT head on frame 0 only."""
+    tok, ps_idx = _VGGT_MODEL.aggregator(images[None])
+    tok0 = [t[:, :1] if t is not None else None for t in tok]
+    depth, _ = _VGGT_MODEL.depth_head(tok0, images[None][:, :1], ps_idx)
+    return depth[0, 0, :, :, 0]
 
 
 @torch.amp.autocast('cuda', enabled=True)   # matches upstream prior_extractor's decorator
@@ -535,9 +947,9 @@ def vggt_prior_extractor(self, im_tensor):
     # motion_filter.py:88-89 hands us an ImageNet-NORMALISED tensor, but VGGT expects [0,1] and
     # normalises internally (aggregator.py:205). Undo it, or VGGT sees doubly-normalised input.
     rgb = (im_tensor * self.STDV + self.MEAN).clamp(0, 1)
-    rgb = F.interpolate(rgb, _VGGT.cfg.vggt_hw, mode='bilinear', align_corners=False)
+    rgb = F.interpolate(rgb, _VGGT_HW, mode='bilinear', align_corners=False)
     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        depth = _VGGT.predict_depth(rgb.cuda())
+        depth = _vggt_depth(rgb.cuda())
     # bilinear, not bicubic: bicubic can overshoot to negative depth at edges
     depth = F.interpolate(depth.float()[None, None], input_size, mode='bilinear',
                           align_corners=False).squeeze().clamp(min=1e-3)
@@ -547,17 +959,22 @@ def vggt_prior_extractor(self, im_tensor):
 def install_vggt_prior(adapter):
     """Patch MotionFilter so the depth prior comes from VGGT. Normals stay Omnidata, so depth is
     the only variable between the arms."""
-    global _VGGT
+    global _VGGT_MODEL, _VGGT_HW
     from motion_filter import MotionFilter
 
-    # from_adapter rebuilds LORA from what the adapter recorded - rank, targets and above all the
-    # input size it was trained at - and says so when that differs from LORA. Only the un-adapted
-    # arm has nothing to read back and is free to take LORA as written.
-    _VGGT = (LoRAVGGT.from_adapter(adapter, LORA) if adapter else LoRAVGGT(LORA)).eval_mode()
-    hw = _VGGT.cfg.vggt_hw
+    _VGGT_HW = VGGT_HW
+    # The adapter was trained at one input size and must be run at that size, so the value written
+    # into its config.json wins over VGGT_HW. Only the un-adapted arm is free to take VGGT_HW.
+    cfg = os.path.join(os.path.dirname(adapter or ''), 'config.json')
+    if adapter and os.path.exists(cfg):
+        _VGGT_HW = tuple(json.load(open(cfg))['vggt_hw'])
+        if tuple(VGGT_HW) != _VGGT_HW:
+            print(f'note: ignoring VGGT_HW, adapter was trained at {_VGGT_HW[0]},{_VGGT_HW[1]}')
+
+    _VGGT_MODEL = load_vggt(adapter=adapter)[0].eval()
     MotionFilter.prior_extractor = vggt_prior_extractor
     which = f'LoRA-adapted VGGT ({adapter})' if adapter else 'base VGGT-1B (no adapter)'
-    print(f'depth prior: {which} at {hw[1]}x{hw[0]}')
+    print(f'depth prior: {which} at {_VGGT_HW[1]}x{_VGGT_HW[0]}')
     print('normals    : Omnidata (unchanged, so depth is the only variable)')
     return f'{"VGGT+LoRA" if adapter else "base VGGT"} depth / Omnidata normals'
 
@@ -636,7 +1053,7 @@ def split_render_metrics(out, split_at):
     for f in sorted(os.listdir(f'{out}/renders/image_after_opt')):
         idx = int(f[:-4])
         render = cv2.imread(f'{out}/renders/image_after_opt/{f}')
-        gt = stream_resize(cv2.imread(os.path.join(COLORS, files[idx])), STREAM_RES)
+        gt = stream_resize(cv2.imread(os.path.join(COLORS, files[idx])))
         if render is None or gt is None or render.shape != gt.shape:
             continue
         r = torch.from_numpy(render[..., ::-1].copy()).permute(2, 0, 1).float().cuda() / 255.
@@ -829,11 +1246,7 @@ def stage_adapt(adapter):
         raise SystemExit(f'no {OUT_EXTRACT}/poses_slam.txt - run the extract stage first')
     gpu_gate()
     t0 = time.time()
-    # seed=ADAPT.seed must be given to the CONSTRUCTOR: the adapter's A matrices are initialised
-    # when LoRA is injected, so seeding any later does not reproduce a run
-    lora = LoRAVGGT(LORA, seed=ADAPT.seed)
-    lora.train(OUT_EXTRACT, COLORS, os.path.dirname(adapter), ADAPT)
-    lora.release()
+    train_lora(OUT_EXTRACT)
     free_vram('adapt')
     print(f'=== adapt done in {time.time()-t0:.0f}s')
 
@@ -841,7 +1254,7 @@ def stage_adapt(adapter):
 def stage_test(adapter, split_at):
     banner(f'3/3 test  -> {OUT_TEST}')
     from motion_filter import MotionFilter
-    global _VGGT
+    global _VGGT_MODEL
 
     # The arms must run stock tracking. The EXTRACT_KF_* knobs shape the training-data run only:
     # if the generated config leaked in here, a denser-keyframe extract would silently also mean
@@ -881,9 +1294,7 @@ def stage_test(adapter, split_at):
         n_kf = run_slam(out, arm_config, TEST_LENGTH, TEST_BUFFER, gtdepthdir=DEPTHS)
         print(f'{label}: SLAM done in {time.time()-t0:.0f}s, {n_kf} keyframes')
 
-        if _VGGT is not None:
-            _VGGT.release()                               # ~2.5 GB, not needed by the evaluation
-            _VGGT = None
+        _VGGT_MODEL = None                                # ~2.5 GB, not needed by the evaluation
         free_vram(f'arm {arm}')
         res = evaluate(out, label, split_at)
         print_report(res)

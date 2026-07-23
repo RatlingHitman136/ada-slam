@@ -9,7 +9,7 @@ Splatting map. It is built from three lineages, and the folder layout mirrors th
 | **DROID-SLAM** | dense flow-based tracking, factor graph, dense BA | `hislam2/{factor_graph,track_*,depth_video,motion_filter}.py`, `hislam2/geom`, `hislam2/modules`, `src/` |
 | **Omnidata / DPT (MiDaS)** | monocular depth + normal priors | `hislam2/midas/` |
 | **MonoGS / 3DGS / RaDe-GS** | Gaussian map, rasterizer, GUI | `hislam2/gaussian/`, `thirdparty/diff-gaussian-rasterization` |
-| **VGGT** *(this fork, §9)* | alternative depth prior, LoRA-adapted on SLAM depth | `thirdparty/vggt`, `scripts/run_pipeline.py`, `scripts/lora_adapt_vggt.py` |
+| **VGGT** *(this fork, §9)* | alternative depth prior, LoRA-adapted on SLAM depth | `thirdparty/vggt`, `ada-slam/adapt/`, `scripts/run_pipeline.py` |
 
 The HI-SLAM2-specific contributions on top of those are: **JDSA** (joint depth–scale
 adjustment, `geom/ba.py`), **PGBA** (Sim(3) pose-graph + bundle adjustment for loop closure,
@@ -17,9 +17,9 @@ adjustment, `geom/ba.py`), **PGBA** (Sim(3) pose-graph + bundle adjustment for l
 (`gaussian/utils/slam_utils.py`).
 
 This fork adds one research track on top: replacing the Omnidata depth prior with a VGGT model
-LoRA-adapted on HI-SLAM2's *own* SLAM depth. That is entirely additive — it lives in `scripts/`
-and `thirdparty/vggt`, and touches the core only through a 17-line optional dump hook in
-`hi2.py`. See **§9**.
+LoRA-adapted on HI-SLAM2's *own* SLAM depth. That is entirely additive — it lives in
+`ada-slam/`, `scripts/` and `thirdparty/vggt`, and touches the core only through a 17-line
+optional dump hook in `hi2.py`. See **§9**.
 
 ---
 
@@ -88,6 +88,7 @@ Directories:
 
 | Dir | Contents |
 |---|---|
+| `ada-slam/` | The VGGT track's own code, factored out of `scripts/run_pipeline.py` stage by stage (§9.5). `adapt/` is the LoRA adaptation package; `common.py` holds what more than one stage needs. Its name has a hyphen, so it is never imported as a package — it is a **directory placed on `sys.path`**, exactly like `hislam2/`, after which `from adapt import ...` and `from common import ...` work. |
 | `calib/` | Plain-text intrinsics, one line: `fx fy cx cy [k1 k2 p1 p2 ...]`. `replica.txt` (600 600 599.5 339.5), `scannet.txt`, `euroc.txt` (with distortion). Loaded by `demo.py:mono_stream`. |
 | `config/` | Per-dataset YAML (see §6). |
 | `media/` | README images (`logo.png`, `teaser.jpg`, `owndata.gif`). |
@@ -312,8 +313,9 @@ Vendored DPT/MiDaS code, used **only** for inference of the Omnidata checkpoints
 | `eval_recon.py` | Mesh evaluation: accuracy / completion / completion-ratio via KD-trees and `evaluate_3d_reconstruction`, plus an optional 2D depth-L1 metric that renders random in-room views of GT vs. reconstruction with Open3D. **Note:** its `trimesh` import was never satisfied before this fork installed it, so this script (and `run_replica.py`'s recon metrics) could not run at all. |
 
 The VGGT track adds three more — see §9: `run_pipeline.py` (the one driver: extract → adapt →
-A/B test), plus `export_slam_depth.py` and `lora_adapt_vggt.py`, which remain as standalone
-single-stage tools.
+A/B test), plus the standalone single-stage tools `export_slam_depth.py` and
+`lora_adapt_vggt.py`. The latter is no longer a copy of anything: it is a thin CLI over
+`ada-slam/adapt/`, the same code the adapt stage runs (§9.5).
 
 ---
 
@@ -418,9 +420,10 @@ Known rough edges:
   points at it. Dead references.
 - `hislam2/gaussian/gui/gl_render/`, `midas/midas_net*.py`, `geom/graph_utils.py` and
   `DroidNet.forward` are vendored/training-path code not exercised by `demo.py`.
-- `scripts/run_pipeline.py` deliberately duplicates rather than imports: `demo.py`'s stream/track
-  loop, `export_slam_depth.py`'s export, and `lora_adapt_vggt.py`'s LoRA and losses all exist
-  twice. Self-containment was the trade — a fix in one copy does not reach the other.
+- `scripts/run_pipeline.py` still duplicates rather than imports: `demo.py`'s stream/track loop
+  and `export_slam_depth.py`'s export exist twice, so a fix in one copy does not reach the other.
+  The LoRA and losses no longer do — they moved to `ada-slam/adapt/` and both entry points now
+  import them (§9.5). The remaining two are what the next extractions are for.
 - `GSBackEnd` inherits `mp.Process` but is driven inline; mapping and tracking are
   serialised in the main process. The GUI, the DROID visualiser and `PGOBuffer.spin` are
   the only genuine extra processes (plus `demo.py`'s image reader).
@@ -448,8 +451,9 @@ nevertheless currently ships `DEPTH_SOURCE = 'slam'`, matching the §9.4 Replica
 
 ### 9.1 Pipeline
 
-**`scripts/run_pipeline.py` is the only way to run it.** One self-contained file, three stages in
-one process, every parameter a CAPITAL constant in the block at its top — no CLI, no environment:
+**`scripts/run_pipeline.py` is the only way to run it.** Three stages in one process, every
+parameter in the block at its top — CAPITAL constants for extract and test, and the `LORA` /
+`ADAPT` dataclass literals for the adapt stage (§9.5). No CLI, no environment:
 
 ```
 python scripts/run_pipeline.py        # from the repo root, adaslam venv active
@@ -480,21 +484,22 @@ Dataset preprocessing is deliberately *not* part of it: run `scripts/preprocess_
 
 | File | Purpose |
 |---|---|
-| `run_pipeline.py` | **The single entry point** — see §9.2.1 for what each stage does. Imports nothing from `demo.py` or from `scripts/`: the code it needs is inlined, so it depends only on `hislam2/`, `thirdparty/vggt`, and three CLIs it drives as subprocesses (`evo_ape`, `tsdf_integrate.py`, `scripts/eval_recon.py`). That self-containment is the point — the file is the experiment. |
+| `run_pipeline.py` | **The single entry point** — see §9.2.1 for what each stage does. Imports nothing from `demo.py` or from `scripts/`: the extract and test code it needs is inlined. The adapt stage is the exception and the direction of travel — it lives in `ada-slam/adapt/` and is reached through `LoRAVGGT` (§9.5). Otherwise it depends only on `hislam2/`, `thirdparty/vggt`, and three CLIs it drives as subprocesses (`evo_ape`, `tsdf_integrate.py`, `scripts/eval_recon.py`). |
 | `export_slam_depth.py` | Standalone version of the extract stage's second half, for when a `slam_depth.npz` already exists (e.g. from a bare `demo.py --dump_slam_depth`). Turns it into training-ready per-keyframe files. `--depth_source` picks the target: `rendered` (default, from `renders/depth_after_opt/`) or `slam` (`1/disps_up`); both are written as float32 `.npy` so only the directory name differs downstream, and `poses_slam.txt` lists **only** the exported keyframes because `lora_adapt_vggt.py` takes its keyframe list from it. Builds the confidence mask with `droid_backends.depth_filter` (≥2 of 6 temporal neighbours agree — the recipe in `util/droid_visualization.py:104-110`; arrays **must** be sliced to the real keyframe count or trailing frames match unused buffer slots). Also reports scale-aligned depth L1 for SLAM vs Gaussian-rendered vs JDSA-aligned-Omnidata depth, in both per-frame and global-scale columns — the gap between those columns *is* the cross-frame-consistency diagnostic. |
-| `lora_adapt_vggt.py` | Standalone version of the adapt stage (`run_pipeline.py` carries its own copy plus the train/val split). One keyframe = one sample, placed **first** in the sequence so VGGT predicts in that keyframe's frame (verified: `extrinsic[0]` is identity to 5e-4, and rebased poses match SLAM GT to 0.04°). Depth supervises frame 0 only; poses supervise all frames, rebased to the keyframe. A random number of neighbouring non-keyframes ride along, so the adapter works monocular *and* with context. LoRA is hand-rolled (~40 lines, no `peft`): rank 16 (`run_pipeline.py` defaults to 8) on `attn.{qkv,proj}` + `mlp.{fc1,fc2}` across the aggregator's 24+24 blocks → 12.58 M trainable, 1.07 % of 1.17 B. Heads and `patch_embed` stay frozen; gradients reach the aggregator *through* them. |
+| `lora_adapt_vggt.py` | ~120 lines of `argparse` over `ada-slam/adapt/` — it builds the two config dataclasses and calls `LoRAVGGT.train()`, exactly as `stage_adapt` does. Every field of both configs is a flag, defaulting to what `run_pipeline.py` currently uses, so a bare run reproduces the adapt stage and a flag sweeps one knob without touching `run_pipeline.py`. Use it when a scene is already extracted and only the adaptation needs re-running. |
 
-Both standalone scripts predate `run_pipeline.py` and are the only surviving pieces of the old
-CLI chain; nothing drives them any more, and the A/B stage has no standalone equivalent at all.
+`export_slam_depth.py` predates `run_pipeline.py` and still duplicates the export;
+`lora_adapt_vggt.py` no longer duplicates anything (§9.5). The A/B stage has no standalone
+equivalent at all.
 
 #### 9.2.1 Inside `run_pipeline.py`
 
 | Stage / part | What it does |
 |---|---|
 | `stage_extract` | Writes a generated `extract_config.yaml` that `inherit_from`s `CONFIG` and applies the `EXTRACT_KF_*` knobs, then runs SLAM over the first `FRACTION`% of the sequence with the `hi2.py` depth dump enabled, then exports. The generated config is given to **this run only**; `stage_test` asserts the arms get the unmodified `CONFIG`, so a denser training set can never masquerade as a tracking change in the comparison. Note the binding gate is `keyframe_thresh` (`EXTRACT_KF_REDUNDANT_THRESH`), not the motion filter: over 204 TUM frames `(thresh, keyframe_thresh) = (2.4, 4.0)` gave 43 keyframes, `(1.2, 4.0)` only 45, `(1.2, 1.5)` 83, because `track_frontend.py:49-52` prunes back whatever the motion filter proposes. GT depth is routed to the export only, never to `Hi2` (§9.3). |
-| `stage_adapt` | LoRA on VGGT, as in `lora_adapt_vggt.py`, plus a **train/val split** of the exported keyframes (`LORA_TRAIN_FRAC`, `LORA_SPLIT_MODE`) so depth L1 is reported on held-out keyframes rather than on the adapter's own training set. `LORA_KEEP_BEST` optionally snapshots on val improvement instead of saving the last epoch. |
+| `stage_adapt` | Ten lines: precondition checks, `gpu_gate`, then `LoRAVGGT(LORA, seed=ADAPT.seed).train(...)` and `release()`. The stage itself is `ada-slam/adapt/` (§9.5). It includes a **train/val split** of the exported keyframes (`train_frac`, `split_mode`) so depth L1 is reported on held-out keyframes rather than on the adapter's own training set, and `keep_best` optionally snapshots on val improvement instead of saving the last epoch. |
 | `stage_test` | One full-sequence run per entry in `ARMS`, then `evaluate` + the comparison table. Captures the stock `MotionFilter.prior_extractor` **once** and restores it before every arm, so a VGGT arm's monkey-patch cannot leak into a later Omnidata arm and silently make it a second VGGT arm. |
-| `install_vggt_prior` / `vggt_prior_extractor` | The monkey-patch that swaps the depth prior. Normals stay Omnidata, so **depth is the only variable between arms**. Undoes `motion_filter.py`'s ImageNet normalisation (§9.3) and prefers the `vggt_hw` recorded in the adapter's `config.json` over the `VGGT_HW` constant, so inference cannot run at a resolution the adapter never saw. |
+| `install_vggt_prior` / `vggt_prior_extractor` | The monkey-patch that swaps the depth prior. Normals stay Omnidata, so **depth is the only variable between arms**. Undoes `motion_filter.py`'s ImageNet normalisation (§9.3); the model comes from `LoRAVGGT.from_adapter`, which rebuilds the **whole** structure — rank, alpha, targets, `patch_embed` and `vggt_hw` — from what the adapter recorded, so an arm cannot run the adapter in a shape or at a resolution it was never trained in. |
 | `run_ate` / `run_mesh` / `split_render_metrics` / `evaluate` | The metrics harness: evo ATE (Sim(3)-aligned), TSDF fuse → Sim(3)-align → `eval_recon.py` (skipped when `GT_MESH is None`, as on TUM), and PSNR/SSIM/depth-L1 recomputed per frame from the saved renders so every number can be **split seen/unseen** at `split_at`. `run_mesh` retries down `VOXEL_FALLBACKS` when marching cubes OOMs on the shared GPU and records which size won. |
 | `compare` | Prints the baseline in absolutes and every other arm as absolute + delta; refuses to print mesh rows when the arms' `voxel_size` disagree. |
 | `free_vram` / `gpu_gate` | Shared-workstation hygiene: `MIN_FREE_VRAM_MB` is re-checked before every GPU stage, and VRAM is force-released between stages (§8's last rough edge is why this is needed at all). |
@@ -516,15 +521,15 @@ CLI chain; nothing drives them any more, and the A/B stage has no standalone equ
 - VGGT's aggregator returns `None` for uncached layers (only 4/11/17/23 are kept, deliberately,
   so layer indices stay stable — `aggregator.py:196`). Any per-frame slicing of the token list
   must preserve those `None`s.
-- **`VGGT_HW` must match the tracking stream's aspect ratio, and must match across VGGT arms.**
-  Both the adapter's `frame()` and `vggt_prior_extractor` resize straight to it with no
+- **`LORA.vggt_hw` must match the tracking stream's aspect ratio, and must match across VGGT
+  arms.** Both `SceneData.frame()` and `vggt_prior_extractor` resize straight to it with no
   letterboxing, so a mismatched aspect squashes the image off VGGT's training distribution —
   `(294, 518)` suits Replica's 344×616, and `run_pipeline.py`'s current `(378, 518)` suits TUM's
-  400×544, which the Replica value would distort by ~30 %. Two guards: the adapt stage warns and
-  suggests a value when the ratios differ by >5 %, and `install_vggt_prior` reads the adapter's
-  recorded `vggt_hw` in preference to the `VGGT_HW` constant. The `vggt_base` arm has no adapter
-  to read, so it silently takes `VGGT_HW` — set that to the value the adapted arm was trained at
-  or the two VGGT arms differ in input resolution as well as in adaptation.
+  400×544, which the Replica value would distort by ~30 %. Two guards: `SceneData.aspect_report()`
+  warns and suggests a value when the ratios differ by >5 %, and `LoRAVGGT.from_adapter` takes the
+  adapter's recorded `vggt_hw` in preference to the configured one. The `vggt_base` arm has no
+  adapter to read, so it silently takes `LORA.vggt_hw` — set that to the value the adapted arm was
+  trained at, or the two VGGT arms differ in input resolution as well as in adaptation.
 - **Never pass GT depth to `Hi2` on a run whose renders will become training data.**
   `eval_utils.py:50-52` zeroes the rendered depth wherever the GT depth is invalid. Replica's GT is
   dense so it is a no-op there, but TUM's Kinect GT is ~24 % holes sitting on exactly the hard
@@ -553,13 +558,43 @@ may already be robust to the weakness being fixed. Replica is well-lit synthetic
 not test the difficult-lighting premise that motivated the work.
 
 Experiment outputs live in `outputs/ab_{depth,disp}_p{40,100}/` (the `depth`/`disp` suffix is
-`DEPTH_SPACE`, the `p` number the sequence fraction the adapter trained on).
+`ADAPT.depth_space`, the `p` number the sequence fraction the adapter trained on).
 
 Note those runs predate the choice of supervision target and used `slam` depth (`1/disps_up`),
 which is the less accurate target and is dumped *before* the refinement that produces the poses
 they were trained against. `DEPTH_SOURCE = 'slam'` reproduces them exactly.
 
 §10 moves the same experiment onto real data, which is what the Replica null asks for next.
+
+### 9.5 `ada-slam/adapt/` — the adapt stage as a package
+
+The adapt stage was lifted out of `run_pipeline.py` (which was 1366 lines carrying all three
+stages) into an importable package. Extract and test are still inline and follow later; the inner
+`ada-slam/` directory is where they will land, which is why `stream_resize` sits in
+`ada-slam/common.py` rather than inside `adapt/`.
+
+| File | Contents |
+|---|---|
+| `config.py` | `LoRAConfig` and `AdaptConfig`, both `frozen`. **No field has a default** — the caller must state every value, so a hyperparameter is written down in exactly one place per entry point and none can be inherited silently from the package. `__post_init__` validates `vggt_hw % 14` and the three enum-ish strings. |
+| `lora.py` | `LoRALinear`, `inject_lora`, `lora_state_dict`. Hand-rolled, no `peft`: rank 8 on `attn.{qkv,proj}` + `mlp.{fc1,fc2}` across the aggregator's 24+24 blocks → 6.29 M trainable of 1.17 B. `B` starts at zero so the adapter is identity at step 0; `A` is kaiming — **which is why the seed goes to the constructor** (see below). |
+| `model.py` | `LoRAVGGT` — build/inject/load, `forward` (depth head on frame 0, camera head on all), `predict_depth` (the inference path the A/B arms use), `save`, `release`, and `from_adapter`. |
+| `data.py` | `SceneData` (one keyframe = one sample, placed **first** so VGGT predicts in that keyframe's frame — verified: `extrinsic[0]` is identity to 5e-4, rebased poses match SLAM GT to 0.04°), `split_keyframes`, `tum_to_c2w`, `aspect_report`. |
+| `losses.py` | `median_scale`, `depth_loss`, `pose_loss`. The two undetached scale estimates that §9.3 warns about live here. |
+| `trainer.py` | `run_training` (reached via `LoRAVGGT.train()`) and `eval_depth`. |
+
+Two things are easy to get wrong and are worth stating:
+
+- **The seed belongs to the constructor, not the trainer.** `LoRALinear.A` is kaiming-initialised
+  when LoRA is injected, so `LoRAVGGT(cfg, seed=...)` seeds `torch` immediately before the model
+  is built. Seeding inside `run_training` would be too late: the adapter is identity at step 0
+  either way (`B` is zero), but `A`'s values steer the whole trajectory, so a run seeded
+  afterwards is not reproducible.
+- **`from_adapter` overrides the config, deliberately.** An adapter only means anything inside
+  the structure it was trained in, so the `rank`, `alpha`, `targets`, `lora_patch_embed` and
+  `vggt_hw` in its `config.json` win over whatever `LORA` says, and each override is printed. Only
+  `weights` (where the VGGT-1B snapshot lives on this machine) still comes from the caller. Those
+  key names predate the package and must not be renamed — adapters already on disk are read
+  through them.
 
 ---
 
@@ -584,8 +619,8 @@ Two properties of its output are load-bearing:
 - **Sequential `%06d` filenames.** `demo.py:72` derives each trajectory timestamp from the
   filename, so index names make timestamps frame indices — matching `preprocess_replica.py:28` and
   letting `evo_ape` associate exactly. Real TUM names would break more than that:
-  `lora_adapt_vggt.py:131` keys poses by `int(timestamp)`, and `1305031910.765238` truncates to the
-  same integer for ~30 consecutive frames, silently collapsing the pose dict.
+  `adapt/data.py:SceneData` keys poses by `int(timestamp)`, and `1305031910.765238` truncates to
+  the same integer for ~30 consecutive frames, silently collapsing the pose dict.
 - **`colors/` and `depths/` 1:1 by index.** `eval_utils.py:47`, `export_slam_depth.py:122` and
   `run_pipeline.py:split_render_metrics` all index GT depth by RGB frame number.
   `run_pipeline.py:main` asserts this before any GPU work.
@@ -597,7 +632,8 @@ if either is set. Preprocessing undistorts colour
 (bilinear) and depth (nearest — interpolating across a depth discontinuity invents surfaces, and
 blending with an invalid 0 drags real depths down), crops the measured black border, rescales depth
 5000 → 6553.5, and writes a distortion-free `calib.txt`. Measured for fr1: 18 px border →
-604×444 → **400×544** at tracking resolution, hence `VGGT_HW = (378, 518)` to match that aspect.
+604×444 → **400×544** at tracking resolution, hence `LORA.vggt_hw = (378, 518)` to match that
+aspect.
 
 Verified end to end on the real data: 0.000 % black pixels after the crop, processed depth median
 within 0.4 % of the raw file, and warping frame 0 forward with the written calib + GT poses + GT
