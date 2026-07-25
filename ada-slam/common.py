@@ -1,11 +1,14 @@
 """Helpers shared by more than one pipeline stage.
 
-Deliberately outside adapt/: as the extract and test stages follow the adapt stage out of
-scripts/run_pipeline.py, this is the neutral ground they can all import from without depending
-on each other.
+Deliberately outside any of them: extract, adapt and abtest all need these, and this is the
+neutral ground they can import from without depending on each other.
 """
 import cv2
 import numpy as np
+
+# Which of the extract stage's export targets supervises the adaptation. Lives here, not in a
+# stage: extract writes depth_<src>/ and adapt reads it, so one tuple has to bound both.
+DEPTH_SOURCES = ('slam', 'rendered')
 
 
 def stream_resize(img, res):

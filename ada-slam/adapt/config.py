@@ -13,7 +13,8 @@ The split is by lifetime, not by topic:
 from dataclasses import dataclass
 from typing import Tuple
 
-DEPTH_SOURCES = ('slam', 'rendered')
+from common import DEPTH_SOURCES      # extract writes depth_<src>/, this reads it: one tuple
+
 DEPTH_SPACES = ('depth', 'disparity')
 SPLIT_MODES = ('stride', 'contiguous', 'random')
 

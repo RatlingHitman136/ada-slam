@@ -23,15 +23,15 @@ everything it pulled in.
 import os
 import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))          # <repo>/ada-slam/adapt
-_ROOT = os.path.dirname(os.path.dirname(_HERE))             # <repo>
+# The irreducible four lines: `paths` is itself a sibling module, so ada-slam/ has to reach
+# sys.path before it can be imported. Everything after this goes through paths.bootstrap.
+_ADA = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))      # <repo>/ada-slam
+if _ADA not in sys.path:
+    sys.path.insert(0, _ADA)
 
-# `common` is a sibling module and thirdparty/vggt is vendored rather than installed, so both need
-# to be on sys.path. The caller has usually done it already; do it anyway so `import adapt` works
-# from anywhere.
-for _p in (os.path.dirname(_HERE), os.path.join(_ROOT, 'thirdparty/vggt')):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+from paths import VGGT, bootstrap                                # noqa: E402
+
+bootstrap(VGGT)      # `common` is a sibling module; vggt is vendored, not installed
 
 from .config import AdaptConfig, LoRAConfig                      # noqa: E402
 from .data import SceneData, split_keyframes, tum_to_c2w         # noqa: E402

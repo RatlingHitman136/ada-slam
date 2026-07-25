@@ -4,6 +4,7 @@ The one object callers talk to. Both the adapt stage (which trains it) and the A
 run it as MotionFilter's depth prior) go through this class, so there is a single definition of
 what "VGGT with our adapter" means.
 """
+import gc
 import json
 import os
 from dataclasses import replace
@@ -32,6 +33,7 @@ class LoRAVGGT:
         from safetensors.torch import load_file
         from vggt.models.vggt import VGGT
 
+        self.released = False    # set first, so it exists even if construction raises below
         if seed is not None:
             torch.manual_seed(seed)
 
@@ -76,8 +78,13 @@ class LoRAVGGT:
 
     # ---------------------------------------------------------------- inference
 
+    def _ensure_live(self):
+        if self.released:
+            raise RuntimeError('this LoRAVGGT was release()d; construct a new instance')
+
     def forward(self, images):
         """Aggregator once; depth head on frame 0 only; camera head on everything."""
+        self._ensure_live()
         tok, ps_idx = self.model.aggregator(images[None])
         # this build caches only layers 4/11/17/23 and leaves the rest None to save memory
         # (aggregator.py:196) - the frame slice must preserve those Nones
@@ -89,6 +96,7 @@ class LoRAVGGT:
     @torch.no_grad()
     def predict_depth(self, images):
         """Depth for a single frame. Skips camera_head, and runs the DPT head on frame 0 only."""
+        self._ensure_live()
         tok, ps_idx = self.model.aggregator(images[None])
         tok0 = [t[:, :1] if t is not None else None for t in tok]
         depth, _ = self.model.depth_head(tok0, images[None][:, :1], ps_idx)
@@ -98,32 +106,38 @@ class LoRAVGGT:
 
     def train(self, scene_dir, image_dir, out_dir, cfg):
         """LoRA-adapt on an extract stage's export. Returns the run summary."""
+        self._ensure_live()
         from .trainer import run_training
         return run_training(self, scene_dir, image_dir, out_dir, cfg)
 
     def train_mode(self):
+        self._ensure_live()
         self.model.train()          # also enables the aggregator's gradient checkpointing
         return self
 
     def eval_mode(self):
+        self._ensure_live()
         self.model.eval()
         return self
 
     # ---------------------------------------------------------------- bookkeeping
 
     def trainable_parameters(self):
+        self._ensure_live()
         return [p for p in self.model.parameters() if p.requires_grad]
 
     def n_trainable(self):
         return sum(p.numel() for p in self.trainable_parameters())
 
     def summary(self):
+        self._ensure_live()
         n_train = self.n_trainable()
         n_total = sum(p.numel() for p in self.model.parameters())
         return (f'LoRA r={self.cfg.rank} on {self.n_wrapped} Linears -> {n_train/1e6:.2f}M '
                 f'trainable / {n_total/1e9:.2f}B ({100*n_train/n_total:.2f}%)')
 
     def state_dict(self):
+        self._ensure_live()
         return lora_state_dict(self.model)
 
     def save(self, out_dir, state=None, extra=None):
@@ -145,5 +159,13 @@ class LoRAVGGT:
         return f'{out_dir}/adapter.safetensors'
 
     def release(self):
-        """Drop the model so the caller's cache-emptying can actually reclaim the VRAM."""
+        """Release memory used for the model. This class can no longer be used.
+        """
+        if self.released:
+            return
+        self.released = True
         self.model = None
+        gc.collect()                 # break any hook/optimiser cycles so the module is truly freed
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
