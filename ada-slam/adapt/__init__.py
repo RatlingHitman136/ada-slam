@@ -33,13 +33,13 @@ from paths import VGGT, bootstrap                                # noqa: E402
 
 bootstrap(VGGT)      # `common` is a sibling module; vggt is vendored, not installed
 
-from .config import AdaptConfig, LoRAConfig                      # noqa: E402
+from .config import AdaptConfig, LoRAConfig, aspect_lines, vggt_hw_for   # noqa: E402
 from .data import SceneData, split_keyframes, tum_to_c2w         # noqa: E402
 from .losses import depth_loss, median_scale, pose_loss          # noqa: E402
 from .lora import LoRALinear, inject_lora, lora_state_dict       # noqa: E402
 from .model import LoRAVGGT                                      # noqa: E402
 from .trainer import eval_depth, run_training                    # noqa: E402
 
-__all__ = ['AdaptConfig', 'LoRAConfig', 'LoRALinear', 'LoRAVGGT', 'SceneData', 'depth_loss',
-           'eval_depth', 'inject_lora', 'lora_state_dict', 'median_scale', 'pose_loss',
-           'run_training', 'split_keyframes', 'tum_to_c2w']
+__all__ = ['AdaptConfig', 'LoRAConfig', 'LoRALinear', 'LoRAVGGT', 'SceneData', 'aspect_lines',
+           'depth_loss', 'eval_depth', 'inject_lora', 'lora_state_dict', 'median_scale',
+           'pose_loss', 'run_training', 'split_keyframes', 'tum_to_c2w', 'vggt_hw_for']

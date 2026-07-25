@@ -29,12 +29,14 @@ sys.path.insert(0, os.path.join(_ROOT, 'ada-slam'))                       # nope
 sys.path.insert(0, os.path.join(_ROOT, 'hislam2'))                        # nopep8
 sys.path.insert(0, os.path.join(_ROOT, 'thirdparty/vggt'))                # nopep8
 import time
+from dataclasses import replace
 
 import numpy as np
 import torch
 
 from abtest import TestConfig, run_ab_test
 from adapt import AdaptConfig, LoRAConfig, LoRAVGGT
+from common import probe_stream_hw
 from extract import ExtractConfig, run_extract
 from runtime import banner, ensure_venv_on_path, free_vram, gpu_gate, raise_fd_limit
 from slam import SlamConfig, SlamRunner
@@ -72,6 +74,14 @@ STREAM_RES       = 341 * 640           # tracking resolution budget
 DEPTH_PNG_SCALE  = 6553.5              # 16-bit depth PNG scale used across the repo
 DEPTH_SOURCE     = 'slam'  # 'rendered' (Gaussian expected depth) | 'slam' (1/disps_up)
 
+# VGGT's input size. None = derive it in main() from the tracking stream's aspect ratio, which is
+# what you want: nothing letterboxes anywhere, so a value that does not match the stream squashes
+# the image off VGGT's training distribution, and the correct value is a pure function of the
+# stream (adapt/config.py:vggt_hw_for). State a value instead to pin it - an adapter's own
+# recorded size always wins over both (§9.3). It is NOT derived here: this block is re-executed in
+# every spawned reader child and must not touch the filesystem.
+VGGT_HW          = None                # or e.g. (378, 518) for TUM, (294, 518) for Replica
+
 # ---------------------------------------------------------------- the SLAM runs
 # What is identical across all three invocations - the extract run and both arms. Everything that
 # differs between them (tracking YAML, output dir, length, buffer, gtdepthdir, dump_slam_depth,
@@ -106,7 +116,7 @@ EXTRACT = ExtractConfig(
 # in even if these values move afterwards. ADAPT is the training run, which no adapter re-reads.
 LORA = LoRAConfig(
     weights='pretrained_models/vggt',
-    vggt_hw=(378, 518),        # dims %14; MUST match the tracking stream's aspect (§9.3)
+    vggt_hw=VGGT_HW,           # None -> derived in main(); see the constant above
     rank=4, alpha=8,
     targets=('attn.qkv', 'attn.proj', 'mlp.fc1', 'mlp.fc2'),
     patch_embed=False)         # False = adapt only the alternating-attention stack
@@ -229,8 +239,19 @@ def main():
     split_at = extract_length
     adapter = f'{OUT_EXTRACT}/lora-vggt/adapter.safetensors'
 
+    # Resolve vggt_hw HERE, not in the PARAMETERS block: deriving reads a frame, and that block is
+    # re-executed by every spawned reader child (which never touches LORA - it only needs SLAM).
+    # After chdir, so the relative COLORS resolves however the script was invoked.
+    global LORA, TEST
+    stream_hw = probe_stream_hw(COLORS, STREAM_RES)
+    LORA = LORA.resolved(stream_hw)
+    TEST = replace(TEST, lora=LORA)          # the vggt_base arm reads its size off this
+
     print(f'sequence  : {SCENE}  ({n_frames} frames, {COLORS})')
     print(f'config    : {CONFIG}  calib {CALIB}')
+    print(f'stream    : {stream_hw[1]}x{stream_hw[0]} (aspect '
+          f'{stream_hw[1]/stream_hw[0]:.3f})   VGGT input: {LORA.vggt_hw[1]}x{LORA.vggt_hw[0]}'
+          f'{" (derived)" if VGGT_HW is None else " (pinned by VGGT_HW)"}')
     print(f'adapter   : trains on frames 0..{extract_length-1} ({FRACTION}%), '
           f'evaluated on 0..{n_frames-1}')
     print(f'target    : depth_{DEPTH_SOURCE}/   split at frame {split_at}')

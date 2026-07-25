@@ -13,8 +13,8 @@ import torch.nn.functional as F
 class VggtPrior:
     """VGGT depth + Omnidata normals. `adapter=None` is the un-adapted 'vggt_base' arm."""
 
-    def __init__(self, cfg, adapter=None):
-        from adapt import LoRAVGGT
+    def __init__(self, cfg, adapter=None, stream_hw=None):
+        from adapt import LoRAVGGT, aspect_lines
 
         # from_adapter rebuilds cfg.lora from what the adapter recorded - rank, targets and above
         # all the input size it was trained at - and says so when that differs. Only the
@@ -28,6 +28,13 @@ class VggtPrior:
         which = f'LoRA-adapted VGGT ({adapter})' if adapter else 'base VGGT-1B (no adapter)'
         print(f'depth prior: {which} at {self.hw[1]}x{self.hw[0]}')
         print('normals    : Omnidata (unchanged, so depth is the only variable)')
+
+        # The check the inference path never had. It matters most for exactly the two cases the
+        # adapt stage's report cannot cover: an adapter whose recorded size was trained on a
+        # different stream, and the 'vggt_base' arm, which has no adapter to read a size from.
+        if stream_hw is not None:
+            for line in aspect_lines(stream_hw, self.hw, 'VggtPrior'):
+                print(f'  {line}')
 
     def extractor(self):
         """A plain function to install as MotionFilter.prior_extractor.

@@ -7,6 +7,7 @@ import json
 import os
 import time
 
+from common import probe_stream_hw
 from runtime import banner, free_vram
 
 from .config import ARM_NAMES
@@ -15,15 +16,15 @@ from .prior import VggtPrior
 from .report import compare, print_report
 
 
-def make_prior(arm, cfg, adapter):
+def make_prior(arm, cfg, adapter, stream_hw=None):
     """The one place an arm name becomes a depth prior. None = stock Omnidata."""
     if arm == 'omnidata':
         return None
     if arm == 'vggt_lora':
         if not os.path.exists(adapter):
             raise SystemExit(f'no adapter at {adapter} - run the adapt stage first')
-        return VggtPrior(cfg, adapter)
-    return VggtPrior(cfg, None)          # 'vggt_base': stock VGGT-1B, no adapter
+        return VggtPrior(cfg, adapter, stream_hw)
+    return VggtPrior(cfg, None, stream_hw)   # 'vggt_base': stock VGGT-1B, no adapter
 
 
 def run_ab_test(runner, slam_cfg, cfg, arm_config, adapter, split_at, skip_existing=False):
@@ -32,6 +33,9 @@ def run_ab_test(runner, slam_cfg, cfg, arm_config, adapter, split_at, skip_exist
     `arm_config` is the base tracking YAML, identical for every arm - the caller asserts it is not
     the extract run's derived one, where both paths are visible side by side.
     """
+    # probed once, not per arm: it only depends on the stream, and every arm shares that
+    stream_hw = probe_stream_hw(slam_cfg.colors, slam_cfg.stream_res)
+
     labels, results = [], []
     for arm in cfg.arms:
         out = cfg.out_dir(arm)
@@ -43,7 +47,7 @@ def run_ab_test(runner, slam_cfg, cfg, arm_config, adapter, split_at, skip_exist
             continue
 
         banner(f'arm {arm} -> {out}')
-        prior = make_prior(arm, cfg, adapter)
+        prior = make_prior(arm, cfg, adapter, stream_hw)
         label = prior.label if prior else 'Omnidata depth (baseline)'
         try:
             t0 = time.time()

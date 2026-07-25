@@ -16,6 +16,8 @@ import torch
 
 from common import stream_resize
 
+from .config import aspect_lines
+
 
 def tum_to_c2w(row):
     from scipy.spatial.transform import Rotation
@@ -77,19 +79,13 @@ class SceneData:
         self.K = np.array([[fx * sx, 0, cx * sx], [0, fy * sy, cy * sy], [0, 0, 1]], np.float64)
 
     def aspect_report(self):
-        """The stream -> VGGT resize, and a warning when it distorts. frame() resizes without
-        letterboxing, so a mismatched aspect ratio squashes the image off VGGT's training
-        distribution; the suggested value is the one that would not."""
-        h, w = self.stream_hw
-        vh, vw = self.hw
-        skew = (vw / vh) / (w / h)
-        lines = [f'stream {w}x{h} (aspect {w/h:.3f}) -> VGGT {vw}x{vh} '
-                 f'(aspect {vw/vh:.3f}), squash {skew:.3f}x']
-        if not 0.95 < skew < 1.05:
-            lines.append(f'  WARNING: aspect ratios differ by {abs(1-skew)*100:.0f}%. '
-                         f'SceneData.frame() resizes without letterboxing, so VGGT sees a '
-                         f'distorted image. Consider vggt_hw = ({14*round(518*h/w/14)}, 518)')
-        return lines
+        """The stream -> VGGT resize, and a warning when it distorts.
+
+        With vggt_hw derived (LoRAConfig.resolved) this should never warn. If it does, the value
+        was either pinned by hand or read back off an adapter trained on a different stream -
+        both worth knowing, which is why the check survives derivation.
+        """
+        return aspect_lines(self.stream_hw, self.hw, 'SceneData.frame()')
 
     def frame(self, t):
         img = cv2.cvtColor(cv2.imread(os.path.join(self.image_dir, self.files[t])),

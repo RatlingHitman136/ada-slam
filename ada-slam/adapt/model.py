@@ -34,6 +34,10 @@ class LoRAVGGT:
         from vggt.models.vggt import VGGT
 
         self.released = False    # set first, so it exists even if construction raises below
+        if cfg.vggt_hw is None:
+            raise SystemExit('LoRAConfig.vggt_hw is None (unresolved). Derive it first with '
+                             'cfg.resolved(probe_stream_hw(colors, stream_res)) - the model needs '
+                             'a concrete input size, and it must match the tracking stream.')
         if seed is not None:
             torch.manual_seed(seed)
 
