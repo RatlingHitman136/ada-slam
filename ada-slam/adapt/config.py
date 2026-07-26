@@ -140,6 +140,8 @@ class AdaptConfig:
     eval_every_epoch: bool   # False = only before training and after the last epoch
     eval_max_kf: int         # evenly subsample each eval subset to at most this many; 0 = no cap
     keep_best: bool          # True = snapshot on val improvement and save that, not the last epoch
+    checkpoint_every: int    # full adapter snapshot every N epochs; 0 = off. The CADENCE only -
+                             # where they land is the ckpt_dir argument of LoRAVGGT.train()
 
     def __post_init__(self):
         for name, allowed in (('depth_source', DEPTH_SOURCES), ('depth_space', DEPTH_SPACES),
@@ -147,3 +149,5 @@ class AdaptConfig:
             value = getattr(self, name)
             if value not in allowed:
                 raise ValueError(f'{name}={value!r} is not one of {allowed}')
+        if self.checkpoint_every < 0:
+            raise ValueError(f'checkpoint_every={self.checkpoint_every} must be >= 0 (0 = off)')

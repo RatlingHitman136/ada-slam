@@ -2,6 +2,12 @@
 
 Reached through LoRAVGGT.train(); split out only because it is long. One keyframe = one sample,
 depth supervises frame 0, poses supervise every frame in the sample.
+
+It trains and reports; it does NOT write the final adapter. That is the caller's, with the
+returned 'state' and 'run' going straight into LoRAVGGT.save(). The only weights this file writes
+are cfg.checkpoint_every's periodic snapshots into ckpt_dir, and each of those is a complete
+adapter directory rather than a bare tensor file, so any epoch can be loaded back with
+from_adapter and run as an A/B arm.
 """
 import json
 import math
@@ -37,12 +43,21 @@ def eval_depth(lora, data, kfs, cfg):
     return float(np.mean(errs))
 
 
-def run_training(lora, scene_dir, image_dir, out_dir, cfg):
+def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
     """LoRA-adapt `lora` on the exported depth + poses, reporting train/val depth L1.
+
+    Writes train_log.json into out_dir and, if cfg.checkpoint_every, a snapshot per N epochs into
+    ckpt_dir. The adapter itself is NOT written - the returned 'state' and 'run' are save()'s
+    state= and extra=, so the caller decides where it lands.
 
     torch is NOT seeded here: LoRAVGGT(seed=...) had to do it before injection, because the
     adapter's A matrices are initialised then. cfg.seed still drives the data order below.
     """
+    if cfg.checkpoint_every and not ckpt_dir:
+        raise SystemExit(f'checkpoint_every={cfg.checkpoint_every} asks for a snapshot every '
+                         f'{cfg.checkpoint_every} epochs, but no ckpt_dir was given. The cadence '
+                         f'is AdaptConfig.checkpoint_every, the location is train(ckpt_dir=...); '
+                         f'set both, or set checkpoint_every=0.')
     rng = np.random.default_rng(cfg.seed)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -85,6 +100,28 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg):
     steps_per_epoch = math.ceil(len(data.train_kf) / cfg.batch_size)
     print(f'{len(data.train_kf)} train keyframes / batch {cfg.batch_size} = {steps_per_epoch} '
           f'optimiser steps per epoch, {cfg.epochs * steps_per_epoch} in total')
+
+    # What every saved adapter records about the run that produced it. Built HERE, before the
+    # loop, because a mid-training checkpoint needs it too - the only fields that cannot exist
+    # yet are which epoch is being saved and how the evaluation had gone by then.
+    run_cfg = {'epochs': cfg.epochs, 'batch_size': cfg.batch_size,
+               'steps_per_epoch': steps_per_epoch, 'samples_per_epoch': len(data.train_kf),
+               'lr': cfg.lr, 'weight_decay': cfg.weight_decay, 'grad_clip': cfg.grad_clip,
+               'lambda_pose': cfg.lambda_pose, 'depth_space': cfg.depth_space,
+               'depth_source': cfg.depth_source, 'coupled_scale': cfg.coupled_scale,
+               'p_single_view': cfg.p_single_view, 'max_left': cfg.max_left,
+               'max_right': cfg.max_right, 'radius': cfg.radius, 'scene': scene_dir,
+               'seed': cfg.seed, 'split_mode': cfg.split_mode, 'train_frac': cfg.train_frac,
+               'n_train_kf': len(data.train_kf), 'n_val_kf': len(data.val_kf),
+               'val_kf': data.val_kf, 'keep_best': cfg.keep_best,
+               'checkpoint_every': cfg.checkpoint_every}
+
+    def record(epoch):
+        """run_cfg for a save of `epoch`, with the evaluation known at that moment."""
+        return {**run_cfg, 'saved_epoch': epoch, 'eval_history': history}
+
+    if ckpt_dir and cfg.checkpoint_every:
+        print(f'checkpointing every {cfg.checkpoint_every} epochs -> {ckpt_dir}/epoch_NNN/')
 
     for epoch in range(cfg.epochs):
         # every training keyframe exactly once per epoch, in a fresh order each time
@@ -148,20 +185,13 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg):
             if cfg.keep_best and v is not None and v < best['val_l1']:
                 best = {'val_l1': v, 'epoch': epoch, 'state': lora.state_dict()}
 
+        # A full adapter directory, not a bare tensor file, so any epoch can be loaded back with
+        # from_adapter and run as an A/B arm. Safe mid-training: lora_state_dict detaches to CPU.
+        if cfg.checkpoint_every and (epoch + 1) % cfg.checkpoint_every == 0:
+            extra = {**record(epoch), 'checkpoint': True}
+            print(f'  checkpoint -> {lora.save(f"{ckpt_dir}/epoch_{epoch:03d}", extra=extra)}')
+
     keep = cfg.keep_best and best['state'] is not None
-    run_cfg = {'epochs': cfg.epochs, 'batch_size': cfg.batch_size,
-               'steps_per_epoch': steps_per_epoch, 'samples_per_epoch': len(data.train_kf),
-               'lr': cfg.lr, 'weight_decay': cfg.weight_decay, 'grad_clip': cfg.grad_clip,
-               'lambda_pose': cfg.lambda_pose, 'depth_space': cfg.depth_space,
-               'depth_source': cfg.depth_source, 'coupled_scale': cfg.coupled_scale,
-               'p_single_view': cfg.p_single_view, 'max_left': cfg.max_left,
-               'max_right': cfg.max_right, 'radius': cfg.radius, 'scene': scene_dir,
-               'seed': cfg.seed, 'split_mode': cfg.split_mode, 'train_frac': cfg.train_frac,
-               'n_train_kf': len(data.train_kf), 'n_val_kf': len(data.val_kf),
-               'val_kf': data.val_kf, 'keep_best': cfg.keep_best,
-               'saved_epoch': best['epoch'] if keep else cfg.epochs - 1,
-               'eval_history': history}
-    adapter = lora.save(out_dir, state=best['state'] if keep else None, extra=run_cfg)
     json.dump(log, open(f'{out_dir}/train_log.json', 'w'))
 
     # ---- summary: the val row is the one that means something ----
@@ -172,8 +202,12 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg):
             print(f'  {name:<8}' + ''.join(
                 f'{r[key]:>10.4f}' if r.get(key) is not None else f'{"n/a":>10}' for r in history))
     if cfg.keep_best and best['epoch'] is not None:
-        print(f'  saved epoch {best["epoch"]} (best val L1 {best["val_l1"]:.4f})')
-    print(f'saved adapter ({n_train/1e6:.1f}M params) to {out_dir}')
+        print(f'  epoch {best["epoch"]} kept (best val L1 {best["val_l1"]:.4f})')
+    print(f'trained {n_train/1e6:.1f}M adapter params; log in {out_dir}/train_log.json. '
+          f'The caller writes the adapter.')
 
-    return {'adapter': adapter, 'history': history, 'run': run_cfg,
-            'train_kf': data.train_kf, 'val_kf': data.val_kf}
+    # 'state' and 'run' are save()'s state= and extra=: keep_best's snapshot still reaches the
+    # file, it is just applied one level up now.
+    return {'state': best['state'] if keep else None,
+            'run': record(best['epoch'] if keep else cfg.epochs - 1),
+            'history': history, 'train_kf': data.train_kf, 'val_kf': data.val_kf}

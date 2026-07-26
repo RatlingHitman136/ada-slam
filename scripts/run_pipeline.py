@@ -46,7 +46,7 @@ from slam import SlamConfig, SlamRunner
 # ==============================================================================
 
 # ---------------------------------------------------------------- data (preprocessing is NOT here)
-SCENE   = 'rgbd_dataset_freiburg1_desk'
+SCENE   = 'rgbd_dataset_freiburg1_desk2'
 DATA    = f'data/TUM/{SCENE}'          # preprocess_tum.py's output layout
 COLORS  = f'{DATA}/colors'
 DEPTHS  = f'{DATA}/depths'             # None if the dataset has no GT depth
@@ -64,15 +64,31 @@ CROP_BORDER = 0
 
 # ---------------------------------------------------------------- run control
 STAGES           = ('extract', 'adapt', 'test')
-SKIP_EXISTING    = False               # reuse a stage's output if it is already on disk
+SKIP_EXISTING    = True                # reuse a stage's output if it is already on disk
 MIN_FREE_VRAM_MB = 10000               # shared GPU: checked once at the start of main()
-FRACTION         = 40                  # % of the sequence the adapter trains on; also SPLIT_AT
+FRACTION         = 100                 # % of the sequence the adapter trains on; also SPLIT_AT
 START            = 0
 OUT_EXTRACT      = f'outputs/tum/{SCENE}_p{FRACTION}'
 OUT_TEST         = f'outputs/tum_ab_p{FRACTION}'
 STREAM_RES       = 341 * 640           # tracking resolution budget
 DEPTH_PNG_SCALE  = 6553.5              # 16-bit depth PNG scale used across the repo
 DEPTH_SOURCE     = 'slam'  # 'rendered' (Gaussian expected depth) | 'slam' (1/disps_up)
+
+# ---------------------------------------------------------------- stage I/O
+# A stage RECEIVES its paths and reads no path global. That is what lets one be pointed at another
+# run's results - adapt on one extract's export, write the adapter somewhere else - without moving
+# OUT_EXTRACT, which the other stages also key off. The defaults below reproduce the layout §7
+# documents, so an unedited run is unchanged. Only `adapt` is wired this way so far; extract and
+# test still derive their paths from OUT_EXTRACT / OUT_TEST.
+ADAPT_IN     = OUT_EXTRACT                              # extract export to train on: depth_<src>/
+                                                        # mask_<src>/ poses_slam.txt traj_full.txt
+                                                        # intrinsics.npy
+ADAPT_IMAGES = COLORS                                   # keyframe RGB, indexed by frame number
+ADAPT_OUT    = f'{OUT_EXTRACT}/lora-vggt'               # adapter.safetensors config.json train_log
+ADAPT_CKPT   = f'{OUT_EXTRACT}/lora-vggt-checkpoints'   # epoch_NNN/; ADAPT.checkpoint_every says
+                                                        # how often, and 0 there turns them off
+                                                        # (a None here with a cadence set is an
+                                                        # error, not a way to disable them)
 
 # VGGT's input size. None = derive it in main() from the tracking stream's aspect ratio, which is
 # what you want: nothing letterboxes anywhere, so a value that does not match the stream squashes
@@ -98,15 +114,15 @@ SLAM = SlamConfig(
 # comparison - and the arms stay comparable with runs made before these knobs existed. main()
 # asserts this rather than trusting it. See ExtractConfig's docstring for which gate binds.
 EXTRACT = ExtractConfig(
-    kf_motion_thresh=1.2,
+    kf_motion_thresh=1.5,
     kf_init_thresh=4.0,             # the same gate before initialisation
-    kf_redundant_thresh=2.0,        # the one that actually moves the keyframe count
-    kf_covis_thresh=0.1,            # extra keyframes inserted in terminate(); LOWER -> more
+    kf_redundant_thresh=3.0,        # the one that actually moves the keyframe count
+    kf_covis_thresh=0.05,            # extra keyframes inserted in terminate(); LOWER -> more
     buffer=500,                     # hard cap; MUST exceed the count (no overflow guard exists)
                                     # any of the four thresholds may be None = inherit CONFIG
     depth_source=DEPTH_SOURCE, depth_png_scale=DEPTH_PNG_SCALE,
     mask_filter_thresh=0.005,       # depth_filter disparity agreement
-    mask_min_count=1,               # min agreeing neighbours out of 6
+    mask_min_count=2,               # min agreeing neighbours out of 6
     mask_min_disp_ratio=0.5,        # drop pixels below this fraction of the frame's mean disparity
     gt_depths=DEPTHS)               # the accuracy table ONLY - never reaches Hi2 (§9.3)
 
@@ -117,16 +133,16 @@ EXTRACT = ExtractConfig(
 LORA = LoRAConfig(
     weights='pretrained_models/vggt',
     vggt_hw=VGGT_HW,           # None -> derived in main(); see the constant above
-    rank=4, alpha=8,
+    rank=8, alpha=8,
     targets=('attn.qkv', 'attn.proj', 'mlp.fc1', 'mlp.fc2'),
     patch_embed=False)         # False = adapt only the alternating-attention stack
 
 ADAPT = AdaptConfig(
     depth_source=DEPTH_SOURCE, stream_res=STREAM_RES,
     p_single_view=1, max_left=4, max_right=4, radius=8,
-    epochs=15, batch_size=2,
+    epochs=10, batch_size=2,
     lr=1e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
-    depth_space='disparity',   # 'depth' | 'disparity'
+    depth_space='depth',   # 'depth' | 'disparity'
     coupled_scale=True, min_mask_pixels=16, seed=0, log_every=20,
     # ---- train / val split over the exported keyframes ----
     train_frac=0.8,            # 1.0 = train on every keyframe, no val set
@@ -135,8 +151,10 @@ ADAPT = AdaptConfig(
     eval_on_train=True,        # also on the train subset, so the train/val gap is visible
     eval_every_epoch=True,     # False = only before training and after the last epoch
     eval_max_kf=100,           # evenly subsample each eval subset to at most this many; 0 = no cap
-    keep_best=False)           # False = save the last epoch (report-only, the default);
+    keep_best=False,           # False = save the last epoch (report-only, the default);
                                # True  = snapshot whenever val L1 improves and save that instead
+    checkpoint_every=5)        # 0 = off; N = a full loadable adapter dir in ADAPT_CKPT/epoch_NNN
+                               # every N epochs, on top of the one final save
 
 # ---------------------------------------------------------------- test (stage 3, the A/B arms)
 # `lora=LORA` is not decoration: the 'vggt_base' arm has no adapter to read a structure back from,
@@ -173,21 +191,45 @@ def stage_extract(runner, extract_length):
                 skip_existing=SKIP_EXISTING)
 
 
-def stage_adapt(adapter):
-    banner(f'2/3 adapt  -> {adapter}')
+def stage_adapt(in_dir, image_dir, out_dir, ckpt_dir):
+    """LoRA-adapt VGGT on `in_dir`'s export of `image_dir`, writing the adapter into `out_dir`.
+
+    Takes its four paths as arguments and reads no path global, so it can be pointed at any
+    earlier extract run. LORA / ADAPT / SKIP_EXISTING still arrive as globals: they are configs,
+    not paths. Returns the adapter path.
+    """
+    adapter = f'{out_dir}/adapter.safetensors'
+    banner(f'2/3 adapt  {in_dir} -> {adapter}')
     if SKIP_EXISTING and os.path.exists(adapter):
         print(f'{adapter} exists - skipping')
-        return
-    if not os.path.exists(f'{OUT_EXTRACT}/poses_slam.txt'):
-        raise SystemExit(f'no {OUT_EXTRACT}/poses_slam.txt - run the extract stage first')
+        return adapter
+
+    # Checked here rather than left to SceneData, because in_dir and image_dir are now free to be
+    # any pair and a wrong one otherwise dies deep inside the first sample.
+    for f in (f'{in_dir}/poses_slam.txt', f'{in_dir}/traj_full.txt', f'{in_dir}/intrinsics.npy',
+              f'{in_dir}/depth_{ADAPT.depth_source}', image_dir):
+        if not os.path.exists(f):
+            raise SystemExit(f'adapt input missing: {f}   (in_dir={in_dir} must be an extract '
+                             f'export made with depth_source={ADAPT.depth_source!r})')
+    # SceneData.frame() indexes sorted(os.listdir(image_dir)) by frame number, so a mismatched
+    # pair would be an IndexError - or worse, silently the wrong image
+    last_kf = int(np.loadtxt(f'{in_dir}/poses_slam.txt')[:, 0].max())
+    n_img = len(os.listdir(image_dir))
+    if last_kf >= n_img:
+        raise SystemExit(f'{in_dir} has keyframe {last_kf} but {image_dir} holds {n_img} frames; '
+                         f'the export and the images must be the same sequence.')
+
     t0 = time.time()
     # seed=ADAPT.seed must be given to the CONSTRUCTOR: the adapter's A matrices are initialised
     # when LoRA is injected, so seeding any later does not reproduce a run
     lora = LoRAVGGT(LORA, seed=ADAPT.seed)
-    lora.train(OUT_EXTRACT, COLORS, os.path.dirname(adapter), ADAPT)
+    summary = lora.train(in_dir, image_dir, out_dir, ADAPT, ckpt_dir=ckpt_dir)
+    # the one save, here rather than inside the loop - and before release(), which invalidates it
+    print(f'saved adapter to {lora.save(out_dir, state=summary["state"], extra=summary["run"])}')
     lora.release()
     free_vram('adapt')
     print(f'=== adapt done in {time.time()-t0:.0f}s')
+    return adapter
 
 
 def stage_test(runner, adapter, split_at):
@@ -237,7 +279,7 @@ def main():
     if extract_length < 20:
         raise SystemExit(f'{n_frames} frames * {FRACTION}% = {extract_length}, too few to track')
     split_at = extract_length
-    adapter = f'{OUT_EXTRACT}/lora-vggt/adapter.safetensors'
+    adapter = f'{ADAPT_OUT}/adapter.safetensors'      # stage_test's input, wherever adapt put it
 
     # Resolve vggt_hw HERE, not in the PARAMETERS block: deriving reads a frame, and that block is
     # re-executed by every spawned reader child (which never touches LORA - it only needs SLAM).
@@ -267,7 +309,7 @@ def main():
     if 'extract' in STAGES:
         stage_extract(runner, extract_length)
     if 'adapt' in STAGES:
-        stage_adapt(adapter)
+        adapter = stage_adapt(ADAPT_IN, ADAPT_IMAGES, ADAPT_OUT, ADAPT_CKPT)
     if 'test' in STAGES:
         stage_test(runner, adapter, split_at)
 

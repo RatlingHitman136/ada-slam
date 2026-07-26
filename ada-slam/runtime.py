@@ -33,21 +33,10 @@ def sh(cmd, **kw):
 
 
 def ensure_venv_on_path():
-    """Put this interpreter's bin/ on PATH.
-
-    The CLIs sh() drives live in the venv's bin, which is not on PATH when the venv was never
-    activated but this file was run with its python.
-    """
     os.environ['PATH'] = os.path.dirname(sys.executable) + os.pathsep + os.environ.get('PATH', '')
 
 
 def raise_fd_limit():
-    """DepthVideo share_memory_()s every buffer and the default fd limit is not enough.
-
-    demo.py:12-14 does this as an import side effect; a driver that does not import demo.py has to
-    do it itself. Call at module scope, not inside main(): a spawned child re-executes the module
-    and needs the same limit.
-    """
     resource.setrlimit(resource.RLIMIT_NOFILE,
                        (100000, resource.getrlimit(resource.RLIMIT_NOFILE)[1]))
 

@@ -4,8 +4,10 @@
 
     lora = LoRAVGGT(LoRAConfig(weights='pretrained_models/vggt', vggt_hw=(378, 518), ...),
                     seed=cfg.seed)
-    lora.train(scene_dir, image_dir, out_dir, AdaptConfig(epochs=10, ...))
-    lora.release()
+    summary = lora.train(scene_dir, image_dir, out_dir, AdaptConfig(epochs=10, ...),
+                         ckpt_dir=ckpt_dir)          # ckpt_dir holds checkpoint_every's snapshots
+    lora.save(out_dir, state=summary['state'], extra=summary['run'])   # training does not save
+    lora.release()                                                     # save() first: this kills it
 
 and, on the inference side, the same class rebuilt from what an adapter recorded:
 

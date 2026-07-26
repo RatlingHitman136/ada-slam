@@ -108,11 +108,19 @@ class LoRAVGGT:
 
     # ---------------------------------------------------------------- training
 
-    def train(self, scene_dir, image_dir, out_dir, cfg):
-        """LoRA-adapt on an extract stage's export. Returns the run summary."""
+    def train(self, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
+        """LoRA-adapt on an extract stage's export. Returns the run summary.
+
+        This does NOT write the adapter - the caller does, with the summary's 'state' and 'run'
+        as save()'s state= and extra=. Training only reports, so where the adapter lands is a
+        decision at the call site rather than one buried in the loop.
+
+        `ckpt_dir` is where cfg.checkpoint_every drops its periodic snapshots; required when that
+        is non-zero. Each is a full adapter directory, loadable by from_adapter.
+        """
         self._ensure_live()
         from .trainer import run_training
-        return run_training(self, scene_dir, image_dir, out_dir, cfg)
+        return run_training(self, scene_dir, image_dir, out_dir, cfg, ckpt_dir)
 
     def train_mode(self):
         self._ensure_live()
@@ -148,7 +156,8 @@ class LoRAVGGT:
         """adapter.safetensors + config.json.
 
         The structural keys are this class's to write - they are what from_adapter reads back.
-        `extra` is whatever the caller wants recorded alongside; the trainer puts the run there.
+        `extra` is whatever the caller wants recorded alongside; both the final save and each of
+        the trainer's periodic checkpoints put the run there.
         `state` overrides the live weights, for keep_best's snapshot.
         """
         from safetensors.torch import save_file
