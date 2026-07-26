@@ -1,13 +1,13 @@
 """TestConfig - one A/B experiment.
 
-No field carries a default, as everywhere in ada-slam/. Fields SlamConfig already declares are not
+No field carries a default, as everywhere in adaslam/. Fields SlamConfig already declares are not
 repeated here: run_ab_test receives both, so the stream, the calibration and the resolution have
 exactly one description and the arms cannot disagree about them.
 """
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from adapt import LoRAConfig
+from ..adapt import LoRAConfig
 
 ARM_DIRS = {'omnidata': 'omnidata', 'vggt_lora': 'vggt', 'vggt_base': 'vggt_base'}
 # short names for the comparison table's column headers; the full label goes in ab_results.json

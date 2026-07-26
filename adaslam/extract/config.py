@@ -6,7 +6,7 @@ receives both.
 from dataclasses import dataclass
 from typing import Optional
 
-from common import DEPTH_SOURCES
+from ..common import DEPTH_SOURCES
 
 
 @dataclass(frozen=True)

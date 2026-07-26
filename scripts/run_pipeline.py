@@ -12,7 +12,7 @@ Three stages, run in ONE process, each skipped if its output already exists:
              side-by-side comparison split at the frame the adapter's training data ended
 
 This file is the KNOB PANEL, not the implementation. Every stage lives in a package under
-ada-slam/ - slam/ (the single interface to Hi2), extract/, adapt/, abtest/ - and nothing in any of
+adaslam/ - slam/ (the single interface to Hi2), extract/, adapt/, abtest/ - and nothing in any of
 them carries a hyperparameter default of its own. That is the point: a value is written down here,
 once, and travels into exactly the configs that need it. There is no command line and no
 environment. Dataset preprocessing is deliberately NOT here; run scripts/preprocess_tum.py first.
@@ -24,22 +24,20 @@ keep them primitives.
 import os    # nopep8
 import sys   # nopep8
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))       # nopep8
+# the repo root, so `adaslam` is importable; adaslam/__init__.py adds hislam2/ and thirdparty/vggt
 sys.path.insert(0, _ROOT)                                                 # nopep8
-sys.path.insert(0, os.path.join(_ROOT, 'ada-slam'))                       # nopep8
-sys.path.insert(0, os.path.join(_ROOT, 'hislam2'))                        # nopep8
-sys.path.insert(0, os.path.join(_ROOT, 'thirdparty/vggt'))                # nopep8
 import time
 from dataclasses import replace
 
 import numpy as np
 import torch
 
-from abtest import TestConfig, run_ab_test
-from adapt import AdaptConfig, LoRAConfig, LoRAVGGT
-from common import probe_stream_hw
-from extract import ExtractConfig, run_extract
-from runtime import banner, ensure_venv_on_path, free_vram, gpu_gate, raise_fd_limit
-from slam import SlamConfig, SlamRunner
+from adaslam.abtest import TestConfig, run_ab_test
+from adaslam.adapt import AdaptConfig, LoRAConfig, LoRAVGGT
+from adaslam.common import probe_stream_hw
+from adaslam.extract import ExtractConfig, run_extract
+from adaslam.runtime import banner, ensure_venv_on_path, free_vram, gpu_gate, raise_fd_limit
+from adaslam.slam import SlamConfig, SlamRunner
 
 # ==============================================================================
 #  PARAMETERS

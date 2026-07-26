@@ -12,9 +12,9 @@ import cv2
 import numpy as np
 import torch
 
-from common import stream_resize
-from paths import ROOT
-from runtime import free_vram, sh
+from ..common import stream_resize
+from ..paths import ROOT
+from ..runtime import free_vram, sh
 
 
 def run_ate(out, gt_traj):

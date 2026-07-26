@@ -1,10 +1,10 @@
 """SlamRunner - the one way HI-SLAM2 is invoked.
 
-This module is the ONLY place in ada-slam/ that imports `hi2` or `motion_filter`. That is an
+This module is the ONLY place in adaslam/ that imports `hi2` or `motion_filter`. That is an
 invariant worth grepping for: it is what "every invocation goes through one interface" means in
 practice, and it is checkable in one line.
 
-    grep -rn 'from hi2 import\\|from motion_filter import' ada-slam/
+    grep -rn 'from hi2 import\\|from motion_filter import' adaslam/
 
 Three call sites reach it - the extract run and one per A/B arm - and they differ only in their
 arguments. The depth prior is one of those arguments rather than something a caller patches on
@@ -27,7 +27,7 @@ import numpy as np
 from torch.multiprocessing import Process, Queue
 from tqdm import tqdm
 
-from runtime import free_vram
+from ..runtime import free_vram
 
 from .stream import mono_stream
 

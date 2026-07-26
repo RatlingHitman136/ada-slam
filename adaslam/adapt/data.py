@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 import torch
 
-from common import stream_resize
+from ..common import stream_resize
 
 from .config import aspect_lines
 

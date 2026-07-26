@@ -5,7 +5,8 @@ are mutually consistent (hi2.py:155); this turns that dump into the per-keyframe
 stage trains on.
 
 Loading is split from writing because the accuracy table (accuracy.py) needs the same arrays but
-writes nothing - that seam is what export_slam_depth.py --no_export is.
+writes nothing: `load_export` then `report_accuracy`, skipping `write_keyframes`, scores an
+existing dump without touching the files on disk.
 """
 import os
 from dataclasses import dataclass

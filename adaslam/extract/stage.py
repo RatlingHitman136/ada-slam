@@ -2,8 +2,8 @@
 import os
 import time
 
-from runtime import free_vram, tee
-from slam import write_tracking_config
+from ..runtime import free_vram, tee
+from ..slam import write_tracking_config
 
 from .export import export_slam_depth
 

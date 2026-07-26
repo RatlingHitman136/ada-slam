@@ -7,8 +7,8 @@ import json
 import os
 import time
 
-from common import probe_stream_hw
-from runtime import banner, free_vram
+from ..common import probe_stream_hw
+from ..runtime import banner, free_vram
 
 from .config import ARM_NAMES
 from .metrics import evaluate

@@ -14,7 +14,7 @@ class VggtPrior:
     """VGGT depth + Omnidata normals. `adapter=None` is the un-adapted 'vggt_base' arm."""
 
     def __init__(self, cfg, adapter=None, stream_hw=None):
-        from adapt import LoRAVGGT, aspect_lines
+        from ..adapt import LoRAVGGT, aspect_lines
 
         # from_adapter rebuilds cfg.lora from what the adapter recorded - rank, targets and above
         # all the input size it was trained at - and says so when that differs. Only the
