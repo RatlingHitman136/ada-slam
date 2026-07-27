@@ -93,7 +93,7 @@ Directories:
 
 | Dir | Contents |
 |---|---|
-| `adaslam/` | The VGGT track's own code — every stage of the §9 pipeline, as importable packages (§9.5). `slam/` is the **single interface to HI-SLAM2** and the only code here that imports `Hi2` or `MotionFilter`; `extract/`, `adapt/` and `abtest/` are the three stages; `common.py`, `runtime.py` and `paths.py` hold what more than one of them needs. It is a **real package** — `from adaslam.adapt import ...`, `from adaslam.common import ...`. Unlike `hislam2/`, which has no top-level `__init__.py` and so can only be a `sys.path` entry, this one has one, and that `__init__` is where `hislam2/` and `thirdparty/vggt` get put on `sys.path` (§9.5). It was `ada-slam/` until the hyphen — illegal in an identifier — was the only thing forcing the same treatment as `hislam2/`. |
+| `adaslam/` | The VGGT track's own code — every stage of the §9 pipeline, as importable packages (§9.5). `slam/` is the **single interface to HI-SLAM2** and the only package here that imports `Hi2` or `MotionFilter`; `extract/`, `adapt/`, `end2end/` and `priortest/` are the four stages; `common.py`, `runtime.py` and `paths.py` hold what more than one of them needs. It is a **real package** — `from adaslam.adapt import ...`, `from adaslam.common import ...`. Unlike `hislam2/`, which has no top-level `__init__.py` and so can only be a `sys.path` entry, this one has one, and that `__init__` is where `hislam2/` and `thirdparty/vggt` get put on `sys.path` (§9.5). It was `ada-slam/` until the hyphen — illegal in an identifier — was the only thing forcing the same treatment as `hislam2/`. |
 | `calib/` | Plain-text intrinsics, one line: `fx fy cx cy [k1 k2 p1 p2 ...]`. `replica.txt` (600 600 599.5 339.5), `scannet.txt`, `euroc.txt` (with distortion). Loaded by `demo.py:mono_stream`. |
 | `config/` | Per-dataset YAML (see §6). |
 | `media/` | README images (`logo.png`, `teaser.jpg`, `owndata.gif`). |
@@ -318,7 +318,7 @@ Vendored DPT/MiDaS code, used **only** for inference of the Omnidata checkpoints
 | `eval_recon.py` | Mesh evaluation: accuracy / completion / completion-ratio via KD-trees and `evaluate_3d_reconstruction`, plus an optional 2D depth-L1 metric that renders random in-room views of GT vs. reconstruction with Open3D. **Note:** its `trimesh` import was never satisfied before this fork installed it, so this script (and `run_replica.py`'s recon metrics) could not run at all. |
 
 The VGGT track adds exactly one more — see §9: `run_pipeline.py`, the single driver
-(extract → adapt → A/B test). The standalone single-stage tools `export_slam_depth.py` and
+(extract → adapt → end2end comparison). The standalone single-stage tools `export_slam_depth.py` and
 `lora_adapt_vggt.py` are **deleted**: once every stage became an importable package under
 `adaslam/` (§9.5) they were thin argparse wrappers over code reachable in three lines from a
 REPL, and a second way to invoke a stage is a second place for its defaults to drift.
@@ -330,8 +330,8 @@ REPL, and a second way to invoke a stage is a second place for its defaults to d
 Five files: `replica_config.yaml`, `scannet_config.yaml`, `owndata_config.yaml`, `euroc_config.yaml`,
 `tum_config.yaml` (§10 — ScanNet's real-sensor preset with `skip_blur`, `pgba.active`, exposure
 compensation, and `mono_depth_alpha: 0.01`). `run_pipeline.py` generates a sixth at runtime,
-`OUT_EXTRACT/extract_config.yaml`, which `inherit_from`s one of these and overrides the keyframe
-thresholds for the extract run only (§9.2.1).
+`OUT_EXTRACT/full/extract_config.yaml`, which `inherit_from`s one of these and overrides the
+keyframe thresholds for the extract run only (§9.2.1).
 
 - **`Dataset`** — `pcd_downsample(_init)`: how aggressively new Gaussians are subsampled from a
   keyframe; `point_size` + `adaptive_pointsize`: initial Gaussian scale; `scale_multiplier`:
@@ -375,30 +375,77 @@ Caveat on `final_result.json`'s `mean_l1`: `eval_utils.py:62` compares metric GT
 harness recomputes it after a global median-ratio scale fit (~0.02 m) — that is the meaningful
 number.
 
-The §9 pipeline writes to two trees: `OUT_EXTRACT` (the training-data run) and
-`OUT_TEST/<scene>_<arm>/` (one per A/B arm). Each is a normal `outputs/<seq>/` as above, plus:
+### 7.1 The §9 pipeline's tree — stage, then scene, then experiment
+
+The fan-out is real: a scene has several extracts, each has several adapts, each has several
+tests. So `outputs/` is keyed by **stage, then scene**, and an experiment directory holds what the
+*next* stage consumes and nothing else. The raw HI-SLAM2 run goes one level down in `full/`, which
+means it can be deleted to reclaim the Gaussian map and the renders (~400 MB a run) without
+breaking the stage after it.
 
 ```
-OUT_EXTRACT/
-  extract_config.yaml     generated; inherit_from CONFIG + EXTRACT's kf_* knobs. Extract only
-  slam_depth.npz          post-global-BA SLAM state: tstamp, disps (1/8), disps_up (full),
-                          poses (w2c), images, intrinsics, dscales, disps_prior
-  depth_<src>/%06d.npy    per-keyframe training depth, float32, SLAM units. <src> is
-                          DEPTH_SOURCE: `rendered` (the Gaussian map's expected depth) or
-                          `slam` (1/disps_up)
-  mask_<src>/%06d.png     multi-view consistency mask (droid_backends.depth_filter) & depth > 0
-  image/%06d.jpg          the matching keyframe RGB
-  poses_slam.txt          keyframe poses, TUM c2w, same convention as traj_kf.txt
-  export.txt              the depth-source accuracy table (read this first)
-  lora-vggt/              adapter.safetensors (~48 MB), config.json, train_log.json
-  lora-vggt-checkpoints/  epoch_NNN/ every ADAPT.checkpoint_every epochs, each a COMPLETE adapter
-                          dir (safetensors + config.json) that from_adapter loads and an A/B arm
-                          can run. Both this and lora-vggt/ are only where run_pipeline.py's
-                          ADAPT_OUT / ADAPT_CKPT happen to point (§9.2.1)
+outputs/
+  extract/<SCENE>/<EXTRACT_NAME>/ the handoff to adapt, and nothing else
+    depth_slam/%06d.npy           per-keyframe training depth, float32, SLAM units. BOTH sources
+    mask_slam/%06d.png            are always written (EXTRACT.depth_sources) — choosing one at
+    depth_rendered/%06d.npy       extract time would cost another SLAM run the day you want the
+    mask_rendered/%06d.png        other. `slam` is 1/disps_up, `rendered` the Gaussian map's
+                                  expected depth; masks are droid_backends.depth_filter & depth>0
+    image/%06d.jpg                the matching keyframe RGB — a record, NOT read by adapt, which
+                                  indexes the full colour dir by frame number (ADAPT_IMAGES)
+    poses_slam.txt                the exported keyframes, TUM c2w. adapt reads column 0 (the
+                                  keyframe list) and takes its poses from traj_full.txt; the list
+                                  is the INTERSECTION over the sources written, so either choice
+                                  of ADAPT.depth_source has a file for every keyframe named here
+    traj_full.txt                 copied up from full/ — every pose adapt actually uses
+    intrinsics.npy                copied up from full/
+    export.txt                    the depth-source accuracy table (read this first)
+    full/                         the untouched SLAM run: a normal outputs/<seq>/ as above, plus
+                                  extract_config.yaml (generated; inherit_from CONFIG + EXTRACT's
+                                  kf_* knobs, this run only) and slam_depth.npz (post-global-BA
+                                  state: tstamp, disps 1/8, disps_up full, poses w2c, images,
+                                  intrinsics, dscales, disps_prior)
 
-OUT_TEST/<scene>_<arm>/
-  ab_results.json         that arm's metrics, split seen/unseen at split_at
+  adapt/<SCENE>/<ADAPT_NAME>/     the handoff to end2end, and nothing else
+    adapter.safetensors           ~48 MB
+    config.json                   the structure from_adapter rebuilds: rank, alpha, targets,
+                                  lora_patch_embed, vggt_hw — plus `scene`, the extract directory
+                                  it trained on, which is where lineage is recorded
+    train_log.json
+    checkpoints/epoch_NNN/        every ADAPT.checkpoint_every epochs, each a COMPLETE adapter
+                                  dir that from_adapter loads and an arm can run
+
+  test/
+    end2end/<SCENE>/<arm>/        ONE DIRECTORY PER DEPTH-PRIOR GENERATOR, <arm> inferred (below).
+                                  A normal outputs/<seq>/ as above, plus results.json (that arm's
+                                  metrics and the split_at they were computed at), evo/, ape.txt,
+                                  tsdf_mesh_w<W>[_aligned].ply, eval_recon.txt
+    prior/<SCENE>/<arm>/          the SAME generators scored against GT depth with no SLAM run
+      frames.csv                  one row per frame — the expensive artifact, split-INDEPENDENT,
+                                  cached on the eval spec written into its `#` header line
+      results.json                aggregates at one split_at, recomputed from frames.csv in ms
 ```
+
+**Naming.** `EXTRACT_NAME` and `ADAPT_NAME` in `run_pipeline.py` are **required** and are checked by
+`common.py:require_name` before any GPU work. The scene is a directory of its own, so a name only
+has to be unique within its scene — it does not carry the scene and does not chain the run before
+it. Lineage is recorded as *data* instead: an adapter's `config.json` holds the extract directory it
+trained on (`adapt/trainer.py:113`). `FRACTION` is not in the name either; put it there yourself if
+you vary it, or two fractions overwrite each other.
+
+**Arm names are inferred, never typed** (`end2end/config.py:arm_name`):
+
+| entry in `END2END_PRIORS` | directory under `test/end2end/<SCENE>/` |
+|---|---|
+| `'omnidata'` | `omni` |
+| `'vggt_base'` | `base` |
+| `outputs/adapt/<scene>/<aname>` | `<aname>` |
+| `outputs/adapt/<scene>/<aname>/checkpoints/epoch_005` | `<aname>_chkp_005` |
+
+That is what makes an arm **reusable**: one adapter always scores into one directory, so a scene's
+`omni` baseline is run once and every later comparison finds it instead of repeating it. Two entries
+that infer the same name are a hard error — they would write into one directory and the comparison
+would silently score an arm against itself.
 
 ---
 
@@ -458,11 +505,13 @@ for Omnidata on the rest of that scene. The better supervision target is the **G
 depth (`DEPTH_SOURCE = 'rendered'`): it is 2.4× closer to GT than `1/disps_up` (0.0133 vs
 0.0324 m global-scale L1 on room0) and, unlike the npz dump, it is produced from the same
 post-refinement trajectory that `traj_full.txt` supplies for the pose loss. `run_pipeline.py`
-nevertheless currently ships `DEPTH_SOURCE = 'slam'`, matching the §9.4 Replica runs.
+nevertheless currently ships `DEPTH_SOURCE = 'slam'`, matching the §9.4 Replica runs. Since the
+§7.1 restructure that is a *selection*, not a production decision: extract writes both
+(`EXTRACT.depth_sources`), so switching costs an adapt run rather than another SLAM run.
 
 ### 9.1 Pipeline
 
-**`scripts/run_pipeline.py` is the only way to run it.** Three stages in one process, every
+**`scripts/run_pipeline.py` is the only way to run it.** Four stages in one process, every
 parameter in the block at its top — a handful of CAPITAL constants and the five config dataclass
 literals `SLAM` / `EXTRACT` / `LORA` / `ADAPT` / `TEST` they feed (§9.5). The file is the knob
 panel, not the implementation: every stage is a package under `adaslam/`. No CLI, no environment:
@@ -471,21 +520,32 @@ panel, not the implementation: every stage is a package under `adaslam/`. No CLI
 python scripts/run_pipeline.py        # from the repo root, adaslam venv active
 
   1 extract   SLAM over the first FRACTION% of the sequence (generated extract_config.yaml)
-              → slam_depth.npz → depth_<src>/ mask_<src>/ image/ poses_slam.txt + export.txt
+              into OUT_EXTRACT/full/ → slam_depth.npz → depth_{slam,rendered}/ mask_*/ image/
+              poses_slam.txt + export.txt one level up, with traj_full.txt / intrinsics.npy
+              copied up beside them
   2 adapt     LoRA-adapt VGGT on a TRAIN subset of those keyframes, depth L1 reported on a
               held-out VAL subset  → ADAPT_OUT/adapter.safetensors, plus a snapshot every
               ADAPT.checkpoint_every epochs into ADAPT_CKPT/epoch_NNN/. Its four paths are
               arguments (ADAPT_IN / ADAPT_IMAGES / ADAPT_OUT / ADAPT_CKPT), so it can be run
               against any earlier extract's export
-  3 test      one full-sequence arm per entry in TEST.arms, differing ONLY in the depth prior,
-              then evo ATE → TSDF → Sim(3) align → eval_recon + render metrics, and a
-              comparison table split at the frame the adapter's training data ended
+  3 end2end   one full-sequence arm per entry in END2END_PRIORS, differing ONLY in the depth
+              prior, each into OUT_END2END/<inferred name>/ → evo ATE → TSDF → Sim(3) align →
+              eval_recon + render metrics, and a comparison table split at the frame the
+              adapter's training data ended
+  4 prior     the SAME generators in PRIOR_PRIORS scored against GT depth directly, with NO SLAM
+              run — minutes an arm rather than forty — decomposed by alignment so an end2end null
+              can be attributed (§9.2.2)
 ```
 
-`TEST.arms` selects the arms: `omnidata` (baseline), `vggt_lora` (the adapted prior), and
-`vggt_base` (stock VGGT-1B, the §10.2 sanity arm, off by default). `STAGES` skips stages,
-`SKIP_EXISTING` reuses finished ones — `STAGES = ('test',)` re-runs just the A/B against an
-adapter already on disk.
+Every stage takes its input and output paths as arguments (§9.5's fourth rule) — `main()` names
+them from `EXTRACT_NAME` / `ADAPT_NAME` and hands them down, so which directory a stage writes to
+is visible at the call site and never read out of a global inside it.
+
+`END2END_PRIORS` lists the depth-prior generators to compare, `[0]` being the baseline column:
+`'omnidata'` (upstream's), `'vggt_base'` (stock VGGT-1B, the §10.2 sanity arm), and any number of
+adapt handoff directories or their checkpoints. `STAGES` skips stages, `SKIP_EXISTING` reuses
+finished ones — `STAGES = ('end2end',)` re-runs just the comparison against adapters already on
+disk, and any arm already scored at the same `split_at` is skipped outright.
 
 The earlier route — a shell/CLI chain of `run_slam_depth_batch.sh`, `run_full_{omnidata,vggt}.py`,
 `_full_run_common.py`, `temp_run_ab_comparison.sh` and `run_tum_experiment.sh` — has been
@@ -503,41 +563,82 @@ Dataset preprocessing is deliberately *not* part of it: run `scripts/preprocess_
 | ~~`export_slam_depth.py`~~ / ~~`lora_adapt_vggt.py`~~ | **Deleted.** Both were argparse wrappers over one stage. Since the stages became packages, the same thing is `from adaslam.extract.export import load_export, write_keyframes` or `LoRAVGGT(cfg).train(...)` — reachable from a REPL, with no second set of defaults to drift out of step with the PARAMETERS block. Re-exporting an existing `slam_depth.npz` without re-running SLAM is still possible that way; the accuracy table without the files is `load_export` then `from adaslam.extract.accuracy import report_accuracy`, skipping `write_keyframes`. Neither name is in `extract`'s `__all__` — the fifth rule in §9.5 says why, and why that costs nothing. |
 
 Every stage is importable — `adaslam.extract.run_extract`, `adaslam.adapt.LoRAVGGT.train`,
-`adaslam.abtest.run_ab_test`, `adaslam.slam.SlamRunner.run` — so `run_pipeline.py` is a convenience, not a
+`adaslam.end2end.run_end2end_test`, `adaslam.priortest.run_prior_test`,
+`adaslam.slam.SlamRunner.run` — so `run_pipeline.py` is a convenience, not a
 gate. Nothing duplicates anything (§9.5).
 
 #### 9.2.1 The stage packages
 
-`run_pipeline.py` holds the parameters and three wrappers; this is where the work actually is.
+`run_pipeline.py` holds the parameters and four thin wrappers; this is where the work actually is.
 
 | Entry point | What it does |
 |---|---|
-| `adaslam.slam.SlamRunner.run` | **The single interface to HI-SLAM2**, and the only code in `adaslam/` that imports `Hi2` or `MotionFilter` — an invariant one grep checks. Three call sites reach it: the extract run and one per A/B arm. One `SlamRunner` is built in `main()` from `SLAM`, so the arms cannot disagree about the stream, calibration or resolution; everything that legitimately differs (tracking YAML, output dir, length, buffer, `gtdepthdir`, `dump_slam_depth`, **depth prior**) is an argument, visible at the call site. It asserts the 9-field `Hi2` args contract (`HI2_ARGS`) before construction. |
-| `adaslam.extract.run_extract` | Writes a generated `extract_config.yaml` that `inherit_from`s `CONFIG` and applies `EXTRACT`'s four `kf_*` knobs, runs SLAM over the first `FRACTION`% with the `hi2.py` depth dump enabled, then exports. The generated config is given to **this run only**; `stage_test` asserts the arms get the unmodified `CONFIG`, so a denser training set can never masquerade as a tracking change in the comparison. Note the binding gate is `kf_redundant_thresh` (`frontend.keyframe_thresh`), not the motion filter: over 204 TUM frames `(motion, redundant) = (2.4, 4.0)` gave 43 keyframes, `(1.2, 4.0)` only 45, `(1.2, 1.5)` 83, because `track_frontend.py:49-52` prunes back whatever the motion filter proposes. GT depth reaches `ExtractConfig.gt_depths` (the accuracy table) and never `Hi2` (§9.3). |
-| `adaslam.adapt.LoRAVGGT.train` | The **first stage wired to explicit I/O**: `stage_adapt(in_dir, image_dir, out_dir, ckpt_dir)` reads no path global, so it can be pointed at any earlier extract run without moving `OUT_EXTRACT` — which extract and test also key off. It checks its four paths (including that the export's highest keyframe index exists in `image_dir`, since the two are now free to be any pair), then `LoRAVGGT(LORA, seed=ADAPT.seed).train(...)`, **the one `lora.save()`**, and `release()` — in that order, because `save()` goes through `_ensure_live()`. Training itself writes no adapter: `run_training` returns `state` and `run`, which are exactly `save()`'s `state=` and `extra=`, so where the adapter lands is a decision at the call site. Includes a **train/val split** of the exported keyframes (`train_frac`, `split_mode`) so depth L1 is reported on held-out keyframes rather than on the adapter's own training set; `keep_best` optionally snapshots on val improvement instead of keeping the last epoch, and `checkpoint_every` drops a full loadable adapter dir into `ckpt_dir` every N epochs. |
-| `adaslam.abtest.run_ab_test` | One full-sequence run per entry in `TEST.arms`, then `evaluate` + `print_report` per arm and `compare` at the end. The prior is passed **into** `SlamRunner.run`, which snapshots `MotionFilter.prior_extractor`, installs, and restores it in a `finally` — so a VGGT arm's patch cannot leak into a later Omnidata arm and silently make it a second VGGT arm, and cannot leak out of a run that raised either. The restore is deliberately **after** `hi2.terminate()`: `hi2.py:143` calls the extractor again for the keyframes `terminate()` inserts into low-covisibility gaps. Each arm's prior is `release()`d in its own `finally`, so a crashed arm no longer strands ~2.5 GB. |
-| `adaslam.abtest.VggtPrior` | The depth-prior swap. Normals stay Omnidata, so **depth is the only variable between arms**. Undoes `motion_filter.py`'s ImageNet normalisation (§9.3), and reports the stream→VGGT aspect skew, warning above 5 % — the inference-side half of the `vggt_hw` guard (§9.3). The model comes from `LoRAVGGT.from_adapter`, which rebuilds the **whole** structure — rank, alpha, targets, `patch_embed` and `vggt_hw` — from what the adapter recorded, so an arm cannot run the adapter in a shape or at a resolution it was never trained in. `extractor()` returns a **plain function, never a bound method**: functions are descriptors, so the `MotionFilter` binds as the first argument while the `VggtPrior` arrives through the closure cell. A bound method or `functools.partial` is not a descriptor — `mf` would never be passed and `mf.MEAN` / `mf.STDV` / the cached normal model would be lost. |
-| `adaslam/abtest/metrics.py` — `evaluate`, and the `run_ate` / `run_mesh` / `split_render_metrics` it calls | The metrics harness: evo ATE (Sim(3)-aligned), TSDF fuse → Sim(3)-align → `eval_recon.py` (skipped when `TEST.gt_mesh is None`, as on TUM), and PSNR/SSIM/depth-L1 recomputed per frame from the saved renders so every number can be **split seen/unseen** at `split_at`. `run_mesh` retries down `voxel_fallbacks` when marching cubes OOMs on the shared GPU and records which size won. Reached through `run_ab_test`; `from adaslam.abtest.metrics import evaluate` re-scores a finished output dir. |
-| `adaslam/abtest/report.py` — `compare` | Prints the baseline in absolutes and every other arm as absolute + delta; refuses to print mesh rows when the arms' `voxel_size` disagree. Pure formatting over `ab_results.json`, so `from adaslam.abtest.report import compare, print_report` re-runs on finished output without a GPU. |
+| `adaslam.slam.SlamRunner.run` | **The single interface to HI-SLAM2**; `adaslam/slam/` is the only package importing `Hi2` or `MotionFilter` — an invariant one grep checks (§9.3). Three or more call sites reach it: the extract run and one per end2end arm. One `SlamRunner` is built in `main()` from `SLAM`, so the arms cannot disagree about the stream, calibration or resolution; everything that legitimately differs (tracking YAML, output dir, length, buffer, `gtdepthdir`, `dump_slam_depth`, **depth prior**) is an argument, visible at the call site. It asserts the 9-field `Hi2` args contract (`HI2_ARGS`) before construction. |
+| `adaslam.extract.run_extract` | Writes a generated `extract_config.yaml` that `inherit_from`s `CONFIG` and applies `EXTRACT`'s four `kf_*` knobs, runs SLAM over the first `FRACTION`% with the `hi2.py` depth dump enabled **into `<exp>/full/`**, copies `traj_full.txt` and `intrinsics.npy` up to the experiment level, then exports **every** source in `EXTRACT.depth_sources` (§7.1). Its two halves skip independently: an existing `full/slam_depth.npz` reuses the SLAM run but the export still re-runs when a handoff artifact is missing, so a run made before a source existed can gain it without re-tracking. The generated config is given to **this run only**; `main()` asserts the arms get the unmodified `CONFIG`, so a denser training set can never masquerade as a tracking change in the comparison. Note the binding gate is `kf_redundant_thresh` (`frontend.keyframe_thresh`), not the motion filter: over 204 TUM frames `(motion, redundant) = (2.4, 4.0)` gave 43 keyframes, `(1.2, 4.0)` only 45, `(1.2, 1.5)` 83, because `track_frontend.py:49-52` prunes back whatever the motion filter proposes. GT depth reaches `ExtractConfig.gt_depths` (the accuracy table) and never `Hi2` (§9.3). |
+| `adaslam.adapt.LoRAVGGT.train` | The **first stage that was wired to explicit I/O**, and the pattern the other two now follow: `stage_adapt(in_dir, image_dir, out_dir, ckpt_dir)` reads no path global, so it can be pointed at any earlier extract run without moving `OUT_EXTRACT`. It checks its four paths (including that the export's highest keyframe index exists in `image_dir`, since the two are now free to be any pair), then `LoRAVGGT(LORA, seed=ADAPT.seed).train(...)`, **the one `lora.save()`**, and `release()` — in that order, because `save()` goes through `_ensure_live()`. Training itself writes no adapter: `run_training` returns `state` and `run`, which are exactly `save()`'s `state=` and `extra=`, so where the adapter lands is a decision at the call site. Includes a **train/val split** of the exported keyframes (`train_frac`, `split_mode`) so depth L1 is reported on held-out keyframes rather than on the adapter's own training set; `keep_best` optionally snapshots on val improvement instead of keeping the last epoch, and `checkpoint_every` drops a full loadable adapter dir into `ckpt_dir` every N epochs. |
+| `adaslam.end2end.run_end2end_test` | One full-sequence run per entry in `END2END.priors` into `out_root/<arm_name(spec)>` — the directory is an argument, so `End2EndConfig` holds knobs and never a location — then `evaluate` + `print_report` per arm and `compare` at the end. There is deliberately **no `adapter` parameter**: each arm carries its own, which is what lets one comparison hold several adapters and their checkpoints. Caching splits in two, because arms are reused across comparisons: the SLAM run is skipped when `{out}/traj_full.txt` exists, and scoring is skipped only when `results.json` records the *same* `split_at` — every adapter has its own training fraction, so one comparison's split is not another's, and re-scoring reads the saved renders at no SLAM cost. The prior is passed **into** `SlamRunner.run`, which snapshots `MotionFilter.prior_extractor`, installs, and restores it in a `finally` — so a VGGT arm's patch cannot leak into a later Omnidata arm and silently make it a second VGGT arm, and cannot leak out of a run that raised either. The restore is deliberately **after** `hi2.terminate()`: `hi2.py:143` calls the extractor again for the keyframes `terminate()` inserts into low-covisibility gaps. Each arm's prior is `release()`d in its own `finally`, so a crashed arm no longer strands ~2.5 GB. |
+| `adaslam.end2end.VggtPrior` | The depth-prior swap. Normals stay Omnidata, so **depth is the only variable between arms**. Undoes `motion_filter.py`'s ImageNet normalisation (§9.3), and reports the stream→VGGT aspect skew, warning above 5 % — the inference-side half of the `vggt_hw` guard (§9.3). The model comes from `LoRAVGGT.from_adapter`, which rebuilds the **whole** structure — rank, alpha, targets, `patch_embed` and `vggt_hw` — from what the adapter recorded, so an arm cannot run the adapter in a shape or at a resolution it was never trained in. `extractor()` returns a **plain function, never a bound method**: functions are descriptors, so the `MotionFilter` binds as the first argument while the `VggtPrior` arrives through the closure cell. A bound method or `functools.partial` is not a descriptor — `mf` would never be passed and `mf.MEAN` / `mf.STDV` / the cached normal model would be lost. |
+| `adaslam/end2end/metrics.py` — `evaluate`, and the `run_ate` / `run_mesh` / `split_render_metrics` it calls | The metrics harness: evo ATE (Sim(3)-aligned), TSDF fuse → Sim(3)-align → `eval_recon.py` (skipped when `END2END.gt_mesh is None`, as on TUM), and PSNR/SSIM/depth-L1 recomputed per frame from the saved renders so every number can be **split seen/unseen** at `split_at`. `run_mesh` retries down `voxel_fallbacks` when marching cubes OOMs on the shared GPU and records which size won. Reached through `run_end2end_test`; `from adaslam.end2end.metrics import evaluate` re-scores a finished output dir. |
+| `adaslam/end2end/report.py` — `compare` | Prints the baseline in absolutes and every other arm as absolute + delta; refuses to print mesh rows when the arms' `voxel_size` disagree. Pure formatting over `results.json`, so `from adaslam.end2end.report import compare, print_report` re-runs on finished output without a GPU. |
+| `adaslam.priortest.run_prior_test` | The same generators, scored against GT depth with **no SLAM run** — see §9.2.2 for what it measures and why. Takes no `runner`: each frame goes through `slam.PriorProbe`, which calls the very extractor a real arm would (that is the point — a probe that resized differently would report a number no arm ever produces). Caching is split in two: `frames.csv` is the expensive artifact and is keyed on the **eval spec** written into its header, while `results.json` is a cheap aggregate at one `split_at`. Every per-frame value is split-independent, so changing which adapter defines the boundary re-aggregates in milliseconds instead of re-running inference. |
 | `adaslam.runtime.free_vram` / `gpu_gate` | Shared-workstation hygiene: `MIN_FREE_VRAM_MB` is checked once at the top of `main()`, and VRAM is force-released between stages (§8's last rough edge is why this is needed at all). |
+
+#### 9.2.2 The prior test — what it measures, and why alignment is the axis
+
+The end2end test cannot attribute its own null (§9.4). "Swapping the prior changed nothing" is
+either *the new prior is no better* or *HI-SLAM2 is insensitive to the way it is better*, and
+telling those apart needs the priors measured before SLAM touches them.
+
+The design axis is **alignment**, not more error functions, because HI-SLAM2 never consumes the
+prior raw: JDSA fits a 2×2 bilinear scale grid per keyframe and multiplies
+(`geom/ba.py:get_prior_depth_aligned` is `depth_prior * mscales_bi` — **scale-only, no shift**). So
+one prediction yields three very different errors depending on how much of that freedom you grant,
+and the differences are the diagnosis:
+
+| alignment | residual means |
+|---|---|
+| per-frame scale (median ratio) | pure shape error, scale-free |
+| per-frame 2×2 JDSA grid (least squares, fitted in **disparity** — where JDSA fits it) | the error the pipeline **cannot** absorb |
+| one global scale for the whole sequence | shape error **plus** cross-frame scale drift |
+
+Two derived numbers carry the story. **`consistency_index` = L1_global / L1_per-frame** is §10.2's
+"first number to check" generalised to every arm — Omnidata on Replica room0 reads 0.0735 / 0.2078,
+a 2.8× blow-up, and *that* is the cross-frame inconsistency this whole track targets; an adapter
+trained on SLAM depth should drive it toward 1.0. **`scale_cv`**, the spread of the per-frame fitted
+scales, measures the same drift directly. Alongside them: L1 (m), AbsRel and δ<1.25 per alignment.
+
+Scale**+shift** alignment is deliberately not offered — it is the MiDaS convention and would
+flatter Omnidata with a degree of freedom the pipeline can never exploit.
+
+**Two caveats to carry with the numbers.** The JDSA-grid row is a *lower* bound on what JDSA leaves
+behind: the real solver fits that grid jointly with poses and depths against photometric residuals,
+not in closed form against GT. And the seen/unseen rows are only readable against the **sentinels'**
+seen/unseen — one split, taken from the first adapter in `priors`, is applied to every arm precisely
+so `omni` and `base` act as the control. If every prior degrades past the split, the back of the
+sequence is simply harder and the adapter has not generalised worse at all. Adapters whose own
+training boundary differs from the table's are warned about and carry a `*`.
 
 ### 9.3 Traps that silently corrupt results
 
-- **Only `adaslam/slam/runner.py` may import `hi2` or `motion_filter`.** That is what makes "every
-  invocation goes through one interface" a checkable property rather than a convention, and it is
-  what lets the prior swap be a run *parameter*. A second importer would be free to patch the
-  class around a call again, reintroducing the leak the `finally` exists to prevent:
-  `grep -rn 'from hi2 import\|from motion_filter import' adaslam/` must return only that file.
+- **Only `adaslam/slam/` may import `hi2` or `motion_filter`.** That is what makes "every invocation
+  goes through one interface" a checkable property rather than a convention, and it is what lets the
+  prior swap be a run *parameter*. An importer elsewhere would be free to patch the class around a
+  call again, reintroducing the leak the `finally` exists to prevent:
+  `grep -rn 'from hi2 import\|from motion_filter import' adaslam/` must return **only paths under
+  `adaslam/slam/`**. Two files match today: `runner.py`, which runs SLAM, and `prior_probe.py`,
+  which needs `MotionFilter.prior_extractor` because the stock depth prior *is* that method and the
+  prior test must call it rather than a re-implementation. The rule is the package, not the file —
+  it was one file until the prior test needed the same import for a different reason.
 - **`prior_extractor` receives an ImageNet-normalised tensor** (`motion_filter.py:88-89`), but
   VGGT expects `[0,1]` and normalises internally (`aggregator.py:205`). `vggt_prior_extractor`
   undoes it; forgetting to would just quietly make VGGT worse.
 - **The TSDF mesh must be Sim(3)-aligned before scoring.** SLAM scale is arbitrary (~1.3× here)
   and `eval_recon`'s ICP is rigid-only, so skipping the alignment gives ~0.7 m accuracy instead of
-  ~0.03 m. `run_replica.py:46` does this; `abtest/metrics.py:run_mesh` does too.
+  ~0.03 m. `run_replica.py:46` does this; `end2end/metrics.py:run_mesh` does too.
 - **Scale estimates in the losses must not be detached.** Detaching makes a loss only *look*
   scale-invariant — the optimiser then sees a gradient rewarding a shrinking prediction, and
   translations collapse toward zero. This diverged the first overfit test 12×.
-- **Every A/B arm must use the same TSDF voxel size.** Marching-cubes allocation fails at 0.006
+- **Every end2end arm must use the same TSDF voxel size.** Marching-cubes allocation fails at 0.006
   when the shared GPU is busy; `run_mesh` has a fallback ladder (`VOXEL_FALLBACKS`) and records
   `voxel_size`, and `compare` refuses to print mesh rows if the arms disagree.
 - VGGT's aggregator returns `None` for uncached layers (only 4/11/17/23 are kept, deliberately,
@@ -587,7 +688,7 @@ gate. Nothing duplicates anything (§9.5).
   `demo.py --dump_slam_depth` run, which must be given no `--gtdepthdir`. Nothing is lost: the
   export's accuracy table masks
   on `(gt > 0) & mask` regardless, and the only casualty is `final_result.json`'s `mean_l1`, which
-  §7 already documents as meaningless on a monocular run. The A/B arms *do* keep it — there the
+  §7 already documents as meaningless on a monocular run. The end2end arms *do* keep it — there the
   masking is correct, since depth cannot be scored where there is no GT.
 
 ### 9.4 Status
@@ -596,7 +697,7 @@ The plumbing is verified end to end: frame-0 convention confirmed, adapter ident
 save/load round-trip both exactly `0.0`, overfit test converges, ~7.8 GiB peak.
 
 The **result so far is a null**. On the training keyframes the adapter improves depth L1 a lot
-(0.0080 → 0.0032), but a full-sequence A/B on room0/1/2 shows essentially no downstream
+(0.0080 → 0.0032), but a full-sequence comparison on room0/1/2 shows essentially no downstream
 difference — ATE identical to four decimals, PSNR within ±0.2 dB, depth L1 within ±0.0005, on
 both the trained and the unseen halves. Two plausible reasons, and they are not exclusive:
 base VGGT is already very strong on Replica (0.04° rotation, ~1 % relative disparity), leaving
@@ -605,8 +706,11 @@ almost no headroom; and JDSA re-solves the prior's scale per keyframe anyway
 may already be robust to the weakness being fixed. Replica is well-lit synthetic data and does
 not test the difficult-lighting premise that motivated the work.
 
-Experiment outputs live in `outputs/ab_{depth,disp}_p{40,100}/` (the `depth`/`disp` suffix is
-`ADAPT.depth_space`, the `p` number the sequence fraction the adapter trained on).
+Those Replica experiment outputs lived in `outputs/ab_{depth,disp}_p{40,100}/` (the `depth`/`disp`
+suffix is `ADAPT.depth_space`, the `p` number the sequence fraction the adapter trained on) and the
+TUM ones in `outputs/tum*/`, both predating §7.1. Everything from before that restructure was moved
+to `outputs/old/` untouched — nothing was migrated into the new shape, so `SKIP_EXISTING` does not
+see it.
 
 Note those runs predate the choice of supervision target and used `slam` depth (`1/disps_up`),
 which is the less accurate target and is dumped *before* the refinement that produces the poses
@@ -616,7 +720,7 @@ they were trained against. `DEPTH_SOURCE = 'slam'` reproduces them exactly.
 
 ### 9.5 `adaslam/` — the pipeline as packages
 
-`run_pipeline.py` once carried all three stages in 1366 lines. The adapt stage came out first,
+`run_pipeline.py` once carried all the stages in 1366 lines. The adapt stage came out first,
 then extract and test; the file is now ~320 lines of parameters and dispatch, and every stage is
 an importable package, under one parent package `adaslam`.
 
@@ -638,39 +742,48 @@ exactly the directories it is given and nothing implicit.
 |---|---|
 | `__init__.py` | Six lines: `bootstrap(HISLAM2, VGGT)`. The **only** place in the repo besides `demo.py` that touches `sys.path`. |
 | `paths.py` | `ROOT` / `ADA_SLAM` / `HISLAM2` / `VGGT` and `bootstrap()`, whose one caller is the `__init__` above. Stdlib-only and side-effect-free beyond the `sys.path` inserts — every `adaslam.*` import goes through it, so it must cost nothing. Note what it is *not* needed for: **a spawned child inherits the parent's `sys.path` verbatim** (`multiprocessing/spawn.py:173` copies it, `:228-229` installs it, both before `__main__` is re-imported and before the target is unpickled), so nothing here has to run again in the reader process. |
-| `common.py` | `stream_resize` — ONE definition, used by the reader, the LoRA data loader and the render metrics; they must agree or renders and GT stop lining up pixel for pixel. Also `DEPTH_SOURCES`, because `extract` writes `depth_<src>/` and `adapt` reads it. |
-| `runtime.py` | `sh`, `free_vram`, `gpu_gate`, `tee`, `banner`, `raise_fd_limit`, `ensure_venv_on_path` — shared-workstation hygiene, nothing stage-specific. Its module docstring is where the pgba CUDA-IPC measurement in §8 is written down. |
-| `slam/` | `SlamConfig`, `mono_stream` (the reader `Process` target), `write_tracking_config`, and `SlamRunner` — **the single interface to HI-SLAM2** (§9.2.1). |
-| `extract/` | `ExtractConfig`; `export.py` (`confidence_mask`, `load_export`, `write_keyframes`, `export_slam_depth`); `accuracy.py` (the depth-source table, §10.2's first number); `stage.py` (`run_extract`). Loading is split from writing so `--no_export` can have the table without the files. |
+| `common.py` | `stream_resize` — ONE definition, used by the reader, the LoRA data loader and the render metrics; they must agree or renders and GT stop lining up pixel for pixel. Also `DEPTH_SOURCES`, because `extract` writes `depth_<src>/` and `adapt` reads it, and the §7.1 layout vocabulary (`EXTRACT_RUN_SUBDIR`, `ADAPT_CKPT_SUBDIR`, `TEST_KINDS`, `HANDOFF_UP`, `extract_run_dir`, `experiment_dir`, `test_dir`, `require_name`) for the same reason: more than one stage — and `run_pipeline.py` itself — has to agree on it. |
+| `runtime.py` | `sh`, `free_vram`, `gpu_gate`, `raise_fd_limit`, `ensure_venv_on_path` — shared-workstation hygiene, nothing stage-specific. Its module docstring is where the pgba CUDA-IPC measurement in §8 is written down. `free_vram` and `gpu_gate` print, but they do work and report on it; anything that only *formats* lives next door. |
+| `print_utils.py` | `banner`, `tee` (+`_Tee`), `delta_row` — formatting output for a human, and nothing else. **Stdlib only**, no torch or cv2, so a finished comparison can be reprinted on a machine with neither. `delta_row` is the one comparison-row formatter both `report.py` modules use: baseline absolute, later columns absolute + signed delta + a `+`/`-` mark, `n/a` for `None`, blank mark on an exact tie. Their table *layouts* stay separate — the prior test repeats its table per population and can star an arm whose split is not its own, which `end2end`'s `compare()` has no notion of. |
+| `slam/` | `SlamConfig`; `mono_stream` (the reader `Process` target) and the `load_frame` it is built on — ONE definition of what the tracker is shown, because `PriorProbe` scores priors on exactly those pixels; `write_tracking_config`; `SlamRunner`, **the single interface to HI-SLAM2** (§9.2.1); and `PriorProbe`, which runs a prior over frames with no SLAM run. `PriorProbe` lives here rather than in `priortest/` because the stock prior **is** a `MotionFilter` method and this is the only package allowed to import it. |
+| `priortest/` | `PriorTestConfig` + `arm_split_at` / `resolve_split`; `predict.py` (inference → `frames.csv`); `metrics.py` (the three alignments, and `aggregate`, the only place the split is used); `report.py`; `stage.py` (`run_prior_test`). Imports `arm_name` from `end2end` rather than restating it, so both test kinds name a scene's arms identically. |
+| `extract/` | `ExtractConfig`; `export.py` (`confidence_mask`, `load_export`, `write_keyframes`, `export_slam_depth`); `accuracy.py` (the depth-source table, §10.2's first number); `stage.py` (`run_extract`, `handoff_paths`). Loading is split from writing so `--no_export` can have the table without the files. Every function here takes either the **experiment** directory or the **run** directory (`<exp>/full`) and its parameter name says which — the npz and the renders are in the run, the handoff artifacts in the experiment above it. |
 | `adapt/` | `LoRAConfig` / `AdaptConfig`; `lora.py` (`LoRALinear`, `inject_lora`, `lora_state_dict` — hand-rolled, no `peft`: rank 8 on `attn.{qkv,proj}` + `mlp.{fc1,fc2}` across the aggregator's 24+24 blocks → 6.29 M trainable of 1.17 B; `B` starts at zero so the adapter is identity at step 0, `A` is kaiming — **which is why the seed goes to the constructor**); `model.py` (`LoRAVGGT` — build/inject/load, `forward`, `predict_depth`, `save`, `release`, `from_adapter`); `data.py` (`SceneData`, one keyframe = one sample placed **first** so VGGT predicts in that keyframe's frame — verified: `extrinsic[0]` is identity to 5e-4, rebased poses match SLAM GT to 0.04°); `losses.py` (the two undetached scale estimates §9.3 warns about); `trainer.py`, which **reports and returns but does not write the adapter** — `model.py:save` writes, the caller decides when and where. The only weights `trainer.py` writes are `checkpoint_every`'s periodic snapshots. |
-| `abtest/` | `TestConfig` + `ARM_DIRS` / `ARM_NAMES`; `prior.py` (`VggtPrior`); `metrics.py`; `report.py`; `stage.py` (`run_ab_test`). Named `abtest`, not `test`: back when `ada-slam/` was itself on `sys.path`, a package called `test` there would have shadowed CPython's stdlib one. As `adaslam.test` it no longer would — the name is kept because renaming it now would buy nothing. |
+| `end2end/` | `End2EndConfig` + the prior-spec vocabulary (`SENTINELS`, `arm_name`, `adapter_path`); `prior.py` (`VggtPrior`); `metrics.py`; `report.py`; `stage.py` (`run_end2end_test`). Was `abtest/` until an arm stopped being one of three fixed names. Note `End2EndConfig.check_priors_exist` is called by the **stage**, not `__post_init__`: the config is built in a block that must not touch the filesystem and that runs before `main()`'s `chdir`, and an adapter listed there legitimately does not exist yet when the whole pipeline runs — the adapt stage is about to create it. |
 
 Five rules hold across all of it — the fourth still being rolled out:
 
 - **No config field carries a default.** Five frozen dataclasses now — `SlamConfig`,
-  `ExtractConfig`, `LoRAConfig`, `AdaptConfig`, `TestConfig` — and every one of them is stated in
+  `ExtractConfig`, `LoRAConfig`, `AdaptConfig`, `End2EndConfig` — and every one of them is stated in
   full in `run_pipeline.py`'s PARAMETERS block. A knob is therefore written down in exactly one
   place per entry point, and none can be inherited silently from a package. The one field that
   may be left `None` is `LoRAConfig.vggt_hw`, and that is not a default: `None` is a stated
   instruction meaning *derive this from the stream*, honoured by `LoRAConfig.resolved(stream_hw)`
   in `main()` and refused by `LoRAVGGT` if it ever reaches the model unresolved (§9.3).
 - **A package that receives another's config does not re-declare its fields.** `extract` and
-  `abtest` are both handed the `SlamConfig`, so `colors` / `calib` / `stream_res` / `start` exist
+  `end2end` are both handed the `SlamConfig`, so `colors` / `calib` / `stream_res` / `start` exist
   once. Two configs naming the same *value* (`DEPTH_SOURCE` reaching both `EXTRACT` and `ADAPT`)
   is not divergence — that is the block above feeding both, which is the point.
 - **The PARAMETERS block is re-executed in every spawned child**, because `spawn` re-imports the
-  driver for the reader process. No config field may be a computed path or an open handle.
+  driver for the reader process. No config field may be a computed path or an open handle — and no
+  config's `__post_init__` may touch the filesystem. That block also runs *before* `main()`'s
+  `os.chdir(_ROOT)`, so a relative path checked there would resolve against whatever directory the
+  script was invoked from. `End2EndConfig.check_priors_exist` is a method the stage calls for
+  exactly this reason (and because the adapters it names may not exist yet when the full pipeline
+  runs — the adapt stage is about to create them).
 - **A stage receives its input and output paths; it reads no path global.** Configs still arrive
   as globals — they are knobs, not locations. This is what lets one stage be pointed at another
   run's results (adapt on one extract's export, write the adapter elsewhere) without moving
-  `OUT_EXTRACT`, which every other stage also keys off. **Only `adapt` holds today**
-  (`ADAPT_IN` / `ADAPT_IMAGES` / `ADAPT_OUT` / `ADAPT_CKPT` in the `stage I/O` block, passed to
-  `stage_adapt`); `extract` and `test` still derive their paths from `OUT_EXTRACT` / `OUT_TEST`,
-  and converting them is what finishes this rule. `grep -n 'OUT_EXTRACT\|COLORS' scripts/run_pipeline.py`
-  returning nothing inside a stage body is the check.
+  `OUT_EXTRACT`, which every other stage also keys off. **All three hold now**: the `stage I/O`
+  block names every path (`OUT_EXTRACT`, `ADAPT_IN` / `ADAPT_IMAGES` / `ADAPT_OUT` / `ADAPT_CKPT`,
+  `OUT_END2END`) and `main()` passes them down. The last two conversions came with the §7.1
+  restructure and took `out_root` out of the test config with them — a config that carried its own
+  output directory could not be pointed anywhere else. The check:
+  `grep -n 'OUT_EXTRACT\|OUT_END2END\|COLORS' scripts/run_pipeline.py` returns nothing inside a
+  stage body.
 - **`__all__` lists only what another package or an entry point imports** — 13 names across the
   four packages, down from 44. Everything else is reachable by its module path
-  (`adaslam.extract.export.load_export`, `adaslam.abtest.report.compare`), which is the difference between not
+  (`adaslam.extract.export.load_export`, `adaslam.end2end.report.compare`), which is the difference between not
   advertising a function and hiding it. A package's `__init__` is therefore a statement of its
   interface, and re-exporting `inject_lora` or `save_trajectory` would be advertising a second
   door into a stage that the four rules above exist to close. The two exceptions are types in a
@@ -738,7 +851,7 @@ auto-exposure, a genuine loop, sparse and holed GT depth. Nothing needs download
 is mirrored at `/storage/group/dataset_mirrors/01_incoming/TUM_RGBD_Dataset/`.
 
 **Two commands run everything:** `python scripts/preprocess_tum.py` once (§10.1), then
-`python scripts/run_pipeline.py` (~2 h 15 for extract → adapt → A/B). Every parameter is a
+`python scripts/run_pipeline.py` (~2 h 15 for extract → adapt → end2end). Every parameter is a
 constant at the top of `run_pipeline.py`; `STAGES` re-runs a single stage and `SKIP_EXISTING`
 reuses what is already on disk. `SCENE` selects the sequence — `rgbd_dataset_freiburg1_desk` at
 the moment, `rgbd_dataset_freiburg1_room` for the loop-closure case described below.
@@ -754,7 +867,7 @@ Two properties of its output are load-bearing:
   `adapt/data.py:SceneData` keys poses by `int(timestamp)`, and `1305031910.765238` truncates to
   the same integer for ~30 consecutive frames, silently collapsing the pose dict.
 - **`colors/` and `depths/` 1:1 by index.** `eval_utils.py:47`, `extract/export.py` and
-  `abtest/metrics.py:split_render_metrics` all index GT depth by RGB frame number.
+  `end2end/metrics.py:split_render_metrics` all index GT depth by RGB frame number.
   `run_pipeline.py:main` asserts this before any GPU work.
 
 **Undistortion happens offline, not via `UNDISTORT`/`CROP_BORDER` (or `demo.py
@@ -775,7 +888,7 @@ undistortion, depth scale and pose convention are all mutually consistent.
 ### 10.2 What to read from the result
 
 `config/tum_config.yaml` sets `mono_depth_alpha: 0.01`, not Replica's 0.001 — at 0.001 the prior
-barely enters BA and a null would be guaranteed by construction. If the A/B is null anyway, sweep
+barely enters BA and a null would be guaranteed by construction. If the comparison is null anyway, sweep
 that knob (0.001 / 0.01 / 0.05) before concluding: JDSA re-solving the prior's scale per keyframe
 (`track_frontend.py:42`) is exactly the failure mode the adaptation targets, so HI-SLAM2 may be
 structurally insensitive to it, and α is the only knob that changes how much the prior can matter.
@@ -784,8 +897,14 @@ The first number to check is `export.txt`'s per-frame vs global depth-L1 columns
 row. On Replica room0 they read 0.0735 / 0.2078 — that 2.8× blow-up under a single global scale
 *is* the cross-frame inconsistency this whole track targets. If TUM shows it too, there is headroom;
 if it does not, expect another null, and the honest reading is that the prior was never the
-bottleneck. Adding `'vggt_base'` to `TEST.arms` (stock VGGT-1B, no adapter) separates that from
+bottleneck. Adding `'vggt_base'` to `END2END_PRIORS` (stock VGGT-1B, no adapter) separates that from
 "VGGT is simply the better prior"; it is off by default because it costs a third full run.
+
+**The `prior` stage (§9.2.2) is the direct form of that check**, and it is the one to run first now:
+it reports exactly this ratio as `consistency_index`, for every generator rather than only for the
+Omnidata prior of one extract run, over every frame rather than that run's keyframes, and without a
+SLAM run. Run it before committing forty minutes an arm to `end2end` — if no generator's index
+moves, an end2end null is predictable rather than surprising.
 
 Second, check `export.txt`'s Gaussian-rendered row: it is the training target, so its L1 bounds
 what the adapter can learn. On Replica it was 0.0133 m; if TUM's is much worse, the supervision

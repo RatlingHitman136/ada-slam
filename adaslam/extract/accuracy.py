@@ -35,8 +35,12 @@ def l1_global(pairs):
     return np.mean([np.abs(g - s * p).mean() for g, p in pairs])
 
 
-def report_accuracy(out, x, cfg):
-    """Print the table. No-op when cfg.gt_depths is None - there is nothing to score against."""
+def report_accuracy(run_dir, x, cfg):
+    """Print the table. No-op when cfg.gt_depths is None - there is nothing to score against.
+
+    Takes the HI-SLAM2 run directory (extract/<exp>/full), not the experiment above it: the
+    Gaussian-rendered row is read straight out of that run's renders/.
+    """
     from geom.ba import get_prior_depth_aligned
     if cfg.gt_depths is None:
         return None
@@ -63,7 +67,7 @@ def report_accuracy(out, x, cfg):
             continue
 
         srcs = [('slam', x.depth[i]), ('prior', prior_depth[i])]
-        rf = f'{out}/renders/depth_after_opt/{idx:06d}.png'
+        rf = f'{run_dir}/renders/depth_after_opt/{idx:06d}.png'
         if os.path.exists(rf):
             srcs.append(('rendered',
                          cv2.imread(rf, cv2.IMREAD_ANYDEPTH) / cfg.depth_png_scale))

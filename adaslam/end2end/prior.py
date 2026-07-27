@@ -1,4 +1,4 @@
-"""VggtPrior - the depth prior an A/B arm swaps in.
+"""VggtPrior - the depth prior an end2end arm swaps in.
 
 It produces a drop-in for MotionFilter.prior_extractor and owns the model behind it; installing
 and restoring is SlamRunner.run(prior=...)'s job, so this module never touches MotionFilter and
@@ -11,7 +11,11 @@ import torch.nn.functional as F
 
 
 class VggtPrior:
-    """VGGT depth + Omnidata normals. `adapter=None` is the un-adapted 'vggt_base' arm."""
+    """VGGT depth + Omnidata normals.
+
+    `adapter` is the path to an adapter.safetensors - config.py:adapter_path resolves it from the
+    handoff DIRECTORY a prior spec names. `adapter=None` is the un-adapted 'vggt_base' arm.
+    """
 
     def __init__(self, cfg, adapter=None, stream_hw=None):
         from ..adapt import LoRAVGGT, aspect_lines

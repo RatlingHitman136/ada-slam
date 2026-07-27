@@ -1,12 +1,17 @@
 """SlamRunner - the one way HI-SLAM2 is invoked.
 
-This module is the ONLY place in adaslam/ that imports `hi2` or `motion_filter`. That is an
-invariant worth grepping for: it is what "every invocation goes through one interface" means in
-practice, and it is checkable in one line.
+This PACKAGE is the only place in adaslam/ that imports `hi2` or `motion_filter`. That is an
+invariant worth grepping for - it is what "every invocation goes through one interface" means in
+practice - and it is checkable in one line: every hit must be under adaslam/slam/.
 
     grep -rn 'from hi2 import\\|from motion_filter import' adaslam/
 
-Three call sites reach it - the extract run and one per A/B arm - and they differ only in their
+Two files match, and only two. This one imports both, to run SLAM. prior_probe.py imports
+MotionFilter for a different reason: the stock depth prior IS one of its methods, and the prior
+test has to call that exact function rather than a re-implementation of it. Anything outside
+adaslam/slam/ matching that grep has broken the invariant.
+
+Three call sites reach it - the extract run and one per end2end arm - and they differ only in their
 arguments. The depth prior is one of those arguments rather than something a caller patches on
 before calling, which fixes a real hazard: hi2.py:143 calls prior_extractor again inside
 terminate(), for the covis-inserted keyframes, so the patch has to survive that call and be undone
@@ -81,8 +86,8 @@ class SlamRunner:
         """One full SLAM run: stream -> track -> terminate -> write trajectories.
 
         `config` is the tracking YAML, `prior` an optional depth-prior object exposing
-        `.extractor()` (see abtest/prior.py). `gtdepthdir` is stated per call and never inherited:
-        passing it on a run whose renders become training data corrupts them (9.3).
+        `.extractor()` (see end2end/prior.py). `gtdepthdir` is stated per call and never
+        inherited: passing it on a run whose renders become training data corrupts them (9.3).
         """
         from hi2 import Hi2
         from motion_filter import MotionFilter

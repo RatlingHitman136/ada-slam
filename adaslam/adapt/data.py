@@ -1,12 +1,19 @@
 """Turning an extract stage's export into training samples.
 
-Reads the layout scripts/run_pipeline.py's extract stage writes (ARCHITECTURE.md §7):
+`scene_dir` is an extract EXPERIMENT directory (outputs/extract/<exp>), whose top level is exactly
+the handoff (ARCHITECTURE.md §7.1) - nothing here reaches into its full/ subdirectory, which is
+why that can be deleted once the export exists:
 
     <scene_dir>/depth_<src>/%06d.npy   float32 depth in SLAM units, one per keyframe
     <scene_dir>/mask_<src>/%06d.png    multi-view consistency mask
-    <scene_dir>/poses_slam.txt         the exported keyframes, TUM c2w  <- the keyframe list
+    <scene_dir>/poses_slam.txt         the exported keyframes, TUM c2w  <- the keyframe LIST only;
+                                       every pose below comes from traj_full.txt, which is the
+                                       post-refinement one
     <scene_dir>/traj_full.txt          every frame's pose, TUM c2w
     <scene_dir>/intrinsics.npy         fx fy cx cy at the tracker's resolution
+
+`image_dir` is separate and is the FULL colour directory, not <scene_dir>/image: frame() indexes
+it by frame number, so a keyframes-only folder would silently return the wrong image.
 """
 import os
 

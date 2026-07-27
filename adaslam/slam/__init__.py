@@ -16,11 +16,15 @@ Import cost is deliberate: torch.multiprocessing, numpy and tqdm arrive at impor
 motion_filter, lietorch and yaml are imported inside the functions that need them, because the
 reader Process is started with 'spawn' and re-imports this package in the child.
 
+Besides SlamRunner it exposes PriorProbe, which runs a depth prior over frames WITHOUT a SLAM run.
+The prior test needs that, and the stock prior is a MotionFilter method, so it has to live here.
+
 hi2 and motion_filter live in hislam2/, which adaslam/__init__.py put on sys.path before this file
 could run.
 """
 from .config import SlamConfig
+from .prior_probe import PriorProbe
 from .runner import SlamResult, SlamRunner
 from .tracking_config import write_tracking_config
 
-__all__ = ['SlamConfig', 'SlamResult', 'SlamRunner', 'write_tracking_config']
+__all__ = ['PriorProbe', 'SlamConfig', 'SlamResult', 'SlamRunner', 'write_tracking_config']

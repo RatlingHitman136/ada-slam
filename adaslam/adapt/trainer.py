@@ -111,6 +111,11 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
                'depth_source': cfg.depth_source, 'coupled_scale': cfg.coupled_scale,
                'p_single_view': cfg.p_single_view, 'max_left': cfg.max_left,
                'max_right': cfg.max_right, 'radius': cfg.radius, 'scene': scene_dir,
+               # the frame this adapter stopped seeing: the extract run streamed 0..t_max, so
+               # anything at or past this index is genuinely unseen. The prior test reads it here
+               # (priortest/config.py:arm_split_at) rather than re-deriving it from the extract dir,
+               # which may be deleted long before the adapter is.
+               'split_at': int(data.t_max) + 1,
                'seed': cfg.seed, 'split_mode': cfg.split_mode, 'train_frac': cfg.train_frac,
                'n_train_kf': len(data.train_kf), 'n_val_kf': len(data.val_kf),
                'val_kf': data.val_kf, 'keep_best': cfg.keep_best,

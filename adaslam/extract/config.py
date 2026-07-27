@@ -4,7 +4,7 @@ No field carries a default. Fields SlamConfig already declares are not repeated:
 receives both.
 """
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 from ..common import DEPTH_SOURCES
 
@@ -33,7 +33,10 @@ class ExtractConfig:
     kf_covis_thresh: Optional[float]      # backend.covis_thresh; extras in terminate(). LOWER=more
     buffer: int                           # hard cap; MUST exceed the count (no overflow guard)
     # ---------------------------------------------------------------- export
-    depth_source: str                     # 'rendered' (Gaussian expected) | 'slam' (1/disps_up)
+    # Every source named here is written, because all of them are handoff artifacts: which one
+    # supervises the adaptation is AdaptConfig.depth_source's decision, made later and cheaply
+    # changed, whereas re-deriving a source it turns out you wanted means another SLAM run.
+    depth_sources: Tuple[str, ...]        # 'slam' (1/disps_up) | 'rendered' (Gaussian expected)
     depth_png_scale: float                # 16-bit depth PNG scale used across the repo
     mask_filter_thresh: float             # depth_filter disparity agreement
     mask_min_count: int                   # min agreeing neighbours out of 6
@@ -45,8 +48,15 @@ class ExtractConfig:
     gt_depths: Optional[str]
 
     def __post_init__(self):
-        if self.depth_source not in DEPTH_SOURCES:
-            raise ValueError(f'depth_source={self.depth_source!r} is not one of {DEPTH_SOURCES}')
+        # normalise, so a config rebuilt from JSON (lists) compares equal to a hand-written one
+        object.__setattr__(self, 'depth_sources', tuple(self.depth_sources))
+        if not self.depth_sources:
+            raise ValueError('depth_sources is empty: nothing to export')
+        unknown = [s for s in self.depth_sources if s not in DEPTH_SOURCES]
+        if unknown:
+            raise ValueError(f'unknown depth source(s) {unknown}; choose from {DEPTH_SOURCES}')
+        if len(set(self.depth_sources)) != len(self.depth_sources):
+            raise ValueError(f'duplicate source in {self.depth_sources}: each writes one directory')
         if self.buffer <= 0:
             raise ValueError(f'buffer={self.buffer} must be > 0')
         if self.mask_min_count < 0:

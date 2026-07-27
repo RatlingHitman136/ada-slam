@@ -16,6 +16,10 @@ from ..common import stream_resize
 from ..paths import ROOT
 from ..runtime import free_vram, sh
 
+# One arm's scores. It records the split_at it was computed at, because arms are reused across
+# comparisons and a score split at the wrong frame is worse than no score (stage.py:cached_results).
+RESULTS = 'results.json'
+
 
 def run_ate(out, gt_traj):
     """evo with Sim3 alignment. Returns (overall rmse, per-frame errors, timestamps)."""
@@ -137,7 +141,11 @@ def split_render_metrics(out, split_at, slam_cfg, cfg):
 
 
 def evaluate(out, label, split_at, slam_cfg, cfg):
-    """Every metric for one arm, written to out/ab_results.json and returned."""
+    """Every metric for one arm, written to out/results.json and returned.
+
+    Reads a finished arm directory and re-runs nothing expensive, so re-scoring an existing arm at
+    a different split_at is cheap - which is what makes arms reusable across comparisons.
+    """
     res = {'label': label, 'output': out, 'split_at': split_at}
 
     ate, err, ts = run_ate(out, cfg.gt_traj)
@@ -152,5 +160,5 @@ def evaluate(out, label, split_at, slam_cfg, cfg):
     res['render'] = split_render_metrics(out, split_at, slam_cfg, cfg)
     res['mesh'] = run_mesh(out, cfg) if cfg.gt_mesh else None
 
-    json.dump(res, open(f'{out}/ab_results.json', 'w'), indent=2, default=float)
+    json.dump(res, open(f'{out}/{RESULTS}', 'w'), indent=2, default=float)
     return res
