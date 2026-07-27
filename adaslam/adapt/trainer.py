@@ -108,7 +108,7 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
                'steps_per_epoch': steps_per_epoch, 'samples_per_epoch': len(data.train_kf),
                'lr': cfg.lr, 'weight_decay': cfg.weight_decay, 'grad_clip': cfg.grad_clip,
                'lambda_pose': cfg.lambda_pose, 'depth_space': cfg.depth_space,
-               'depth_source': cfg.depth_source, 'coupled_scale': cfg.coupled_scale,
+               'coupled_scale': cfg.coupled_scale,
                'p_single_view': cfg.p_single_view, 'max_left': cfg.max_left,
                'max_right': cfg.max_right, 'radius': cfg.radius, 'scene': scene_dir,
                # the frame this adapter stopped seeing: the extract run streamed 0..t_max, so

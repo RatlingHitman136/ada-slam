@@ -13,8 +13,6 @@ The split is by lifetime, not by topic:
 from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
-from ..common import DEPTH_SOURCES      # extract writes depth_<src>/, this reads it: one tuple
-
 DEPTH_SPACES = ('depth', 'disparity')
 SPLIT_MODES = ('stride', 'contiguous', 'random')
 
@@ -114,7 +112,8 @@ class LoRAConfig:
 class AdaptConfig:
     """One training run."""
     # ---------------------------------------------------------------- data
-    depth_source: str        # which export target supervises: depth_<src>/ + mask_<src>/
+    # The supervision target is not a knob: the export writes common.DEPTH_DIR / MASK_DIR and
+    # nothing else, so there is nothing to choose between.
     stream_res: int          # tracking resolution budget the export was produced at
     p_single_view: float     # 0 = always multi-view, 1 = always monocular (how the prior is used)
     max_left: int            # neighbour counts, drawn per sample
@@ -144,8 +143,7 @@ class AdaptConfig:
                              # where they land is the ckpt_dir argument of LoRAVGGT.train()
 
     def __post_init__(self):
-        for name, allowed in (('depth_source', DEPTH_SOURCES), ('depth_space', DEPTH_SPACES),
-                              ('split_mode', SPLIT_MODES)):
+        for name, allowed in (('depth_space', DEPTH_SPACES), ('split_mode', SPLIT_MODES)):
             value = getattr(self, name)
             if value not in allowed:
                 raise ValueError(f'{name}={value!r} is not one of {allowed}')

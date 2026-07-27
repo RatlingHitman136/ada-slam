@@ -1,10 +1,13 @@
 """The depth-source accuracy table - the first number to read after an extract run.
 
-Three candidate supervision sources scored against GT, in two columns: one scale fitted per
-keyframe, and one scale for the whole sequence. The GAP between those columns is the diagnostic
-this whole research track targets - a source that gets worse under a single global scale is
-cross-frame inconsistent. On Replica room0 the Omnidata row reads 0.0735 / 0.2078, a 2.8x blow-up;
-SLAM and Gaussian-rendered depth both improve instead (ARCHITECTURE.md 10.2).
+The supervision target and the prior it is meant to replace, scored against GT in two columns: one
+scale fitted per keyframe, and one scale for the whole sequence. The GAP between those columns is
+the diagnostic this whole research track targets - a source that gets worse under a single global
+scale is cross-frame inconsistent. On Replica room0 the Omnidata row reads 0.0735 / 0.2078, a 2.8x
+blow-up; SLAM depth improves instead (ARCHITECTURE.md 10.2).
+
+There was a third row - the Gaussian map's expected depth, read out of the run's renders/ - and it
+was the most accurate of them. It went with the terminate-time render (SlamConfig.render_eval).
 """
 import os
 
@@ -35,11 +38,11 @@ def l1_global(pairs):
     return np.mean([np.abs(g - s * p).mean() for g, p in pairs])
 
 
-def report_accuracy(run_dir, x, cfg):
+def report_accuracy(x, cfg):
     """Print the table. No-op when cfg.gt_depths is None - there is nothing to score against.
 
-    Takes the HI-SLAM2 run directory (extract/<exp>/full), not the experiment above it: the
-    Gaussian-rendered row is read straight out of that run's renders/.
+    Reads nothing off disk but the GT depth: everything scored here comes out of the npz that
+    load_export already opened.
     """
     from geom.ba import get_prior_depth_aligned
     if cfg.gt_depths is None:
@@ -56,7 +59,7 @@ def report_accuracy(run_dir, x, cfg):
                              align_corners=False)[:, 0]
     prior_depth = (1.0 / prior_al.clamp(min=1e-6)).cpu().numpy()
 
-    pairs = {k: [] for k in ('slam', 'rendered', 'prior')}
+    pairs = {k: [] for k in ('slam', 'prior')}
     for i in range(K):
         idx = int(x.tstamp[i])
         gt = cv2.imread(os.path.join(cfg.gt_depths, gtfiles[idx]),
@@ -66,13 +69,7 @@ def report_accuracy(run_dir, x, cfg):
         if valid.sum() == 0:
             continue
 
-        srcs = [('slam', x.depth[i]), ('prior', prior_depth[i])]
-        rf = f'{run_dir}/renders/depth_after_opt/{idx:06d}.png'
-        if os.path.exists(rf):
-            srcs.append(('rendered',
-                         cv2.imread(rf, cv2.IMREAD_ANYDEPTH) / cfg.depth_png_scale))
-
-        for name, pred in srcs:
+        for name, pred in (('slam', x.depth[i]), ('prior', prior_depth[i])):
             v = valid & (pred > 0)
             if v.sum() > 0:
                 pairs[name].append((gt[v], pred[v]))
@@ -81,7 +78,6 @@ def report_accuracy(run_dir, x, cfg):
     print(f'  {"source":<34} {"per-frame":>10} {"global":>10}')
     print(f'  {"-" * 56}')
     for name, label in (('slam', 'SLAM depth (1/disps_up)'),
-                        ('rendered', f'Gaussian-rendered ({len(pairs["rendered"])} kf)'),
                         ('prior', 'JDSA-aligned Omnidata prior')):
         if pairs[name]:
             print(f'  {label:<34} {l1_per_frame(pairs[name]):>10.4f} '

@@ -29,7 +29,7 @@ import torch
 # ---------------------------------------------------------------- subprocesses
 
 def sh(cmd, **kw):
-    """Shell out, capturing both streams. Used for evo_ape, tsdf_integrate.py, eval_recon.py."""
+    """Shell out, capturing both streams. Used for evo_ape, which is the only CLI left."""
     return subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
 
 

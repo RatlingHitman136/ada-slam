@@ -8,9 +8,13 @@ import os
 import cv2
 import numpy as np
 
-# Which of the extract stage's export targets supervises the adaptation. Lives here, not in a
-# stage: extract writes depth_<src>/ and adapt reads it, so one tuple has to bound both.
-DEPTH_SOURCES = ('slam', 'rendered')
+# The extract stage's export target, 1/disps_up, and the mask beside it. Lives here, not in a
+# stage: extract writes these directories and adapt reads them, so one name has to bound both.
+# There was a second source once - 'rendered', the Gaussian map's expected depth read back out of
+# renders/depth_after_opt/. It went when the target narrowed to pose estimation and the terminate
+# time render became optional (SlamConfig.render_eval): a source that only exists when the renders
+# do is not a source, and depth_slam/ needs no SLAM run beyond the one that was happening anyway.
+DEPTH_DIR, MASK_DIR = 'depth_slam', 'mask_slam'
 
 # ---------------------------------------------------------------- the outputs/ layout
 # outputs/ is one directory per STAGE, then one per SCENE, then one per EXPERIMENT, because the
@@ -18,7 +22,7 @@ DEPTH_SOURCES = ('slam', 'rendered')
 # experiment directory holds what the NEXT stage consumes and nothing else; the raw HI-SLAM2 run
 # goes in a subdirectory, so it can be deleted to reclaim space without breaking the stage after it.
 #
-#   outputs/extract/<scene>/<exp>/ {depth_<src>/ mask_<src>/ image/ poses_slam.txt traj_full.txt
+#   outputs/extract/<scene>/<exp>/ {depth_slam/ mask_slam/ image/ poses_slam.txt traj_full.txt
 #                                   intrinsics.npy export.txt} + full/<the whole SLAM run>
 #   outputs/adapt/<scene>/<exp>/   {adapter.safetensors config.json train_log.json} + checkpoints/
 #   outputs/test/end2end/<scene>/<arm>/  one depth-prior generator's run; <arm> is INFERRED from

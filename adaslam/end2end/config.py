@@ -19,7 +19,7 @@ have exactly one description and the arms cannot disagree about them.
 """
 import os
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Tuple
 
 from ..adapt import LoRAConfig
 from ..common import ADAPT_CKPT_SUBDIR
@@ -75,15 +75,10 @@ class End2EndConfig:
     length: int                      # 100000 = whole sequence
     buffer: int
     # ---------------------------------------------------------------- ground truth
+    # ATE is the metric, so evo_ape's reference trajectory is the only ground truth an arm needs.
+    # The GT mesh, GT depth and the TSDF voxel knobs went with the render and mesh metrics when the
+    # target narrowed to pose estimation (metrics.py's docstring).
     gt_traj: str                     # evo_ape's reference trajectory
-    gt_mesh: Optional[str]           # None -> skip TSDF + eval_recon (TUM ships no GT mesh)
-    gt_depths: Optional[str]         # Hi2's gtdepthdir AND split_render_metrics' reference. Here
-                                     # the masking is correct: depth cannot be scored without GT
-    depth_png_scale: float           # 16-bit depth PNG scale used across the repo
-    # ---------------------------------------------------------------- mesh metric
-    voxel_size: float                # pinned for ALL arms - differing sizes are not comparable
-    voxel_fallbacks: Tuple[float, ...]   # marching cubes OOMs on a busy shared GPU
-    mesh_weight: float
     # ---------------------------------------------------------------- the VGGT arms
     # Declared here because the 'vggt_base' arm has no adapter to read a structure back from and
     # so silently takes these values. Making that a field of this config rather than a global is
@@ -94,7 +89,7 @@ class End2EndConfig:
 
     def __post_init__(self):
         # normalise, so a config rebuilt from JSON (lists) compares equal to a hand-written one
-        for name in ('priors', 'voxel_fallbacks', 'omni_normal_hw'):
+        for name in ('priors', 'omni_normal_hw'):
             object.__setattr__(self, name, tuple(getattr(self, name)))
         if not self.priors:
             raise ValueError('priors is empty: nothing to test')
@@ -107,9 +102,6 @@ class End2EndConfig:
         if clash:
             raise ValueError(f'these priors infer the same arm directory {sorted(clash)}: '
                              f'{[s for s, n in zip(self.priors, names) if n in clash]}')
-
-        if any(v <= 0 for v in (self.voxel_size, *self.voxel_fallbacks)):
-            raise ValueError('voxel sizes must be > 0')
 
     def check_priors_exist(self):
         """Every adapter spec is a real handoff directory. Called by the STAGE, not __post_init__.

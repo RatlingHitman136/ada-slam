@@ -34,10 +34,10 @@ def cached_results(out, split_at):
     """That arm's results if it already has some at THIS split, else None.
 
     Two things are cached separately because they cost differently. The SLAM run is the expensive
-    one, keyed on the arm directory holding a finished trajectory. Scoring is cheap - it reads the
-    saved renders - and is keyed on split_at too, because arms are reused across comparisons and
-    every adapter has its own training fraction, so one comparison's split is not another's.
-    Re-scoring at a new split therefore costs no SLAM run.
+    one, keyed on the arm directory holding a finished trajectory. Scoring is cheap - one evo_ape
+    over a trajectory already on disk - and is keyed on split_at too, because arms are reused
+    across comparisons and every adapter has its own training fraction, so one comparison's split
+    is not another's. Re-scoring at a new split therefore costs no SLAM run.
     """
     path = f'{out}/{RESULTS}'
     if not os.path.exists(path):
@@ -93,15 +93,17 @@ def run_end2end_test(runner, slam_cfg, cfg, out_root, arm_config, split_at, skip
                 # SlamRunner installs the prior and restores the stock one in a finally, so no arm
                 # can inherit the previous arm's patch and quietly become a second VGGT arm. That
                 # matters more now the arm list is arbitrary rather than three fixed names.
+                # gtdepthdir stays None: Hi2 reads it only inside the eval_rendering guard, and
+                # nothing scores renders any more (SlamConfig.render_eval)
                 n_kf = runner.run(out, arm_config, cfg.length, cfg.buffer,
-                                  gtdepthdir=cfg.gt_depths, prior=prior).n_kf
+                                  gtdepthdir=None, prior=prior).n_kf
                 print(f'{label}: SLAM done in {time.time()-t0:.0f}s, {n_kf} keyframes')
             finally:
                 if prior is not None:
                     prior.release()      # in a finally: a crashed arm otherwise strands ~2.5 GB
             free_vram(f'arm {name}')
 
-        res = evaluate(out, label, split_at, slam_cfg, cfg)
+        res = evaluate(out, label, split_at, cfg)
         print_report(res)
         results.append(res)
         free_vram(f'arm {name} eval')

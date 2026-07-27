@@ -177,5 +177,9 @@ class Hi2:
         self.video.poses[:self.video.counter.value] = torch.tensor(updated_poses[:,1:])
 
         traj_full = self.traj_filler(self.images)
-        self.gs.eval_rendering(self.images, self.args.gtdepthdir, traj_full.matrix().data, self.video.tstamp[:self.video.counter.value].to(device='cpu'))
+        # renders/ + psnr/, and nothing else: eval_rendering is no_grad and only writes files, so
+        # the trajectory above is the same either way. Off when the run's only product is poses.
+        # getattr, like dump_slam_depth at 155, so demo.py's argparse namespace still works.
+        if getattr(self.args, 'render_eval', True):
+            self.gs.eval_rendering(self.images, self.args.gtdepthdir, traj_full.matrix().data, self.video.tstamp[:self.video.counter.value].to(device='cpu'))
         return traj_full.inv().data.cpu().numpy()

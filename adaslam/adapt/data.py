@@ -4,8 +4,8 @@
 the handoff (ARCHITECTURE.md §7.1) - nothing here reaches into its full/ subdirectory, which is
 why that can be deleted once the export exists:
 
-    <scene_dir>/depth_<src>/%06d.npy   float32 depth in SLAM units, one per keyframe
-    <scene_dir>/mask_<src>/%06d.png    multi-view consistency mask
+    <scene_dir>/depth_slam/%06d.npy    float32 depth in SLAM units, one per keyframe
+    <scene_dir>/mask_slam/%06d.png     multi-view consistency mask
     <scene_dir>/poses_slam.txt         the exported keyframes, TUM c2w  <- the keyframe LIST only;
                                        every pose below comes from traj_full.txt, which is the
                                        post-refinement one
@@ -21,7 +21,7 @@ import cv2
 import numpy as np
 import torch
 
-from ..common import stream_resize
+from ..common import DEPTH_DIR, MASK_DIR, stream_resize
 
 from .config import aspect_lines
 
@@ -67,10 +67,9 @@ class SceneData:
         self.hw = lora.vggt_hw
         self.files = sorted(os.listdir(image_dir))
 
-        self.ddir, self.mdir = f'depth_{cfg.depth_source}', f'mask_{cfg.depth_source}'
+        self.ddir, self.mdir = DEPTH_DIR, MASK_DIR
         if not os.path.isdir(f'{scene_dir}/{self.ddir}'):
-            raise SystemExit(f'{scene_dir}/{self.ddir} not found - re-run the extract stage with '
-                             f'depth_source = {cfg.depth_source!r}')
+            raise SystemExit(f'{scene_dir}/{self.ddir} not found - re-run the extract stage')
 
         traj = np.loadtxt(f'{scene_dir}/traj_full.txt')
         self.c2w = {int(r[0]): tum_to_c2w(r) for r in traj}

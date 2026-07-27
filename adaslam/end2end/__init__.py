@@ -4,9 +4,10 @@
 
     run_end2end_test(runner, slam_cfg, End2EndConfig(...), out_root, arm_config, split_at)
 
-One full-sequence SLAM run per entry in `priors`, differing ONLY in the depth prior, then evo ATE
--> TSDF -> Sim(3) align -> eval_recon plus render metrics recomputed per frame, all split
-seen/unseen at the frame the adapter's training data ended.
+One full-sequence SLAM run per entry in `priors`, differing ONLY in the depth prior, then evo ATE,
+split seen/unseen at the frame the adapter's training data ended. ATE is the whole table: the
+render and mesh metrics went with the terminate-time render when the target narrowed to pose
+estimation (SlamConfig.render_eval, metrics.py's docstring).
 
 An arm is a prior GENERATOR - 'omnidata', 'vggt_base', or the handoff directory of any adapt run or
 one of its checkpoints - and its output directory is INFERRED from that (config.py:arm_name), never
@@ -19,8 +20,8 @@ against results.json files already on disk without a GPU:
 
     from adaslam.end2end.report import compare, print_report
 
-gaussian.utils.loss_utils and midas.omnidata live in hislam2/, which adaslam/__init__.py put on
-sys.path before this file could run.
+midas.omnidata lives in hislam2/, which adaslam/__init__.py put on sys.path before this file could
+run.
 """
 from .config import End2EndConfig
 from .prior import VggtPrior

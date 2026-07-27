@@ -12,7 +12,9 @@ object.
 
 Note what is NOT here: gtdepthdir. Routing GT depth into Hi2 corrupts a run whose renders become
 training data (eval_utils.py:50-52 zeroes rendered depth wherever GT is invalid - 9.3), so it is
-a per-run argument that each caller has to state, not a field it could inherit by accident.
+a per-run argument that each caller has to state, not a field it could inherit by accident. That
+trap is dormant while render_eval is False - Hi2 reads gtdepthdir nowhere else - but it costs
+nothing to keep the argument honest for the day the toggle goes back on.
 """
 from dataclasses import dataclass
 
@@ -28,9 +30,17 @@ class SlamConfig:
     colors: str           # image directory, walked sorted; the filenames supply the timestamps
     calib: str            # one line: 'fx fy cx cy [k1 k2 p1 p2 ...]'
     start: int            # first frame index
-    undistort: bool       # reader-only. 10.1 says undistort offline instead: split_render_metrics
-    crop_border: int      # reader-only, likewise    re-derives the GT frame with a resize alone
+    undistort: bool       # reader-only. 10.1 says undistort offline instead: extract/accuracy.py,
+    crop_border: int      # reader-only, likewise    priortest/predict.py and adapt/data.py all
+                          #                          re-derive the frame with a resize alone
     stream_res: int       # tracking resolution budget - common.stream_resize's argument
+    # hi2.py:180's eval_rendering. On, it renders every 5th frame plus every keyframe, loads
+    # AlexNet twice for LPIPS and writes renders/ + psnr/; nothing in this pipeline reads any of
+    # it now that the target is pose estimation. It is a field rather than a run() argument
+    # because it is the same for every run of an experiment - the extract run and every arm - and
+    # that is the split this docstring draws. gs.finalize() still runs either way, so the
+    # trajectory is unaffected (it is what refines the keyframe poses - ARCHITECTURE.md 3.1).
+    render_eval: bool
 
     def __post_init__(self):
         if self.start < 0:

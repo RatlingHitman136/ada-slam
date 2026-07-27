@@ -3,10 +3,11 @@
     from adaslam.slam import SlamConfig, SlamRunner
 
     runner = SlamRunner(SlamConfig(weights='pretrained_models/droid.pth', colors=..., calib=...,
-                                   start=0, undistort=False, crop_border=0, stream_res=341*640))
+                                   start=0, undistort=False, crop_border=0, stream_res=341*640,
+                                   render_eval=False))
     res = runner.run(out, config='config/tum_config.yaml', length=200, buffer=500,
                      dump_slam_depth=True)                       # the extract run
-    res = runner.run(out, config, length, buffer, gtdepthdir=DEPTHS, prior=VggtPrior(...))  # an arm
+    res = runner.run(out, config, length, buffer, prior=VggtPrior(...))                     # an arm
 
 This package is the only code in the repo besides demo.py that talks to `Hi2` or `MotionFilter`.
 Keeping it that way is what makes "one interface" a checkable property rather than a convention -

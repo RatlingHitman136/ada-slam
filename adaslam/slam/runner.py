@@ -36,11 +36,11 @@ from ..runtime import free_vram
 
 from .stream import mono_stream
 
-# Every attribute Hi2 reads off its args namespace (hi2.py: 23, 24, 29, 41, 47, 157, 180 and the
-# getattr at 155). Asserted rather than trusted, so a future Hi2 that starts reading args.start
-# fails here instead of silently seeing whatever a SimpleNamespace happened to carry.
-HI2_ARGS = ('weights', 'config', 'output', 'gtdepthdir', 'buffer',
-            'droidvis', 'gsvis', 'dump_slam_depth', 'image_size')
+# Every attribute Hi2 reads off its args namespace (hi2.py: 23, 24, 29, 41, 47, 157, 184 and the
+# getattrs at 155 and 182). Asserted rather than trusted, so a future Hi2 that starts reading
+# args.start fails here instead of silently seeing whatever a SimpleNamespace happened to carry.
+HI2_ARGS = ('weights', 'config', 'output', 'gtdepthdir', 'buffer', 'droidvis', 'gsvis',
+            'dump_slam_depth', 'render_eval', 'image_size')
 
 
 @dataclass
@@ -88,6 +88,8 @@ class SlamRunner:
         `config` is the tracking YAML, `prior` an optional depth-prior object exposing
         `.extractor()` (see end2end/prior.py). `gtdepthdir` is stated per call and never
         inherited: passing it on a run whose renders become training data corrupts them (9.3).
+        It only bites while cfg.render_eval is True - Hi2 reads it nowhere else - so with the
+        toggle off every caller may pass None, and does.
         """
         from hi2 import Hi2
         from motion_filter import MotionFilter
@@ -112,7 +114,8 @@ class SlamRunner:
             args = types.SimpleNamespace(
                 weights=cfg.weights, config=config, output=out, gtdepthdir=gtdepthdir,
                 buffer=min(1000, n_frames // 10 + 150) if buffer is None else buffer,
-                droidvis=False, gsvis=False, dump_slam_depth=dump_slam_depth)
+                droidvis=False, gsvis=False, dump_slam_depth=dump_slam_depth,
+                render_eval=cfg.render_eval)
 
             hi2 = None
             pbar = tqdm(range(min(n_frames, length)), desc='Processing keyframes')

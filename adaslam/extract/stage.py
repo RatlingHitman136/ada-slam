@@ -3,7 +3,7 @@ import os
 import shutil
 import time
 
-from ..common import HANDOFF_UP, extract_run_dir
+from ..common import DEPTH_DIR, HANDOFF_UP, extract_run_dir
 from ..print_utils import tee
 from ..runtime import free_vram
 from ..slam import write_tracking_config
@@ -11,20 +11,14 @@ from ..slam import write_tracking_config
 from .export import export_slam_depth
 
 
-def handoff_paths(out, cfg):
+def handoff_paths(out):
     """What a finished export leaves at the top level of an extract experiment directory.
 
-    Used to decide whether an already-tracked run still needs its export re-run. Note this is the
-    superset: an adapt run opens only the ONE source it was configured with, which is why
-    run_pipeline.py's stage_adapt checks its own shorter list rather than calling this.
-
-    A source that write_keyframes had to drop (a run that died before eval_rendering has no
-    renders) is still listed here, so such a run re-exports on every invocation instead of being
-    skipped. That is the intended reading - the run is incomplete - and it is only ever the cost
-    of reading the npz back.
+    Used to decide whether an already-tracked run still needs its export re-run: any of these
+    missing re-runs it, which costs only reading the npz back.
     """
-    return [f'{out}/poses_slam.txt', *(f'{out}/{f}' for f in HANDOFF_UP),
-            *(f'{out}/depth_{s}' for s in cfg.depth_sources)]
+    return [f'{out}/poses_slam.txt', f'{out}/{DEPTH_DIR}',
+            *(f'{out}/{f}' for f in HANDOFF_UP)]
 
 
 def run_extract(runner, cfg, out, length, base_config, skip_existing=False):
@@ -32,7 +26,7 @@ def run_extract(runner, cfg, out, length, base_config, skip_existing=False):
 
     `out` is the EXPERIMENT directory. The run itself goes into out/full and stays there whole;
     only the handoff artifacts reach the top level, so full/ can be deleted afterwards to reclaim
-    the Gaussian map and the renders without breaking the adapt stage.
+    the Gaussian map without breaking the adapt stage.
 
     `base_config` is the experiment's tracking YAML; this is the ONLY run that gets the keyframe
     knobs layered on top of it, written to out/full/extract_config.yaml so the run is
@@ -45,13 +39,11 @@ def run_extract(runner, cfg, out, length, base_config, skip_existing=False):
                                          keyframe_thresh=cfg.kf_redundant_thresh,
                                          covis_thresh=cfg.kf_covis_thresh)
 
-    # The two halves are skipped independently. The npz standing in for the whole stage used to
-    # mean an existing run could never gain a depth source it was not originally exported with;
-    # re-exporting is cheap (it reads PNGs), so the export re-runs whenever a handoff artifact is
-    # missing even though the SLAM run is reused.
+    # The two halves are skipped independently: re-exporting is cheap (it reads the npz back), so
+    # it re-runs whenever a handoff artifact is missing even though the SLAM run is reused.
     if skip_existing and os.path.exists(f'{run_dir}/slam_depth.npz'):
         print(f'{run_dir}/slam_depth.npz exists - skipping the SLAM run')
-        stale = [p for p in handoff_paths(out, cfg) if not os.path.exists(p)]
+        stale = [p for p in handoff_paths(out) if not os.path.exists(p)]
         if not stale:
             return None
         print(f'but re-exporting: {" ".join(os.path.basename(p) for p in stale)} missing')
@@ -59,7 +51,8 @@ def run_extract(runner, cfg, out, length, base_config, skip_existing=False):
         t0 = time.time()
         # gtdepthdir stays None: eval_utils.py:50-52 zeroes the rendered depth wherever GT is
         # invalid, and on real sensors (TUM: 24% holes, on exactly the hard surfaces) that would
-        # both shrink the training set and tie its mask to where the Kinect happened to work.
+        # both shrink the training set and tie its mask to where the Kinect happened to work. Moot
+        # while render_eval is off, and stated anyway so it stays true if it goes back on.
         # cfg.gt_depths reaches the accuracy table below instead, which masks on (gt > 0) & mask.
         n_kf = runner.run(run_dir, tracking_cfg, length, cfg.buffer,
                           gtdepthdir=None, dump_slam_depth=True).n_kf
@@ -81,5 +74,5 @@ def run_extract(runner, cfg, out, length, base_config, skip_existing=False):
     with tee(f'{out}/export.txt'):
         n_exported = export_slam_depth(out, cfg)
     free_vram('extract')
-    print(f'{n_exported} keyframes exported to {out}/depth_{{{",".join(cfg.depth_sources)}}}/')
+    print(f'{n_exported} keyframes exported to {out}/{DEPTH_DIR}/')
     return n_exported
