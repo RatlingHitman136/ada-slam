@@ -1,13 +1,7 @@
-"""The depth-source accuracy table - the first number to read after an extract run.
+"""The depth-source accuracy table - the first number to read after an extract run (10.2).
 
-The supervision target and the prior it is meant to replace, scored against GT in two columns: one
-scale fitted per keyframe, and one scale for the whole sequence. The GAP between those columns is
-the diagnostic this whole research track targets - a source that gets worse under a single global
-scale is cross-frame inconsistent. On Replica room0 the Omnidata row reads 0.0735 / 0.2078, a 2.8x
-blow-up; SLAM depth improves instead (ARCHITECTURE.md 10.2).
-
-There was a third row - the Gaussian map's expected depth, read out of the run's renders/ - and it
-was the most accurate of them. It went with the terminate-time render (SlamConfig.render_eval).
+The GAP between the per-frame and global columns is the diagnostic this track targets: a source
+that gets worse under one global scale is cross-frame inconsistent.
 """
 import os
 
@@ -28,22 +22,14 @@ def l1_per_frame(pairs):
 
 
 def l1_global(pairs):
-    """One scale for the whole sequence, then averaged the same way as l1_per_frame.
-
-    Averaging per frame in both keeps the only difference the scale fit itself, so the gap between
-    the two columns isolates cross-frame scale drift rather than frame weighting.
-    """
+    """One scale for the whole sequence, averaged as l1_per_frame - so only the fit differs."""
     s = align_scale(np.concatenate([p for _, p in pairs]),
                     np.concatenate([g for g, _ in pairs]))
     return np.mean([np.abs(g - s * p).mean() for g, p in pairs])
 
 
 def report_accuracy(x, cfg):
-    """Print the table. No-op when cfg.gt_depths is None - there is nothing to score against.
-
-    Reads nothing off disk but the GT depth: everything scored here comes out of the npz that
-    load_export already opened.
-    """
+    """Print the table. No-op without cfg.gt_depths. Reads nothing off disk but the GT depth."""
     from geom.ba import get_prior_depth_aligned
     if cfg.gt_depths is None:
         return None
@@ -51,8 +37,7 @@ def report_accuracy(x, cfg):
     K, H, W = x.shape
     gtfiles = sorted(os.listdir(cfg.gt_depths))
 
-    # JDSA-aligned Omnidata prior, reusing geom/ba.py's bilinear scale field.
-    # Inherently 1/8-res in the pipeline; bilinearly upsampled here so all three are comparable.
+    # JDSA-aligned prior, via geom/ba.py's own scale field; 1/8-res, upsampled to compare
     prior_al, _ = get_prior_depth_aligned(torch.from_numpy(x.npz['disps_prior']).cuda(),
                                           torch.from_numpy(x.npz['dscales']).cuda())
     prior_al = F.interpolate(prior_al[:, None], size=(H, W), mode='bilinear',

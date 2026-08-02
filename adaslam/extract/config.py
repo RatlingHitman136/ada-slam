@@ -1,8 +1,4 @@
-"""ExtractConfig - the training-data run.
-
-No field carries a default. Fields SlamConfig already declares are not repeated: run_extract
-receives both.
-"""
+"""ExtractConfig - the training-data run. Fields SlamConfig declares are not repeated."""
 from dataclasses import dataclass
 from typing import Optional
 
@@ -11,39 +7,24 @@ from typing import Optional
 class ExtractConfig:
     """Keyframe production, then the export.
 
-    The four thresholds are EXTRACT-ONLY and that is the whole point: they go into a generated
-    tracking YAML that only this run is given, so denser training data can never be mistaken for a
-    tracking change in the A/B comparison. Any of them may be None = inherit the base config.
-
-    Two gates decide the keyframe count and the SECOND usually wins. MotionFilter proposes one
-    once the mean flow since the last exceeds kf_motion_thresh (motion_filter.py:112-113), then
-    TrackFrontend deletes it again if it lands closer than kf_redundant_thresh to its neighbour
-    (track_frontend.py:49-52, and :93-99 during init, where it prunes on that alone). So lowering
-    kf_motion_thresh by itself just proposes keyframes that are immediately pruned. Measured over
-    204 TUM frames:
-        (motion, redundant) = (2.4, 4.0) -> 43 kf   (1.2, 4.0) -> 45 kf   (1.2, 1.5) -> 83 kf
-    To densify, lower BOTH; kf_redundant_thresh is the one that moves the number.
+    The four thresholds are EXTRACT-ONLY: they go into a generated tracking YAML only this run is
+    given, so denser training data cannot look like a tracking change in the comparison.
     """
     # ---------------------------------------------------------------- keyframe production
+    # Two gates decide the count and the second usually wins: MotionFilter proposes, TrackFrontend
+    # prunes. Over 204 TUM frames (motion, redundant) = (2.4, 4.0) -> 43 kf, (1.2, 4.0) -> 45,
+    # (1.2, 1.5) -> 83. To densify, lower BOTH. Any threshold may be None = inherit the base config.
     kf_motion_thresh: Optional[float]     # motion_filter.thresh
     kf_init_thresh: Optional[float]       # the same gate before initialisation
     kf_redundant_thresh: Optional[float]  # frontend.keyframe_thresh - the gate that binds
     kf_covis_thresh: Optional[float]      # backend.covis_thresh; extras in terminate(). LOWER=more
     buffer: int                           # hard cap; MUST exceed the count (no overflow guard)
     # ---------------------------------------------------------------- export
-    # The export writes common.DEPTH_DIR / MASK_DIR and nothing else: 1/disps_up is the one
-    # supervision target left now that the terminate-time render is optional.
     depth_png_scale: float                # 16-bit depth PNG scale used across the repo
     mask_filter_thresh: float             # depth_filter disparity agreement
     mask_min_count: int                   # min agreeing neighbours out of 6
     mask_min_disp_ratio: float            # drop pixels below this fraction of the frame's mean
-    # The accuracy table's reference ONLY - it must never reach Hi2. eval_utils.py:50-52 zeroes
-    # rendered depth wherever GT is invalid, and on TUM's ~24% holes that would both shrink the
-    # training set and tie its mask to where the Kinect happened to work. Hence a field here and
-    # a separate, per-call gtdepthdir argument on SlamRunner.run (ARCHITECTURE.md 9.3). Dormant
-    # while SlamConfig.render_eval is False - Hi2 reads gtdepthdir nowhere else - but the split is
-    # what keeps it dormant by construction rather than by luck.
-    gt_depths: Optional[str]
+    gt_depths: Optional[str]              # the accuracy table ONLY - must never reach Hi2 (9.3)
 
     def __post_init__(self):
         if self.buffer <= 0:

@@ -1,46 +1,23 @@
-"""SlamConfig - the stream and the tracker.
-
-No field carries a default, as in adapt/config.py: whoever drives a run states every value, so a
-knob is written down in exactly one place per entry point.
-
-The split is deliberate and load-bearing. What is IDENTICAL across every run of one experiment
-lives here and is handed to SlamRunner once; what DIFFERS per run - the tracking YAML, the output
-dir, length, buffer, gtdepthdir, dump_slam_depth - is an argument to SlamRunner.run(). That is
-what makes it visible at the call site that the extract run gets a generated config and the A/B
-arms get the base one (ARCHITECTURE.md 9.2.1), rather than that difference hiding inside an
-object.
-
-Note what is NOT here: gtdepthdir. Routing GT depth into Hi2 corrupts a run whose renders become
-training data (eval_utils.py:50-52 zeroes rendered depth wherever GT is invalid - 9.3), so it is
-a per-run argument that each caller has to state, not a field it could inherit by accident. That
-trap is dormant while render_eval is False - Hi2 reads gtdepthdir nowhere else - but it costs
-nothing to keep the argument honest for the day the toggle goes back on.
-"""
+"""SlamConfig - the stream and the tracker (9.2.1)."""
 from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class SlamConfig:
-    """One sequence, one tracker. Pickled by value into the reader child, so keep it primitives.
+    """What is identical across every run of an experiment; what differs is a run() argument.
 
-    Never make a field a computed path or an open handle: torch.multiprocessing's 'spawn' start
-    method re-executes the driver module in the child, and every config literal in it is rebuilt.
+    Primitives only - spawn rebuilds every config literal in the reader child. No gtdepthdir:
+    routing GT depth into Hi2 corrupts a run whose renders become training data (9.3), so it is a
+    per-run argument nothing can inherit by accident.
     """
     weights: str          # pretrained_models/droid.pth -> Hi2's DroidNet
-    colors: str           # image directory, walked sorted; the filenames supply the timestamps
+    colors: str           # image dir, walked sorted; the filenames supply the timestamps
     calib: str            # one line: 'fx fy cx cy [k1 k2 p1 p2 ...]'
     start: int            # first frame index
-    undistort: bool       # reader-only. 10.1 says undistort offline instead: extract/accuracy.py,
-    crop_border: int      # reader-only, likewise    priortest/predict.py and adapt/data.py all
-                          #                          re-derive the frame with a resize alone
-    stream_res: int       # tracking resolution budget - common.stream_resize's argument
-    # hi2.py:180's eval_rendering. On, it renders every 5th frame plus every keyframe, loads
-    # AlexNet twice for LPIPS and writes renders/ + psnr/; nothing in this pipeline reads any of
-    # it now that the target is pose estimation. It is a field rather than a run() argument
-    # because it is the same for every run of an experiment - the extract run and every arm - and
-    # that is the split this docstring draws. gs.finalize() still runs either way, so the
-    # trajectory is unaffected (it is what refines the keyframe poses - ARCHITECTURE.md 3.1).
-    render_eval: bool
+    undistort: bool       # reader-only; undistort offline instead (10.1)
+    crop_border: int      # reader-only, likewise
+    stream_res: int       # tracking pixel budget - common.stream_resize's argument
+    render_eval: bool     # hi2.py's eval_rendering -> renders/ + psnr/; nothing here reads them
 
     def __post_init__(self):
         if self.start < 0:

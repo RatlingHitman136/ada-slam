@@ -1,17 +1,8 @@
-"""slam_depth.npz -> depth_slam/ mask_slam/ image/ poses_slam.txt.
+"""slam_depth.npz (Hi2's post-global-BA dump) -> depth_slam/ mask_slam/ image/ poses_slam.txt.
 
-Hi2.terminate() dumps the tracker's own state at the one instant where disps, disps_up and poses
-are mutually consistent (hi2.py:155); this turns that dump into the per-keyframe files the adapt
-stage trains on.
-
-Two directories, and every function here says which it takes. `run_dir` is the untouched HI-SLAM2
-run (extract/<exp>/full), which is where the npz is; `exp_dir` is the experiment above it, which
-holds the handoff artifacts and nothing else. The split is what lets full/ be deleted afterwards
-without breaking adapt.
-
-Loading is split from writing because the accuracy table (accuracy.py) needs the same arrays but
-writes nothing: `load_export` then `report_accuracy`, skipping `write_keyframes`, scores an
-existing dump without touching the files on disk.
+`run_dir` is the SLAM run (extract/<exp>/full), where the npz is; `exp_dir` is the experiment above
+it, where the handoff goes. Loading is split from writing so accuracy.py can score a dump without
+touching the files: load_export then report_accuracy, skipping write_keyframes.
 """
 import os
 from dataclasses import dataclass
@@ -36,12 +27,10 @@ class ExportInputs:
 
 
 def confidence_mask(poses, disps, intrinsics_full, cfg):
-    """Multi-view consistency mask, following util/droid_visualization.py:104-110.
+    """Multi-view consistency mask, as util/droid_visualization.py:104-110.
 
-    droid_backends.depth_filter counts, per pixel, how many of 6 temporal neighbours agree on the
-    reprojected disparity. The kernel bounds-checks against disps.size(0), so the arrays must be
-    sliced to the real keyframe count - otherwise trailing keyframes match unused buffer slots
-    that still hold the initial 1.0.
+    depth_filter counts how many of 6 neighbours agree per pixel. The arrays MUST be sliced to the
+    real keyframe count, or trailing keyframes match unused buffer slots still holding 1.0.
     """
     import droid_backends
     K = disps.shape[0]
@@ -78,13 +67,7 @@ def load_export(run_dir, cfg):
 
 
 def write_keyframes(exp_dir, x, cfg):
-    """Write depth_slam/ mask_slam/ image/ poses_slam.txt into exp_dir. Returns the kept rows.
-
-    One target: 1/disps_up, the tracker's own depth, straight out of the npz. There was a second
-    once - the Gaussian map's expected depth, read back out of run_dir/renders/ - and it was the
-    more accurate of the two (0.0133 vs 0.0324 m on Replica room0). It went with the terminate-time
-    render (SlamConfig.render_eval), which is the only thing that ever produced it.
-    """
+    """Write depth_slam/ mask_slam/ image/ poses_slam.txt into exp_dir. Returns the kept rows."""
     from lietorch import SE3
     K, _, _ = x.shape
     for sub in ('image', DEPTH_DIR, MASK_DIR):
@@ -96,15 +79,12 @@ def write_keyframes(exp_dir, x, cfg):
         np.save(f'{exp_dir}/{DEPTH_DIR}/{idx:06d}.npy', dep)
         cv2.imwrite(f'{exp_dir}/{MASK_DIR}/{idx:06d}.png',
                     ((x.mask[i] & (dep > 0)) * 255).astype(np.uint8))
-        # a record of which keyframes were exported, not a handoff artifact - SceneData indexes
-        # the full colour directory by frame number, so it cannot read a keyframes-only folder
+        # a record only: SceneData indexes the FULL colour dir by frame number, not this one
         rgb = x.npz['images'][i].transpose(1, 2, 0)      # stored RGB (mono_stream converts)
         cv2.imwrite(f'{exp_dir}/image/{idx:06d}.jpg', cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
 
-    # poses_slam.txt is the keyframe LIST every later stage works from: adapt reads the indices
-    # here and then opens depth_slam/<idx>.npy for each (adapt/data.py), so a keyframe listed but
-    # absent is a crash. Every keyframe in the npz gets a file above, so the list is all of them.
-    # Same convention as save_trajectory: TUM, camera-to-world.
+    # the keyframe LIST every later stage works from; adapt opens depth_slam/<idx>.npy for each,
+    # so a listed-but-absent keyframe is a crash. TUM, camera-to-world, as save_trajectory.
     rows = list(range(K))
     poses_wc = SE3(x.poses).inv().data.cpu().numpy()
     np.savetxt(f'{exp_dir}/poses_slam.txt',
@@ -115,10 +95,7 @@ def write_keyframes(exp_dir, x, cfg):
 
 
 def export_slam_depth(exp_dir, cfg):
-    """load -> write -> accuracy table. Returns the number of keyframes exported.
-
-    Takes the EXPERIMENT directory; the run it reads from is exp_dir/full.
-    """
+    """load -> write -> accuracy table, over the EXPERIMENT dir. Returns the keyframe count."""
     from .accuracy import report_accuracy
     x = load_export(extract_run_dir(exp_dir), cfg)
     kept = write_keyframes(exp_dir, x, cfg)

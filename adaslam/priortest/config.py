@@ -1,9 +1,6 @@
 """PriorTestConfig, and where the comparison's seen/unseen boundary comes from.
 
-An arm here is the same thing it is in end2end - a depth-prior generator, named by the same
-rule. That rule is IMPORTED, not restated: one edit to end2end/config.py:arm_name changes both
-test kinds' directory names, and `test/end2end/<scene>/omni` and `test/prior/<scene>/omni` stay the
-same generator measured two ways.
+arm_name is IMPORTED from end2end, not restated, so both test kinds name a scene's arms identically.
 """
 import json
 import os
@@ -19,14 +16,9 @@ __all__ = ['PriorTestConfig', 'arm_split_at', 'resolve_split']
 
 
 def arm_split_at(spec):
-    """The frame this arm's adapter stopped training at, or None if it has no such frame.
+    """The frame this arm's adapter stopped training at; None for a sentinel.
 
-    Sentinels have none. For an adapter, in order:
-      1. config.json['split_at'], written by adapt/trainer.py
-      2. the last frame index in its extract run's traj_full.txt, + 1 - exact, because the extract
-         run streams exactly `extract_length` frames and traj_full covers all of them (a
-         poses_slam.txt keyframe would land a few frames short)
-      3. None, with a warning, when that extract directory is gone
+    In order: config.json['split_at'] | its extract run's last traj_full.txt frame + 1 | None.
     """
     if spec in SENTINELS:
         return None
@@ -48,15 +40,10 @@ def arm_split_at(spec):
 
 
 def resolve_split(priors):
-    """(split_at for the whole table, {spec: its own split}) - the table's comes from the FIRST
-    adapter in `priors`.
+    """(the table's split_at, {spec: its own}) - the table's comes from the FIRST adapter.
 
-    One boundary for every arm, sentinels included, because a sentinel's seen/unseen rows are the
-    CONTROL: "the adapter is worse on unseen frames" means nothing until you know whether every
-    prior is worse there. If omnidata's unseen L1 is up too, the back half of the sequence is simply
-    harder and the adapter has not degraded at all.
-
-    With no adapter in the list there is no boundary to speak of and every arm is scored on `all`.
+    One boundary for every arm, sentinels included: they are the CONTROL. If omnidata degrades
+    past the split too, the back of the sequence is simply harder (9.2.2).
     """
     own = {spec: arm_split_at(spec) for spec in priors}
     table = next((own[s] for s in priors if own[s] is not None), None)
@@ -65,25 +52,19 @@ def resolve_split(priors):
 
 @dataclass(frozen=True)
 class PriorTestConfig:
-    """What to score and how. No location: the stage receives out_root.
-
-    priors[0] is the report's baseline column, as in End2EndConfig.
-    """
-    priors: Tuple[str, ...]          # sentinels and/or adapt handoff dirs, in the table's order
+    """What to score and how. No location: the stage receives out_root."""
+    priors: Tuple[str, ...]          # sentinels and/or adapt handoff dirs; [0] is the baseline
     gt_depths: str                   # REQUIRED here - without GT there is nothing to score
     depth_png_scale: float           # 16-bit depth PNG scale used across the repo
     # ---------------------------------------------------------------- masking
-    eval_min_depth: float            # metres; GT below this is sensor noise, not geometry
-    eval_max_depth: float            # metres; TUM's Kinect is unreliable far out
-    # Pixels kept per frame for the metrics, sampled with a fixed seed. Every metric - per-frame AND
-    # the one global scale - is computed from this one sample, so their RATIO (the consistency
-    # index) is internally consistent rather than mixing an exact numerator with a sampled
-    # denominator. 0 = keep every valid pixel, which needs the whole sequence in RAM.
-    eval_samples_per_frame: int
+    eval_min_depth: float            # m; GT below this is sensor noise, not geometry
+    eval_max_depth: float            # m; TUM's Kinect is unreliable far out
+    # every metric comes from this one sample, so the consistency index is internally consistent
+    eval_samples_per_frame: int      # pixels kept per frame; 0 = all valid (needs the RAM)
     seed: int
     # ---------------------------------------------------------------- the VGGT arms
     lora: LoRAConfig                 # the 'vggt_base' arm has no adapter to read a structure from
-    omni_normal_ckpt: str            # VggtPrior's normal branch; the prior test discards its output
+    omni_normal_ckpt: str            # VggtPrior's normal branch; this test discards its output
     omni_normal_hw: Tuple[int, int]
 
     def __post_init__(self):
@@ -120,8 +101,7 @@ class PriorTestConfig:
     def eval_spec(self):
         """What a cached frames.csv must have been built with to be reusable.
 
-        Only the things that change the PER-FRAME numbers. split_at is deliberately absent: it
-        changes no per-frame value, only which rows get averaged together (metrics.py:aggregate).
+        Only what changes the PER-FRAME numbers - split_at changes none, just which rows average.
         """
         return {'gt_depths': self.gt_depths, 'depth_png_scale': self.depth_png_scale,
                 'eval_min_depth': self.eval_min_depth, 'eval_max_depth': self.eval_max_depth,

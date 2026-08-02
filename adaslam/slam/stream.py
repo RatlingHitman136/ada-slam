@@ -1,9 +1,7 @@
 """The image reader: decode, optionally undistort, resize, hand to the tracker.
 
-mono_stream runs in a spawned child, so everything it needs arrives through its arguments. It is
-handed the SlamConfig itself rather than seven loose scalars: frozen dataclasses of primitives
-pickle by value, so the child runs the exact object the parent built - not, as before, whatever
-the constants happened to say when the child re-executed the driver module.
+mono_stream runs in a spawned child, so it is handed the SlamConfig itself - a frozen dataclass of
+primitives pickles by value, so the child runs the exact object the parent built.
 """
 import os
 import time
@@ -25,10 +23,7 @@ def load_calib(cfg):
 def load_frame(cfg, path, calib, K):
     """One colour file -> (RGB image at tracking resolution, intrinsics for it).
 
-    ONE definition of what the tracker is shown, because more than the tracker looks at it: the
-    prior probe (prior_probe.py) scores depth priors on exactly these pixels, and a probe that
-    undistorted differently, or resized differently, would be measuring a different image than the
-    one the SLAM run sees.
+    ONE definition of what the tracker is shown: PriorProbe scores priors on exactly these pixels.
     """
     image = cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB)
     intrinsics = torch.tensor(calib[:4])

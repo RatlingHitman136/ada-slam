@@ -1,10 +1,7 @@
 """run_prior_test - score every depth-prior generator against GT, with no SLAM run.
 
-Answers the question the end2end test cannot: when swapping the prior changes nothing downstream
-(ARCHITECTURE.md 9.4's null), was the new prior no better, or was HI-SLAM2 insensitive to the way
-it is better? The three alignments in metrics.py separate those.
-
-Minutes per arm rather than forty, because nothing here tracks.
+Answers what the end2end null cannot (9.4): was the new prior no better, or was HI-SLAM2
+insensitive to the way it is better? Minutes per arm, because nothing here tracks.
 """
 import json
 import os
@@ -25,8 +22,7 @@ RESULTS = 'results.json'
 def make_prior(spec, cfg):
     """The one place a prior spec becomes a depth prior. None = stock Omnidata.
 
-    No stream_hw: the aspect warning belongs to a run that will feed BA. Here the probe resizes the
-    same way MotionFilter does, so a skew would already have been reported by whichever arm ran.
+    No stream_hw: the aspect warning belongs to a run that will feed BA.
     """
     if spec not in SENTINELS:
         return VggtPrior(cfg, adapter_path(spec))
@@ -38,8 +34,7 @@ def make_prior(spec, cfg):
 def run_prior_test(slam_cfg, cfg, out_root, skip_existing=False):
     """Score every entry in cfg.priors into out_root/<arm>, then compare(). Returns the results.
 
-    No `runner` argument, and none needed: the prior is evaluated directly (slam/prior_probe.py),
-    never through a SLAM run.
+    No `runner`: each prior goes through slam.PriorProbe, never a SLAM run.
     """
     cfg.check_priors_exist()
     split_at, own = resolve_split(cfg.priors)

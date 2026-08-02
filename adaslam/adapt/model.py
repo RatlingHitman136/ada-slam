@@ -1,9 +1,4 @@
-"""LoRAVGGT - VGGT-1B carrying a LoRA adapter.
-
-The one object callers talk to. Both the adapt stage (which trains it) and the A/B arms (which
-run it as MotionFilter's depth prior) go through this class, so there is a single definition of
-what "VGGT with our adapter" means.
-"""
+"""LoRAVGGT - VGGT-1B carrying a LoRA adapter. Both the adapt stage and the arms go through it."""
 import gc
 import json
 import os
@@ -23,10 +18,8 @@ _RECORDED = {'rank': 'rank', 'alpha': 'alpha', 'targets': 'targets',
 class LoRAVGGT:
     """VGGT-1B with LoRA injected into the aggregator, optionally loaded from an adapter.
 
-    `seed`, when given, seeds torch immediately before the model is built. It lives here rather
-    than in the trainer because LoRALinear's A matrix is kaiming-initialised at injection time:
-    seeding afterwards is too late, and A's values steer the whole training trajectory even though
-    the adapter is identity at step 0 (B starts at zero).
+    `seed` belongs HERE, not in the trainer: A is kaiming-initialised at injection, so seeding
+    afterwards is too late and the run is not reproducible.
     """
 
     def __init__(self, cfg: LoRAConfig, adapter=None, seed=None):
@@ -56,13 +49,7 @@ class LoRAVGGT:
 
     @classmethod
     def from_adapter(cls, adapter, cfg: LoRAConfig):
-        """Build the model the adapter was TRAINED with, not the one `cfg` asks for.
-
-        An adapter only means anything inside the structure it was trained in: a different rank or
-        target set is a different set of tensors, and a different vggt_hw is an input distribution
-        it never saw. So its config.json wins over `cfg`, which supplies only what the file cannot
-        - where the VGGT-1B snapshot lives on this machine.
-        """
+        """Build the model the adapter was TRAINED with: its config.json wins over `cfg` (9.5)."""
         return cls(cls.recorded_config(adapter, cfg), adapter=adapter)
 
     @staticmethod
@@ -109,14 +96,10 @@ class LoRAVGGT:
     # ---------------------------------------------------------------- training
 
     def train(self, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
-        """LoRA-adapt on an extract stage's export. Returns the run summary.
+        """LoRA-adapt on an extract stage's export. Returns the run summary; does NOT save.
 
-        This does NOT write the adapter - the caller does, with the summary's 'state' and 'run'
-        as save()'s state= and extra=. Training only reports, so where the adapter lands is a
-        decision at the call site rather than one buried in the loop.
-
-        `ckpt_dir` is where cfg.checkpoint_every drops its periodic snapshots; required when that
-        is non-zero. Each is a full adapter directory, loadable by from_adapter.
+        The caller passes summary['state'] / ['run'] to save(). `ckpt_dir` takes
+        cfg.checkpoint_every's snapshots, each a full adapter directory.
         """
         self._ensure_live()
         from .trainer import run_training
@@ -153,13 +136,7 @@ class LoRAVGGT:
         return lora_state_dict(self.model)
 
     def save(self, out_dir, state=None, extra=None):
-        """adapter.safetensors + config.json.
-
-        The structural keys are this class's to write - they are what from_adapter reads back.
-        `extra` is whatever the caller wants recorded alongside; both the final save and each of
-        the trainer's periodic checkpoints put the run there.
-        `state` overrides the live weights, for keep_best's snapshot.
-        """
+        """adapter.safetensors + config.json. `state` overrides the live weights (keep_best)."""
         from safetensors.torch import save_file
         os.makedirs(out_dir, exist_ok=True)
         save_file(self.state_dict() if state is None else state, f'{out_dir}/adapter.safetensors')
@@ -172,8 +149,7 @@ class LoRAVGGT:
         return f'{out_dir}/adapter.safetensors'
 
     def release(self):
-        """Release memory used for the model. This class can no longer be used.
-        """
+        """Free the model. The instance is unusable afterwards - save() first."""
         if self.released:
             return
         self.released = True

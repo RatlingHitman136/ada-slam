@@ -1,28 +1,20 @@
 """VggtPrior - the depth prior an end2end arm swaps in.
 
-It produces a drop-in for MotionFilter.prior_extractor and owns the model behind it; installing
-and restoring is SlamRunner.run(prior=...)'s job, so this module never touches MotionFilter and
-nothing here can leak a patch into a later arm.
-
-Normals stay Omnidata, unchanged from upstream - depth is the only variable between the arms.
+A drop-in for MotionFilter.prior_extractor; installing and restoring it is SlamRunner's job, so
+nothing here can leak a patch into a later arm. Normals stay Omnidata: depth is the only variable.
 """
 import torch
 import torch.nn.functional as F
 
 
 class VggtPrior:
-    """VGGT depth + Omnidata normals.
-
-    `adapter` is the path to an adapter.safetensors - config.py:adapter_path resolves it from the
-    handoff DIRECTORY a prior spec names. `adapter=None` is the un-adapted 'vggt_base' arm.
-    """
+    """VGGT depth + Omnidata normals. `adapter=None` is the un-adapted 'vggt_base' arm."""
 
     def __init__(self, cfg, adapter=None, stream_hw=None):
         from ..adapt import LoRAVGGT, aspect_lines
 
-        # from_adapter rebuilds cfg.lora from what the adapter recorded - rank, targets and above
-        # all the input size it was trained at - and says so when that differs. Only the
-        # un-adapted arm has nothing to read back and is free to take cfg.lora as written.
+        # from_adapter rebuilds the structure the adapter was trained in; only the un-adapted arm
+        # has nothing to read back and takes cfg.lora as written
         self.model = (LoRAVGGT.from_adapter(adapter, cfg.lora) if adapter
                       else LoRAVGGT(cfg.lora)).eval_mode()
         self.cfg = cfg
@@ -33,21 +25,17 @@ class VggtPrior:
         print(f'depth prior: {which} at {self.hw[1]}x{self.hw[0]}')
         print('normals    : Omnidata (unchanged, so depth is the only variable)')
 
-        # The check the inference path never had. It matters most for exactly the two cases the
-        # adapt stage's report cannot cover: an adapter whose recorded size was trained on a
-        # different stream, and the 'vggt_base' arm, which has no adapter to read a size from.
+        # covers the two cases the adapt stage's report cannot: an adapter trained on another
+        # stream, and 'vggt_base', which has no adapter to read a size from
         if stream_hw is not None:
             for line in aspect_lines(stream_hw, self.hw, 'VggtPrior'):
                 print(f'  {line}')
 
     def extractor(self):
-        """A plain function to install as MotionFilter.prior_extractor.
+        """A plain FUNCTION to install as MotionFilter.prior_extractor - never a bound method.
 
-        It MUST be a function, not a bound method. Functions are descriptors, so reaching this
-        through `self.prior_extractor(...)` binds the MotionFilter as the first argument while
-        this VggtPrior arrives through the closure cell. A bound method - or functools.partial -
-        is not a descriptor: instance access hands back the same object still bound to the
-        VggtPrior, `mf` is never passed, and mf.MEAN / mf.STDV / the cached normal model are lost.
+        Functions are descriptors, so `mf` binds as arg 0 while this VggtPrior arrives through the
+        closure. A bound method or partial is not, and mf.MEAN / mf.STDV would be lost (9.3).
         """
         prior = self
         cfg = self.cfg
@@ -59,19 +47,16 @@ class VggtPrior:
             from torchvision import transforms
             input_size = im_tensor.shape[-2:]
 
-            # --- normals: unchanged from upstream (motion_filter.py:70-72), minus the depth model
-            # cached on the MotionFilter, NOT on the prior: keeping it here would hold ~1 GB alive
-            # across arms and change the VRAM profile
+            # normals: upstream's own code. Cached on the MotionFilter, NOT on the prior - here it
+            # would hold ~1 GB alive across arms and change the VRAM profile.
             if getattr(mf, 'omni_normal', None) is None:
                 mf.omni_normal = OmnidataModel('normal', cfg.omni_normal_ckpt, device='cuda:0')
             resized = transforms.Resize(cfg.omni_normal_hw, antialias=True)(im_tensor).cuda()
             normal = mf.omni_normal(resized) * 2.0 - 1.0
             normal = F.interpolate(normal, input_size, mode='bicubic').float().squeeze()
 
-            # --- depth: VGGT ---
-            # motion_filter.py:88-89 hands us an ImageNet-NORMALISED tensor, but VGGT expects
-            # [0,1] and normalises internally (aggregator.py:205). Undo it, or VGGT sees doubly
-            # normalised input.
+            # depth: motion_filter hands us an ImageNet-NORMALISED tensor; VGGT wants [0,1] and
+            # normalises internally, so undo it or it sees doubly normalised input (9.3)
             rgb = (im_tensor * mf.STDV + mf.MEAN).clamp(0, 1)
             rgb = F.interpolate(rgb, prior.hw, mode='bilinear', align_corners=False)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):

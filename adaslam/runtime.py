@@ -1,21 +1,10 @@
 """Process and shared-workstation hygiene: VRAM, subprocesses, fd limits.
 
-Nothing here is specific to a stage - it is what any driver of this repo needs on a box that
-several people share, kept in one place so a stage package never has to grow its own. Formatting
-output for a human is print_utils.py's job; free_vram() and gpu_gate() print, but they do work and
-report on it rather than formatting someone else's numbers.
-
-The one cost free_vram() CANNOT reclaim is worth budgeting for. With `Tracking.pgba.active`
-(true for TUM, false for Replica), Hi2 spawns the PGBA process and hands it the DepthVideo buffers
-over CUDA IPC, then `terminate()`s it - abruptly, so the producer side never learns the blocks are
-free and they stay pinned in IPC limbo for the life of the process. Measured on TUM at buffer=500:
-1.29 GiB retained after one SLAM run and +1.26 GiB per run after that, versus 0.04 GiB flat with
-pgba off. Only 0.03 GiB of it is reachable from Python, so no gc/empty_cache/ipc_collect call
-touches it.
-
-Consequence: extract + two arms strands ~3.8 GiB by the end. That fits alongside a VGGT arm's
-~10 GiB peak on this 24 GB card, but if it does not on yours, run one STAGES entry per process -
-a fresh process starts from zero.
+What free_vram() cannot reclaim, and why (8): with Tracking.pgba.active, Hi2 hands the DepthVideo
+buffers to the PGBA child over CUDA IPC then terminate()s it, so those blocks stay pinned for the
+life of the process. Measured on TUM at buffer=500: 1.29 GiB after one run, +1.26 GiB per run
+after, versus 0.04 GiB flat with pgba off; only 0.03 GiB of it is reachable from Python. Run one
+STAGES entry per process if that does not fit alongside a VGGT arm's ~10 GiB peak.
 """
 import gc
 import os
@@ -45,11 +34,7 @@ def raise_fd_limit():
 # ---------------------------------------------------------------- VRAM
 
 def free_vram(tag=''):
-    """Drop everything the finished stage held. In-process stages otherwise accumulate.
-
-    See the module docstring for the part of it that cannot be reclaimed - which is what the
-    'pgba IPC limbo' note below is reporting when it fires.
-    """
+    """Drop everything the finished stage held. In-process stages otherwise accumulate."""
     gc.collect()
     torch.cuda.ipc_collect()      # reclaims blocks whose consumer *did* exit cleanly
     torch.cuda.empty_cache()

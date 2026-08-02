@@ -1,25 +1,17 @@
-"""The extract -> adapt -> test pipeline for the VGGT depth-prior experiment.
+"""The extract -> adapt -> test pipeline for the VGGT depth-prior experiment (9.1).
 
     python scripts/run_pipeline.py          # from the repo root, adaslam venv active
-
-Four stages in ONE process, each skipped if its output exists (ARCHITECTURE.md §9.1):
 
   1 extract  HI-SLAM2 over the first FRACTION% -> per-keyframe depth/mask/image + accuracy table
   2 adapt    LoRA-adapt VGGT on that depth; depth L1 on a held-out val subset
   3 end2end  one full-sequence arm per generator in END2END_PRIORS, then ATE side by side
-  4 prior    the same generators vs GT depth directly, no SLAM run (§9.2.2)
+  4 prior    the same generators vs GT depth directly, no SLAM run
 
-Outputs are keyed stage / scene / experiment (§7.1):
+This file is the KNOB PANEL, not the implementation: every stage is a package under adaslam/. No
+CLI, no environment. Run preprocess_tum.py first.
 
-  outputs/extract/<scene>/<EXTRACT_NAME>/       handoff to adapt + full/ (the whole SLAM run)
-  outputs/adapt/<scene>/<ADAPT_NAME>/           handoff to the tests + checkpoints/
-  outputs/test/{end2end,prior}/<scene>/<arm>/   <arm> INFERRED from the adapter it uses
-
-This file is the KNOB PANEL, not the implementation: every stage is a package under adaslam/ and
-none carries a default of its own. No CLI, no environment. Run preprocess_tum.py first.
-
-The config literals below are rebuilt in every spawned reader child - keep them primitives, no
-file access and no computation.
+The config literals below are rebuilt in every spawned reader child - primitives only, no file
+access and no computation.
 """
 import os    # nopep8
 import sys   # nopep8
@@ -47,17 +39,19 @@ from adaslam.slam import SlamConfig, SlamRunner
 # ==============================================================================
 
 # ---------------------------------------------------------------- data (preprocessing is NOT here)
-SCENE   = 'rgbd_dataset_freiburg1_room'
-DATA    = f'data/TUM/{SCENE}'          # preprocess_tum.py's output layout
+# TUM:    SCENE 'rgbd_dataset_freiburg1_room', DATA f'data/TUM/{SCENE}', config/tum_config.yaml,
+#         DEPTH_PNG_SCALE 6553.5, PRIOR eval 0.1-10 m
+SCENE   = 'rellis_00000'               # names the outputs/ tree
+DATA    = 'data/RELLIS/00000'          # preprocess_rellis3d.py's output layout
 COLORS  = f'{DATA}/colors'
 DEPTHS  = f'{DATA}/depths'             # None if the dataset has no GT depth
 GT_TRAJ = f'{DATA}/traj_tum.txt'
 CALIB   = f'{DATA}/calib.txt'
-CONFIG  = 'config/tum_config.yaml'
+CONFIG  = 'config/rellis_config.yaml'
 DROID_WEIGHTS = 'pretrained_models/droid.pth'
 
-# Undistort offline in preprocess_tum.py instead: every consumer that re-derives a frame does it
-# with stream_resize() alone, so doing it here misaligns predictions and GT (§10.1).
+# undistort offline in preprocess_tum.py instead - consumers re-derive a frame with stream_resize
+# alone, so doing it here misaligns predictions and GT (10.1)
 UNDISTORT   = False
 CROP_BORDER = 0
 
@@ -68,21 +62,21 @@ MIN_FREE_VRAM_MB = 10000               # shared GPU: checked once at the start o
 FRACTION         = 40                  # % of the sequence the adapter trains on; also SPLIT_AT
 START            = 0
 STREAM_RES       = 341 * 640           # tracking resolution budget
-DEPTH_PNG_SCALE  = 6553.5              # 16-bit depth PNG scale used across the repo
-RENDER_EVAL      = False               # hi2.py's eval_rendering -> renders/ + psnr/. Nothing here
-                                       # reads them; ATE is unaffected either way (§11)
+DEPTH_PNG_SCALE  = 256.0               # metres = px / this. MUST match the dataset: 6553.5
+                                       # (TUM/Replica) saturates at 10 m, 256 at 256 m
+RENDER_EVAL      = False               # hi2.py's eval_rendering -> renders/ + psnr/; nothing here
+                                       # reads them and ATE is unaffected either way (11)
 
 # ---------------------------------------------------------------- experiment names
-# Both REQUIRED (main() checks). Unique within their scene only - the scene is its own directory.
-# Lineage is DATA, not naming: an adapter's config.json holds the extract it trained on. FRACTION
-# is not in the name either; put it there yourself if you vary it.
+# Both REQUIRED, and unique within their scene only. Lineage is DATA, not naming: an adapter's
+# config.json holds the extract it trained on. FRACTION is not in the name - put it there yourself.
 OUT_ROOT     = 'outputs'
 EXTRACT_NAME = 'dense_kf_p40'
-ADAPT_NAME   = 'r8_e10_depth'
+ADAPT_NAME   = 'online_r8_e1'
 
 # ---------------------------------------------------------------- stage I/O
-# A stage RECEIVES its paths and reads no path global, so one can be pointed at another run's
-# results. Pure string joins - this block runs in every spawned child and must not touch the disk.
+# A stage RECEIVES its paths and reads no path global, so it can be pointed at another run's
+# results. Pure string joins - this block must not touch the disk.
 OUT_EXTRACT  = experiment_dir(OUT_ROOT, 'extract', SCENE, EXTRACT_NAME)
 
 ADAPT_IN     = OUT_EXTRACT                              # an extract export
@@ -93,22 +87,20 @@ ADAPT_CKPT   = f'{ADAPT_OUT}/{ADAPT_CKPT_SUBDIR}'       # epoch_NNN/; cadence is
 OUT_END2END  = test_dir(OUT_ROOT, 'end2end', SCENE)     # one subdirectory per prior generator
 OUT_PRIOR    = test_dir(OUT_ROOT, 'prior', SCENE)       # same arm names, scored without SLAM
 
-# VGGT's input size. None = derive from the stream's aspect in main() (nothing letterboxes, so a
-# mismatch squashes the image off VGGT's training distribution). An adapter's own recorded size
-# wins over both. Derived in main(), not here: this block must not touch the disk (§9.3).
-VGGT_HW          = None                # or e.g. (378, 518) for TUM, (294, 518) for Replica
+# VGGT's input size; an adapter's own recorded size wins over this. Derived in main(), not here -
+# this block must not touch the disk (9.3).
+VGGT_HW          = None                # None = derive | (378, 518) TUM | (294, 518) Replica
 
 # ---------------------------------------------------------------- the SLAM runs
-# What every invocation shares. What differs per run (tracking YAML, output dir, length, buffer,
-# gtdepthdir, dump_slam_depth, depth prior) is an argument to SlamRunner.run() instead.
+# What every invocation shares; what differs per run is an argument to SlamRunner.run() instead.
 SLAM = SlamConfig(
     weights=DROID_WEIGHTS, colors=COLORS, calib=CALIB, start=START,
     undistort=UNDISTORT, crop_border=CROP_BORDER, stream_res=STREAM_RES,
     render_eval=RENDER_EVAL)
 
 # ---------------------------------------------------------------- extract (stage 1)
-# The kf_* knobs are EXTRACT-ONLY: they go into a generated config that only this run is given, so
-# denser training data can never look like a tracking change in the comparison. main() asserts it.
+# The kf_* knobs are EXTRACT-ONLY: they go into a generated config only this run is given, so
+# denser training data cannot look like a tracking change. main() asserts it.
 EXTRACT = ExtractConfig(
     kf_motion_thresh=1.2,
     kf_init_thresh=4.0,             # the same gate before initialisation
@@ -123,8 +115,8 @@ EXTRACT = ExtractConfig(
     gt_depths=DEPTHS)               # the accuracy table ONLY - never reaches Hi2 (§9.3)
 
 # ---------------------------------------------------------------- adapt (stage 2, LoRA on VGGT)
-# LORA is the adapter STRUCTURE and is recorded into its config.json, so an arm always runs the
-# model it was trained in even if these move. ADAPT is the training run, which no adapter re-reads.
+# LORA is the adapter STRUCTURE, recorded into its config.json, so an arm always runs the model it
+# was trained in. ADAPT is the training run, which no adapter re-reads.
 LORA = LoRAConfig(
     weights='pretrained_models/vggt',
     vggt_hw=VGGT_HW,           # None -> derived in main()
@@ -135,32 +127,29 @@ LORA = LoRAConfig(
 ADAPT = AdaptConfig(
     stream_res=STREAM_RES,
     p_single_view=1, max_left=4, max_right=4, radius=8,
-    epochs=10, batch_size=2,
+    adapt_style='online',      # 'normal' = shuffled epochs over the train set; 'online' =
+                               # keyframes in ARRIVAL order, `epochs` consecutive steps on each
+                               # before the next arrives (batch_size unused, eval/checkpoint
+                               # cadences then count keyframes - set eval_every_epoch False)
+    epochs=1, batch_size=2,
     lr=1e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
-    depth_space='depth',   # 'depth' | 'disparity'
     coupled_scale=True, min_mask_pixels=16, seed=0, log_every=20,
     # ---- train / val split over the exported keyframes ----
-    train_frac=0.8,            # 1.0 = train on every keyframe, no val set
-    split_mode='stride',       # 'stride' (every Nth held out) | 'contiguous' (tail) | 'random'
+    train_frac=0.9,            # val = the contiguous LAST 20% of the exported keyframes;
+                               # 1.0 = train on every keyframe, no val set
     eval_on_val=True,          # depth L1 on held-out keyframes, base vs adapted
     eval_on_train=True,        # also on the train subset, so the train/val gap is visible
-    eval_every_epoch=True,     # False = only before training and after the last epoch
+    eval_every_epoch=False,     # False = only before training and after the last epoch
     eval_max_kf=100,           # subsample each eval subset to at most this many; 0 = no cap
     keep_best=False,           # False = save the last epoch; True = snapshot on val improvement
-    checkpoint_every=5)        # 0 = off; N = a loadable adapter dir in ADAPT_CKPT every N epochs
+    checkpoint_every=0)        # 0 = off; N = a loadable adapter dir in ADAPT_CKPT every N epochs
 
 # ---------------------------------------------------------------- end2end test (stage 3)
-# One entry per DEPTH-PRIOR GENERATOR. Each scores into a directory INFERRED from it, never typed:
-#
-#   'omnidata'                  -> outputs/test/end2end/<SCENE>/omni
-#   'vggt_base'                 -> .../base                (stock VGGT-1B, §10.2's arm)
-#   ADAPT_OUT                   -> .../<ADAPT_NAME>
-#   f'{ADAPT_CKPT}/epoch_005'   -> .../<ADAPT_NAME>_chkp_005
-#
-# That is what makes an arm reusable - this scene's omni baseline is run once and every later
-# comparison finds it. priors[0] is the baseline column. `lora=LORA` is not decoration: the
-# 'vggt_base' arm has no adapter to read a structure from and silently takes these values.
-END2END_PRIORS = ('omnidata', 'vggt_base', ADAPT_OUT)
+# One entry per DEPTH-PRIOR GENERATOR, scored into a directory INFERRED from it, never typed:
+#   'omnidata' -> .../omni | 'vggt_base' -> .../base | ADAPT_OUT -> .../<ADAPT_NAME> |
+#   f'{ADAPT_CKPT}/epoch_005' -> .../<ADAPT_NAME>_chkp_005
+# That is what makes an arm reusable. priors[0] is the baseline column.
+END2END_PRIORS = ('omnidata', 'vggt_base', ADAPT_OUT, experiment_dir(OUT_ROOT, 'adapt', SCENE, 'online_r8_e3'),experiment_dir(OUT_ROOT, 'adapt', SCENE, 'online_r8_e5') , experiment_dir(OUT_ROOT, 'adapt', SCENE, 'normal_r8_e10'))
 
 END2END = End2EndConfig(
     priors=END2END_PRIORS,
@@ -172,16 +161,16 @@ END2END = End2EndConfig(
     omni_normal_hw=(512, 512))
 
 # ---------------------------------------------------------------- prior test (stage 4)
-# The same generators vs GT depth, no SLAM run - minutes an arm rather than forty. It attributes an
-# end2end null: "no better prior" vs "HI-SLAM2 cannot feel the difference" (§9.4). The seen/unseen
-# boundary comes from the FIRST adapter and is applied to every arm; the sentinels are the control.
+# The same generators vs GT depth, no SLAM run - minutes an arm. It attributes an end2end null:
+# "no better prior" vs "HI-SLAM2 cannot feel the difference" (9.2.2).
 PRIOR_PRIORS = END2END_PRIORS          # same arms, so the two tests' directories line up
 
 PRIOR = PriorTestConfig(
     priors=PRIOR_PRIORS,
     gt_depths=DEPTHS, depth_png_scale=DEPTH_PNG_SCALE,
-    eval_min_depth=0.1,                # m; below this TUM's Kinect reports noise, not geometry
-    eval_max_depth=10.0,               # m; the NYU/KITTI convention, and past the room anyway
+    eval_min_depth=1.0,                # m; nothing is closer than a few m in these scenes
+    eval_max_depth=50.0,               # m; past this the beams are far enough apart that the
+                                       # interpolation between them is extrapolation
     eval_samples_per_frame=20000,      # valid pixels kept per frame; 0 = all (needs the RAM)
     seed=0,
     lora=LORA,
@@ -209,26 +198,22 @@ def stage_extract(runner, out_dir, extract_length):
 
 
 def stage_adapt(in_dir, image_dir, out_dir, ckpt_dir):
-    """LoRA-adapt VGGT on `in_dir`'s export of `image_dir`, writing the adapter into `out_dir`.
-
-    Takes its four paths as arguments and reads no path global, so it can be pointed at any
-    earlier extract run. Returns the adapter path.
-    """
+    """LoRA-adapt VGGT on `in_dir`'s export of `image_dir`, into `out_dir`. Returns the adapter."""
     adapter = f'{out_dir}/adapter.safetensors'
     banner(f'adapt  {in_dir} -> {adapter}')
     if SKIP_EXISTING and os.path.exists(adapter):
         print(f'{adapter} exists - skipping')
         return adapter
 
-    # here rather than in SceneData: in_dir and image_dir are free to be any pair, and a wrong one
-    # otherwise dies deep inside the first sample
+    # here, not in SceneData: the two are free to be any pair, and a wrong one otherwise dies deep
+    # inside the first sample
     for f in (f'{in_dir}/poses_slam.txt', f'{in_dir}/traj_full.txt', f'{in_dir}/intrinsics.npy',
               f'{in_dir}/{DEPTH_DIR}', image_dir):
         if not os.path.exists(f):
             raise SystemExit(f'adapt input missing: {f}   (in_dir={in_dir} must be an extract '
                              f"stage's export directory)")
-    # SceneData.frame() indexes sorted(os.listdir(image_dir)) by frame number, so a mismatched pair
-    # is an IndexError - or worse, silently the wrong image
+    # SceneData indexes image_dir by frame number, so a mismatched pair is an IndexError - or
+    # worse, silently the wrong image
     last_kf = int(np.loadtxt(f'{in_dir}/poses_slam.txt')[:, 0].max())
     n_img = len(os.listdir(image_dir))
     if last_kf >= n_img:
@@ -250,8 +235,7 @@ def stage_adapt(in_dir, image_dir, out_dir, ckpt_dir):
 def stage_end2end(runner, out_root, arm_config, split_at):
     """One arm per entry in END2END.priors into `out_root`/<inferred name>, then the comparison.
 
-    No `adapter` argument: each prior carries its own, which is what lets one comparison hold
-    several adapters and their checkpoints. `arm_config` is the tracking YAML every arm gets.
+    No `adapter` argument: each prior carries its own. `arm_config` is every arm's tracking YAML.
     """
     banner(f'end2end  -> {out_root}')
     print(f'tracking config for every arm: {arm_config} (unmodified; the EXTRACT kf_* knobs '
@@ -263,8 +247,7 @@ def stage_end2end(runner, out_root, arm_config, split_at):
 def stage_prior(out_root):
     """Score every entry in PRIOR.priors against GT depth into `out_root`/<inferred name>.
 
-    No runner and no split_at: there is no SLAM run, and the boundary is resolved from the priors
-    themselves (priortest/config.py:resolve_split).
+    No runner and no split_at: no SLAM run, and the boundary is resolved from the priors.
     """
     banner(f'prior test  -> {out_root}')
     run_prior_test(SLAM, PRIOR, out_root, skip_existing=SKIP_EXISTING)
@@ -309,9 +292,8 @@ def main():
         raise SystemExit(f'{n_frames} frames * {FRACTION}% = {extract_length}, too few to track')
     split_at = extract_length
 
-    # The arms must run stock tracking: if the generated config leaked in here, a denser-keyframe
-    # extract would silently mean denser keyframes in the comparison too. Asserted here, the one
-    # place both paths are in scope.
+    # the arms must run stock tracking, or a denser-keyframe extract would silently mean denser
+    # keyframes in the comparison too. Asserted here, the one place both paths are in scope.
     assert os.path.abspath(CONFIG) != \
         os.path.abspath(f'{extract_run_dir(OUT_EXTRACT)}/extract_config.yaml'), \
         'the arms must use the base CONFIG, not the extract run derived config'
@@ -320,8 +302,8 @@ def main():
     for kind in ('end2end', 'prior'):
         os.makedirs(test_dir(OUT_ROOT, kind, SCENE), exist_ok=True)
 
-    # here, not in the PARAMETERS block: deriving reads a frame, and that block is re-executed by
-    # every spawned child. After chdir, so relative COLORS resolves the same however invoked.
+    # here, not in PARAMETERS: deriving reads a frame, which that block must not do. After chdir,
+    # so relative COLORS resolves the same however invoked.
     global LORA, END2END, PRIOR
     stream_hw = probe_stream_hw(COLORS, STREAM_RES)
     LORA = LORA.resolved(stream_hw)
@@ -339,8 +321,7 @@ def main():
     print(f'stages    : {" ".join(STAGES)}   render_eval {RENDER_EVAL}')
     print(f'outputs   : {OUT_EXTRACT}')
     print(f'            {ADAPT_OUT}')
-    # arm directories are inferred, so print them: the only place to see where each lands, and
-    # that none collided, before a two-hour run
+    # arm directories are inferred, so print where each lands before a two-hour run
     for kind, cfg_, root in (('end2end', END2END, OUT_END2END), ('prior', PRIOR, OUT_PRIOR)):
         if kind in STAGES:
             for spec, d in cfg_.arm_dirs(root).items():

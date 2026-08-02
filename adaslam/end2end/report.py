@@ -1,13 +1,7 @@
 """Printing results: one arm at a time, then side by side.
 
-Pure formatting over the dicts evaluate() returns, so both functions can be re-run against
-results.json files already on disk without touching a GPU. That includes files written before the
-render and mesh metrics were removed - their extra keys are simply not read, and every count is
-fetched with .get() so an older file still prints its ATE.
-
-compare()'s column headers are the arms' inferred directory names (omni, base, lr1e4_chkp_005) -
-short, and unique by construction since End2EndConfig rejects two priors that infer one name. The
-full human label ('VGGT+LoRA depth / Omnidata normals') stays in results.json.
+Pure formatting over evaluate()'s dicts, so both re-run against results.json on disk with no GPU.
+Column headers are the arms' inferred directory names; the full label stays in results.json.
 """
 from ..print_utils import delta_header, delta_row
 
@@ -20,11 +14,7 @@ def _ate(res, pop):
 
 
 def _n(res, pop):
-    """How many poses that population's ATE was averaged over, or None if the file predates them.
-
-    results.json files written before the render metrics came out carry no counts. Their ATE is
-    unchanged and still worth printing, so a missing count reads n/a rather than a misleading 0.
-    """
+    """Poses that population's ATE was averaged over. .get(): older files carry no counts."""
     return res.get(f'n_{pop}')
 
 
@@ -44,17 +34,11 @@ def print_report(res):
 
 
 def compare(labels, res):
-    """Every arm side by side, ONE TABLE PER POPULATION - the shape priortest/report.py prints.
-
-    Metric down the rows, arm across the columns, one block each for all / seen / unseen. With ATE
-    the only metric left each block is a single row, but the layout is kept: it is the one the
-    prior test prints, and 'how does this arm do on unseen frames' stays a horizontal read.
-    """
+    """Every arm side by side, one table per population - the shape priortest/report.py prints."""
     base = res[0]
     k = base['split_at']
 
-    # an arm run at a different split or over a different pose count is not comparable, however
-    # tempting the numbers look side by side
+    # an arm run at a different split or pose count is not comparable, however the numbers look
     for lbl, r in zip(labels[1:], res[1:]):
         if r['split_at'] != k:
             raise SystemExit(f"  !! {lbl} used split_at={r['split_at']}, baseline used {k} - "
@@ -63,8 +47,7 @@ def compare(labels, res):
         if n0 is not None and n1 is not None and n0 != n1:
             print(f'  !! {lbl} evaluated {n1} poses, baseline {n0} - arms are not comparable')
 
-    # arm names are as long as an adapter's name plus a checkpoint suffix, so the column has to fit
-    # them; the old hardcoded 12 silently misaligned the table for anything longer
+    # the column must fit an adapter's name plus a checkpoint suffix
     width = max(12, max(len(lbl) for lbl in labels) + 2)
     n_all = _n(base, 'all')
     over = f'over {n_all} poses, ' if n_all is not None else ''

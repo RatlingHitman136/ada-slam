@@ -4,29 +4,18 @@
         --src /storage/group/dataset_mirrors/01_incoming/TUM_RGBD_Dataset/rgbd_dataset_freiburg1_room \
         --dst data/TUM/rgbd_dataset_freiburg1_room
 
-Produces the same shape as preprocess_replica.py, i.e. colors/ depths/ traj_tum.txt, plus a
-calib.txt the way preprocess_scannet.py does:
+Produces preprocess_replica.py's shape plus a calib.txt (10.1):
 
     colors/%06d.png   undistorted, cropped
     depths/%06d.png   same index, 16-bit, rescaled from TUM's 5000 to HI-SLAM2's 6553.5
     traj_tum.txt      "<index> tx ty tz qx qy qz qw"
-    calib.txt         "fx fy cx cy"   (no distortion terms - see below)
+    calib.txt         "fx fy cx cy"   (no distortion terms - undistorted here, not at runtime)
 
-Two things here are load-bearing rather than cosmetic.
-
-**Sequential %06d names.** demo.py:72 derives the trajectory timestamp by pulling the last number
-out of the filename, so index names make the timestamps frame indices - matching Replica and
-letting evo_ape associate exactly. Real TUM names would break more than that:
-lora_adapt_vggt.py:131 keys poses by int(timestamp), and 1305031910.765238 truncates to the same
-integer for ~30 consecutive frames, silently collapsing the pose dict. colors/ and depths/ must
-also stay 1:1 by index, because eval_utils.py:47, export_slam_depth.py:122 and
-_full_run_common.py:193 all index GT depth by RGB frame number.
-
-**Undistortion happens here, not at runtime.** demo.py has --undistort/--cropborder, but
-_full_run_common.py:31 stream_resize re-derives the GT frame with resize only, so those flags
-would compare undistorted renders against distorted GT. Doing it offline and shipping a
-distortion-free calib.txt keeps every consumer correct with no changes. Do NOT pass --undistort
-or --cropborder for data produced by this script.
+Two properties are load-bearing. **Sequential %06d names**: timestamps are parsed out of the
+filename, and real TUM names truncate to the same integer for ~30 consecutive frames, collapsing
+SceneData's pose dict. **colors/ and depths/ 1:1 by index**: every consumer indexes GT depth by RGB
+frame number. Do NOT pass --undistort/--cropborder for data produced by this script - consumers
+re-derive a frame with a resize alone, so runtime undistortion would misalign it against GT.
 """
 import argparse
 import os
@@ -64,9 +53,8 @@ def nearest(src_t, dst_t):
 def undistort_maps(K, dist, shape):
     """Precomputed remap maps, so interpolation can be chosen per image type.
 
-    cv2.undistort is bilinear-only. That is fine for colour but wrong for depth: interpolating
-    across a depth discontinuity invents surfaces that were never measured, and blending with an
-    invalid (0) pixel drags real depths toward zero. Same maps, two interpolation modes.
+    cv2.undistort is bilinear-only, which is wrong for depth: interpolating across a discontinuity
+    invents surfaces, and blending with an invalid 0 drags real depths down.
     """
     h, w = shape
     return cv2.initUndistortRectifyMap(K, dist, None, K, (w, h), cv2.CV_32FC1)
@@ -75,11 +63,8 @@ def undistort_maps(K, dist, shape):
 def valid_border(maps, shape):
     """Largest symmetric crop containing no undistortion black border.
 
-    Undistortion maps every output pixel back through the distortion model, so with fr1's strong
-    barrel term (k1=0.26) the periphery samples outside the source image and comes back black.
-    Measure the extent instead of guessing a constant - fr3 needs 0, fr1 needs 18. Probe with
-    INTER_LINEAR because that is what the colour images use, and it bleeds the border one pixel
-    further in than INTER_NEAREST would.
+    Measured, not guessed: fr3 needs 0, fr1 needs 18. Probed with INTER_LINEAR, what the colour
+    images use, which bleeds the border one pixel further in than INTER_NEAREST.
     """
     h, w = shape
     probe = cv2.remap(np.full((h, w), 255, np.uint8), *maps, cv2.INTER_LINEAR)
@@ -95,7 +80,7 @@ def valid_border(maps, shape):
 
 
 def stream_shape(h, w):
-    """The resolution demo.py:49-55 will resize this to, for the sanity print."""
+    """The resolution stream_resize will take this to, for the sanity print."""
     RES = 341 * 640
     h1 = int(h * np.sqrt(RES / (h * w)))
     w1 = int(w * np.sqrt(RES / (h * w)))
@@ -156,8 +141,7 @@ def main():
         rgb = cv2.remap(cv2.imread(f'{args.src}/{f_rgb[k][0]}'), *maps, cv2.INTER_LINEAR)
         cv2.imwrite(f'{args.dst}/colors/{n:06d}.png', rgb[b:h0 - b, b:w0 - b])
 
-        # TUM depth is already registered to the colour frame, so it carries the same distortion
-        # and takes the same maps - but nearest-neighbour, see undistort_maps().
+        # depth is registered to the colour frame, so same maps - but nearest, see undistort_maps
         d = cv2.imread(f'{args.src}/{f_dep[i_dep[k]][0]}', cv2.IMREAD_ANYDEPTH)
         d = cv2.remap(d, *maps, cv2.INTER_NEAREST)
         d = d[b:h0 - b, b:w0 - b].astype(np.float64) * (HI2_DEPTH_SCALE / TUM_DEPTH_SCALE)

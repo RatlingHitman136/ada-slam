@@ -1,27 +1,11 @@
 """SlamRunner - the one way HI-SLAM2 is invoked.
 
-This PACKAGE is the only place in adaslam/ that imports `hi2` or `motion_filter`. That is an
-invariant worth grepping for - it is what "every invocation goes through one interface" means in
-practice - and it is checkable in one line: every hit must be under adaslam/slam/.
+The invariant, checkable in one line (9.3) - every hit must be under adaslam/slam/:
 
     grep -rn 'from hi2 import\\|from motion_filter import' adaslam/
 
-Two files match, and only two. This one imports both, to run SLAM. prior_probe.py imports
-MotionFilter for a different reason: the stock depth prior IS one of its methods, and the prior
-test has to call that exact function rather than a re-implementation of it. Anything outside
-adaslam/slam/ matching that grep has broken the invariant.
-
-Three call sites reach it - the extract run and one per end2end arm - and they differ only in their
-arguments. The depth prior is one of those arguments rather than something a caller patches on
-before calling, which fixes a real hazard: hi2.py:143 calls prior_extractor again inside
-terminate(), for the covis-inserted keyframes, so the patch has to survive that call and be undone
-afterwards. Doing it in a finally here makes both true by construction; the previous arrangement
-(patch before the call, restore at the top of the next loop iteration) happened to be correct only
-because nothing ran in between.
-
-Module-level imports stay light on purpose. `spawn` re-imports this module in the reader child
-(the target function lives in the sibling stream.py), so hi2, motion_filter and lietorch - the
-last of which loads a CUDA extension - are all imported inside the functions that use them.
+hi2, motion_filter and lietorch are imported inside the functions that use them: spawn re-imports
+this module in the reader child.
 """
 import os
 import re
@@ -36,9 +20,8 @@ from ..runtime import free_vram
 
 from .stream import mono_stream
 
-# Every attribute Hi2 reads off its args namespace (hi2.py: 23, 24, 29, 41, 47, 157, 184 and the
-# getattrs at 155 and 182). Asserted rather than trusted, so a future Hi2 that starts reading
-# args.start fails here instead of silently seeing whatever a SimpleNamespace happened to carry.
+# Every attribute Hi2 reads off its args namespace. Asserted, not trusted: a future Hi2 that reads
+# one more fails here instead of silently seeing whatever the SimpleNamespace carried.
 HI2_ARGS = ('weights', 'config', 'output', 'gtdepthdir', 'buffer', 'droidvis', 'gsvis',
             'dump_slam_depth', 'render_eval', 'image_size')
 
@@ -73,9 +56,8 @@ def save_trajectory(hi2, traj_full, cfg, out):
 class SlamRunner:
     """Runs HI-SLAM2 over cfg's sequence, once per call to run().
 
-    One instance is built per experiment and shared by every stage, which is what keeps the A/B
-    arms comparable: they cannot disagree about the stream, the calibration or the resolution,
-    because there is only one description of those and it is not a per-call argument.
+    One instance per experiment, shared by every stage, so the arms cannot disagree about the
+    stream, the calibration or the resolution.
     """
 
     def __init__(self, cfg):
@@ -85,21 +67,17 @@ class SlamRunner:
             gtdepthdir=None, dump_slam_depth=False, prior=None):
         """One full SLAM run: stream -> track -> terminate -> write trajectories.
 
-        `config` is the tracking YAML, `prior` an optional depth-prior object exposing
-        `.extractor()` (see end2end/prior.py). `gtdepthdir` is stated per call and never
-        inherited: passing it on a run whose renders become training data corrupts them (9.3).
-        It only bites while cfg.render_eval is True - Hi2 reads it nowhere else - so with the
-        toggle off every caller may pass None, and does.
+        `config` is the tracking YAML, `prior` an optional object exposing `.extractor()`.
+        `gtdepthdir` is stated per call, never inherited: it corrupts a run whose renders become
+        training data (9.3).
         """
         from hi2 import Hi2
         from motion_filter import MotionFilter
         cfg = self.cfg
         os.makedirs(out, exist_ok=True)
 
-        # Snapshot before installing, restore in the finally below. Both directions matter: an arm
-        # must not inherit the previous arm's prior, and terminate() still calls the extractor.
-        # The try opens on the very next line for a reason - anything that raises between the
-        # install and the finally would leave the patch on the class for the next arm to inherit.
+        # Snapshot, install, restore in the finally - so no arm inherits another's prior, even if
+        # this one raises. The try opens on the very next line for exactly that reason.
         stock_prior = MotionFilter.prior_extractor
         if prior is not None:
             MotionFilter.prior_extractor = prior.extractor()

@@ -1,19 +1,10 @@
 """Turning an extract stage's export into training samples.
 
-`scene_dir` is an extract EXPERIMENT directory (outputs/extract/<exp>), whose top level is exactly
-the handoff (ARCHITECTURE.md §7.1) - nothing here reaches into its full/ subdirectory, which is
-why that can be deleted once the export exists:
+`scene_dir` is an extract EXPERIMENT directory - its top level, never full/. Poses come from
+traj_full.txt (post-refinement); poses_slam.txt supplies the keyframe LIST only.
 
-    <scene_dir>/depth_slam/%06d.npy    float32 depth in SLAM units, one per keyframe
-    <scene_dir>/mask_slam/%06d.png     multi-view consistency mask
-    <scene_dir>/poses_slam.txt         the exported keyframes, TUM c2w  <- the keyframe LIST only;
-                                       every pose below comes from traj_full.txt, which is the
-                                       post-refinement one
-    <scene_dir>/traj_full.txt          every frame's pose, TUM c2w
-    <scene_dir>/intrinsics.npy         fx fy cx cy at the tracker's resolution
-
-`image_dir` is separate and is the FULL colour directory, not <scene_dir>/image: frame() indexes
-it by frame number, so a keyframes-only folder would silently return the wrong image.
+`image_dir` is the FULL colour directory, not <scene_dir>/image: frame() indexes it by frame
+number, so a keyframes-only folder would silently return the wrong image.
 """
 import os
 
@@ -35,32 +26,24 @@ def tum_to_c2w(row):
 
 
 def split_keyframes(kf, cfg):
-    """Train / val split over the exported keyframe list.
+    """Train / val split over the exported keyframes: val is the contiguous TAIL.
 
-    'stride' holds out every Nth keyframe, so val covers the whole trained region and the val
-    curve is not confounded by the scene changing. Its caveat is that a held-out keyframe's
-    neighbours are visually near-identical to trained ones, so it measures memorisation more than
-    generalisation; 'contiguous' is the opposite trade.
+    So val measures generalisation forward, and the trained region is a strict PREFIX of the
+    extract window.
     """
-    kf = list(kf)
+    kf = list(kf)                          # already ascending: poses_slam.txt column 0
     if cfg.train_frac >= 1.0 or len(kf) < 5:
         return kf, []
-    if cfg.split_mode == 'stride':
-        val = kf[::max(2, int(round(1.0 / (1.0 - cfg.train_frac))))]
-    elif cfg.split_mode == 'contiguous':
-        val = kf[int(round(len(kf) * cfg.train_frac)):]
-    else:                                  # 'random'; AdaptConfig already validated the name
-        perm = np.random.default_rng(cfg.seed).permutation(len(kf))
-        val = sorted(kf[i] for i in perm[int(round(len(kf) * cfg.train_frac)):])
-    vset = set(val)
-    return [t for t in kf if t not in vset], val
+    cut = int(round(len(kf) * cfg.train_frac))
+    return kf[:cut], kf[cut:]
 
 
 class SceneData:
-    """One keyframe = one sample, placed FIRST in the sequence so VGGT's predictions land in that
-    keyframe's coordinate frame (verified: extrinsic[0] is identity to 5e-4). Around it we attach
-    a random number of neighbouring non-keyframe frames, so the adapter works both monocular - the
-    way MotionFilter.prior_extractor calls it - and with a few frames of context."""
+    """One keyframe = one sample, placed FIRST so VGGT predicts in that keyframe's frame.
+
+    Around it, a random number of neighbouring non-keyframes, so the adapter works both monocular
+    (the way prior_extractor calls it) and with context.
+    """
 
     def __init__(self, scene_dir, image_dir, lora, cfg):
         self.scene_dir, self.image_dir, self.cfg = scene_dir, image_dir, cfg
@@ -87,9 +70,8 @@ class SceneData:
     def aspect_report(self):
         """The stream -> VGGT resize, and a warning when it distorts.
 
-        With vggt_hw derived (LoRAConfig.resolved) this should never warn. If it does, the value
-        was either pinned by hand or read back off an adapter trained on a different stream -
-        both worth knowing, which is why the check survives derivation.
+        With vggt_hw derived this should never fire; if it does, the value was pinned by hand or
+        read off an adapter trained on another stream.
         """
         return aspect_lines(self.stream_hw, self.hw, 'SceneData.frame()')
 

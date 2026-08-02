@@ -1,14 +1,7 @@
 """Printing prior-test results: one arm, then all of them side by side.
 
-Pure formatting over the dicts aggregate() returns, so it can be re-run against results.json files
-already on disk without a GPU:
-
-    from adaslam.priortest.report import compare, print_report
-
-compare() prints one table per population - metric down the rows, arm across the columns - and
-end2end/report.py now prints the same shape, off the same print_utils.delta_header and delta_row.
-What stays local to each is what genuinely differs: this one can mark an arm whose split is not its
-own with a `*`, and the end2end one has a mesh block with no seen/unseen to split.
+Pure formatting over aggregate()'s dicts, so it re-runs against results.json on disk with no GPU.
+One table per population, off the same print_utils rows end2end/report.py uses.
 """
 from ..print_utils import delta_header, delta_row
 

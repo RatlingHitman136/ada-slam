@@ -1,19 +1,13 @@
 """PriorProbe - running a depth prior exactly as MotionFilter would, with no SLAM run.
 
-The prior test has to call the SAME function the SLAM run calls, or it measures something else: a
-probe that resized differently, or forgot the ImageNet normalisation, would report a number no arm
-would ever produce in practice (ARCHITECTURE.md 9.3 is a list of what such divergences cost).
-
-The stock Omnidata prior IS a MotionFilter method, and only this package may import
-`motion_filter` (runner.py's docstring has the grep). So the probe lives here rather than in
-priortest/, and reaches the extractor through the CLASS:
+It must call the SAME function a real arm calls, or it reports a number no arm produces. The stock
+prior IS a MotionFilter method and only this package may import it, hence the probe living here:
 
     MotionFilter.prior_extractor(host, tensor)      # stock: a plain function, host is arg 0
     VggtPrior.extractor()(host, tensor)             # an arm: same shape, by construction
 
-`host` stands in for the MotionFilter instance. Both extractors want exactly three things from it -
-MEAN, STDV, and somewhere to cache their loaded models - so a SimpleNamespace is a complete
-stand-in, and keeping one per arm is what stops the 1.4 GB Omnidata pair reloading every frame.
+`host` stands in for the MotionFilter instance - both extractors want only MEAN, STDV and model
+cache slots off it, and keeping one per arm stops the models reloading every frame.
 """
 import types
 
@@ -21,8 +15,8 @@ import torch
 
 from .stream import load_calib, load_frame
 
-# Must match motion_filter.py:44-45. Duplicated rather than imported because MotionFilter sets them
-# in __init__, and constructing one needs a DroidNet, a DepthVideo and a CUDA context.
+# Must match motion_filter.py:44-45. Copied, not imported: MotionFilter sets them in __init__, and
+# constructing one needs a DroidNet, a DepthVideo and a CUDA context.
 _MEAN = (0.485, 0.456, 0.406)
 _STDV = (0.229, 0.224, 0.225)
 
@@ -59,9 +53,7 @@ class PriorProbe:
     def depth(self, path):
         """Metric depth (H, W) float32 at tracking resolution for one colour file.
 
-        The normals both extractors also return are discarded. That wastes an Omnidata normal
-        forward per frame, and it is deliberate: a depth-only path would be a second copy of the
-        depth code, and the whole point of this module is that there is only one.
+        The normals are discarded: a depth-only path would be a second copy of the depth code.
         """
         self._ensure()
         image, _ = load_frame(self.cfg, path, *self._calib)

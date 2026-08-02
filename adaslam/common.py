@@ -1,46 +1,18 @@
-"""Helpers shared by more than one pipeline stage.
-
-Deliberately outside any of them: extract, adapt and end2end all need these, and this is the
-neutral ground they can import from without depending on each other.
-"""
+"""Helpers more than one stage needs - the neutral ground they import instead of each other."""
 import os
 
 import cv2
 import numpy as np
 
-# The extract stage's export target, 1/disps_up, and the mask beside it. Lives here, not in a
-# stage: extract writes these directories and adapt reads them, so one name has to bound both.
-# There was a second source once - 'rendered', the Gaussian map's expected depth read back out of
-# renders/depth_after_opt/. It went when the target narrowed to pose estimation and the terminate
-# time render became optional (SlamConfig.render_eval): a source that only exists when the renders
-# do is not a source, and depth_slam/ needs no SLAM run beyond the one that was happening anyway.
-DEPTH_DIR, MASK_DIR = 'depth_slam', 'mask_slam'
+DEPTH_DIR, MASK_DIR = 'depth_slam', 'mask_slam'   # extract writes them, adapt reads them
 
-# ---------------------------------------------------------------- the outputs/ layout
-# outputs/ is one directory per STAGE, then one per SCENE, then one per EXPERIMENT, because the
-# fan-out is real: one scene -> several extracts -> several adapts each -> several tests each. An
-# experiment directory holds what the NEXT stage consumes and nothing else; the raw HI-SLAM2 run
-# goes in a subdirectory, so it can be deleted to reclaim space without breaking the stage after it.
-#
-#   outputs/extract/<scene>/<exp>/ {depth_slam/ mask_slam/ image/ poses_slam.txt traj_full.txt
-#                                   intrinsics.npy export.txt} + full/<the whole SLAM run>
-#   outputs/adapt/<scene>/<exp>/   {adapter.safetensors config.json train_log.json} + checkpoints/
-#   outputs/test/end2end/<scene>/<arm>/  one depth-prior generator's run; <arm> is INFERRED from
-#                                        the adapter it uses (end2end/config.py:arm_name)
-#   outputs/test/prior/<scene>/<arm>/    the same generators scored against GT with no SLAM run
-#
-# The scene level is what lets an experiment name be short: it only has to be unique within its
-# scene, so nothing has to chain the scene into the name. Lineage is recorded as DATA instead - an
-# adapter's config.json carries the extract directory it trained on (adapt/trainer.py:113).
-#
-# These names are here rather than in a stage package because run_pipeline.py needs them too - it
-# asserts the arms are not handed the extract run's generated config, which lives inside full/.
-EXTRACT_RUN_SUBDIR = 'full'
+# ---------------------------------------------------------------- the outputs/ layout (7.1)
+# outputs/<stage>/<scene>/<experiment>/, the experiment holding what the NEXT stage consumes and
+# nothing else. Here rather than in a stage package because run_pipeline.py needs the names too.
+EXTRACT_RUN_SUBDIR = 'full'                        # the raw SLAM run; deletable afterwards
 ADAPT_CKPT_SUBDIR = 'checkpoints'
 TEST_KINDS = ('end2end', 'prior')
-# Written by the SLAM run into full/, needed by adapt at the experiment's top level. COPIED up
-# rather than moved: full/ has to stay a complete run for the split to mean anything.
-HANDOFF_UP = ('traj_full.txt', 'intrinsics.npy')
+HANDOFF_UP = ('traj_full.txt', 'intrinsics.npy')   # COPIED up from full/, so full/ stays complete
 
 
 def extract_run_dir(exp_dir):
@@ -49,12 +21,7 @@ def extract_run_dir(exp_dir):
 
 
 def experiment_dir(root, stage, scene, name):
-    """`<root>/<stage>/<scene>/<name>` - one experiment of `stage` on `scene`.
-
-    Pure string work, so run_pipeline.py's PARAMETERS block may call it: that block is re-executed
-    in every spawned reader child and must not touch the filesystem. Validate `name` with
-    require_name() in main(), where raising is useful.
-    """
+    """`<root>/<stage>/<scene>/<name>`. Pure string work - the PARAMETERS block calls it."""
     return f'{root}/{stage}/{scene}/{name}'
 
 
@@ -66,11 +33,7 @@ def test_dir(root, kind, scene):
 
 
 def require_name(knob, value):
-    """An experiment name must be set and must be one path component.
-
-    Names are mandatory now that the scene is a directory of its own: an empty name would put the
-    experiment's files directly in the scene directory, where the next run would overwrite them.
-    """
+    """An experiment name must be set and must be one path component."""
     if not value or not str(value).strip():
         raise SystemExit(f'{knob} must be set - it names this experiment inside its scene '
                          f'directory, and every experiment needs a name of its own')
@@ -80,14 +43,11 @@ def require_name(knob, value):
 
 
 def stream_resize(img, res):
-    """The resize the tracker sees. ONE definition, used by the reader, the LoRA data loader and
-    the render metrics - they must agree or renders and GT stop lining up pixel for pixel.
+    """The resize the tracker sees. ONE definition - every consumer must agree pixel for pixel.
 
-    `res` is the resolution budget (PIXELS, not a shape): 341*640 is the scalar 218240, and both
-    dims are scaled by sqrt(res / h0*w0) then floored to a multiple of 8. The floor is not
-    aspect-preserving - Replica's 1200x680 drifts from aspect 1.765 to 1.791 - but slam/stream.py
-    rescales the intrinsics with the ACTUAL ratios, so that is image shear, not a calibration
-    error.
+    `res` is a pixel budget, not a shape (9.6): both dims scale by sqrt(res / h0*w0), floored to a
+    multiple of 8. That floor is not aspect-preserving, but slam/stream.py rescales the intrinsics
+    with the actual ratios, so it is image shear rather than a calibration error.
     """
     h0, w0 = img.shape[:2]
     h1 = int(h0 * np.sqrt(res / (h0 * w0)))
@@ -96,10 +56,9 @@ def stream_resize(img, res):
 
 
 def probe_stream_hw(image_dir, res):
-    """The (H, W) the tracker will actually run at, measured by resizing the first frame.
+    """The (H, W) the tracker will run at, measured on the first frame.
 
-    Cheap (one imread) but NOT free, and it touches the filesystem - so callers resolve it once,
-    after chdir and before any Process is spawned, never in a module-level config literal.
+    Touches the filesystem, so callers resolve it once - after chdir, before any Process is spawned.
     """
     files = sorted(os.listdir(image_dir))
     if not files:

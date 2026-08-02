@@ -165,7 +165,7 @@ class Hi2:
                 dscales     = self.video.dscales[:t].cpu().numpy(),
                 disps_prior = self.video.disps_prior[:t].cpu().numpy())
             print(f'saved SLAM depth for {t} keyframes to {out}')
-
+        
         poses_pos = self.video.poses[:self.video.counter.value].clone()
         dposes = SE3(poses_pos).inv() * SE3(poses_pre)
         dscale = torch.ones(self.video.counter.value, 1)

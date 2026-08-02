@@ -1,11 +1,7 @@
-"""Producing one arm's frames.csv: the expensive artifact, and the only one inference touches.
+"""Producing one arm's frames.csv - the expensive artifact, and the only one inference touches.
 
-frames.csv is split-independent by construction (see metrics.py), so it is cached on the EVAL
-SPEC alone - the frame set, the depth mask and the sampling. Change which adapter defines the
-comparison's seen/unseen boundary and nothing here re-runs; change the depth cap and all of it does.
-
-The spec is written into the file as a `#` comment line, so a stale cache identifies itself instead
-of being trusted because the path happened to exist.
+Split-independent, so it is cached on the EVAL SPEC alone, written into the file's `#` header line
+so a stale cache identifies itself instead of being trusted because the path exists.
 """
 import csv
 import json
@@ -63,9 +59,8 @@ def write_rows(path, spec, rows):
 def build_rows(slam_cfg, cfg, prior, label):
     """Run `prior` over every frame and score it. Returns (rows, global_scale).
 
-    One pass: the per-frame numbers are exact over the kept sample, and the single global scale is
-    fitted at the end from the same samples, so the consistency index is a ratio of two numbers
-    measured on identical pixels rather than one exact and one approximated.
+    One pass, and the global scale is fitted from the same samples - so the consistency index is a
+    ratio of two numbers measured on identical pixels.
     """
     paths = frame_paths(slam_cfg)
     gts = gt_paths(cfg, len(paths))

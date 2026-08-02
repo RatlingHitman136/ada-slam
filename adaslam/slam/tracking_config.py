@@ -1,19 +1,14 @@
-"""Writing a derived tracking YAML.
+"""Writing a derived tracking YAML - HI-SLAM2 schema knowledge, hence slam/.
 
-This is HI-SLAM2 config-schema knowledge - which section each keyframe knob lives under, and that
-load_config() resolves `inherit_from` recursively and merges, so only the overridden keys need to
-appear. It sits in slam/ for that reason; the VALUES are a caller's policy and live in its config
-(ExtractConfig, for the one caller there is).
+Only overridden keys need to appear: load_config resolves `inherit_from` recursively. The VALUES
+are the caller's policy and live in its config.
 """
 import os
 
 
 def write_tracking_config(out, base_config, motion_thresh=None, init_thresh=None,
                           keyframe_thresh=None, covis_thresh=None, name='extract_config.yaml'):
-    """Write `out/name` inheriting from base_config, overriding whichever knobs are not None.
-
-    Doubles as a record of what the run was actually told to do. Returns the path.
-    """
+    """Write `out/name` inheriting from base_config, overriding whichever knobs are not None."""
     import yaml
     tracking = {}
     for section, keys in (('motion_filter', (('thresh', motion_thresh),
