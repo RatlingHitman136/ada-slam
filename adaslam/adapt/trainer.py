@@ -37,21 +37,36 @@ def eval_depth(lora, data, kfs, cfg):
     return float(np.mean(errs))
 
 
-def schedule(data, cfg, rng):
-    """(unit, its batches) - the ONLY place the two adaptation styles differ.
+def batches_of(order, batch_size):
+    """A keyframe list cut into batches, in the order given; the tail batch is short."""
+    order = [int(t) for t in order]
+    return [order[s * batch_size:(s + 1) * batch_size]
+            for s in range(math.ceil(len(order) / batch_size))]
 
-    normal  a unit is an EPOCH: every train keyframe once, shuffled, batch_size at a time.
-    online  a unit is ONE ARRIVING KEYFRAME: ascending frame order, cfg.epochs steps on each
-            before the next. batch_size is not read - a keyframe arrives alone.
+
+def schedule(data, cfg, rng):
+    """(unit, its batches) - the ONLY place the three adaptation styles differ.
+
+    normal   a unit is an EPOCH: every train keyframe once, shuffled, batch_size at a time.
+    online   a unit is ONE ARRIVING KEYFRAME: ascending frame order, cfg.epochs steps on each
+             before the next. batch_size is not read - a keyframe arrives alone.
+    wonline  a unit is a SLIDING WINDOW ending at the arriving keyframe: the arrival plus the
+             cfg.window_size-1 keyframes before it, cfg.epochs shuffled passes over them
+             batch_size at a time, then the window slides on by one. No partial warm-up window -
+             the first unit is the first FULL one, so windows run [0..w-1] .. [n-w..n-1].
     """
     if cfg.adapt_style == 'online':
         for i, t in enumerate(data.train_kf):          # ascending frame order = arrival order
             yield i, [[int(t)] for _ in range(cfg.epochs)]
+    elif cfg.adapt_style == 'wonline':
+        kf, w = [int(t) for t in data.train_kf], cfg.window_size
+        for unit, lo in enumerate(range(len(kf) - w + 1)):     # ascending, so lo+w-1 is the arrival
+            window = kf[lo:lo + w]
+            yield unit, [b for _ in range(cfg.epochs)
+                         for b in batches_of(rng.permutation(window), cfg.batch_size)]
     else:
         for epoch in range(cfg.epochs):
-            order = [int(t) for t in rng.permutation(data.train_kf)]
-            yield epoch, [order[s * cfg.batch_size:(s + 1) * cfg.batch_size]   # tail batch is short
-                          for s in range(math.ceil(len(order) / cfg.batch_size))]
+            yield epoch, batches_of(rng.permutation(data.train_kf), cfg.batch_size)
 
 
 def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
@@ -106,25 +121,43 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
     if not data.train_kf:
         raise SystemExit('no training keyframes - raise train_frac or check the export')
 
-    # a UNIT is an epoch, or one arriving keyframe in 'online' - see schedule()
-    online = cfg.adapt_style == 'online'
-    n_units = len(data.train_kf) if online else cfg.epochs
-    steps_per_unit = cfg.epochs if online else math.ceil(len(data.train_kf) / cfg.batch_size)
-    unit_word, unit_tag = ('keyframe', 'k') if online else ('epoch', 'e')
-    if online:
+    # a UNIT is an epoch, one arriving keyframe in 'online', one window in 'wonline' - see
+    # schedule(). Whatever it is, the units it yields are 0..n_units-1: the final eval and the
+    # checkpoint cadence below both count on that.
+    if cfg.adapt_style == 'online':
+        n_units = len(data.train_kf)
+        steps_per_unit = cfg.epochs
+        unit_word, unit_tag = 'keyframe', 'k'
         print(f'online: {n_units} keyframes in frame order x {steps_per_unit} steps each = '
               f'{n_units * steps_per_unit} optimiser steps, 1 keyframe per step '
               f'(batch_size={cfg.batch_size} is not used in this style)')
-        if cfg.eval_every_epoch:
-            print(f'  WARNING: eval_every_epoch evaluates after EVERY keyframe - {n_units} '
-                  f'evaluations. Set it False for base + final only.')
+    elif cfg.adapt_style == 'wonline':
+        if cfg.window_size > len(data.train_kf):
+            raise SystemExit(f'window_size={cfg.window_size} exceeds the {len(data.train_kf)} '
+                             f'training keyframes, so not one full window exists and the schedule '
+                             f'would be empty. Lower window_size, or raise train_frac / the '
+                             f"extract's keyframe count.")
+        n_units = len(data.train_kf) - cfg.window_size + 1
+        steps_per_unit = cfg.epochs * math.ceil(cfg.window_size / cfg.batch_size)
+        unit_word, unit_tag = 'window', 'w'
+        print(f'wonline: {n_units} windows of {cfg.window_size} keyframes sliding by 1 over '
+              f'{len(data.train_kf)} train keyframes, x {cfg.epochs} shuffled passes / batch '
+              f'{cfg.batch_size} = {steps_per_unit} steps each, {n_units * steps_per_unit} '
+              f'in total')
     else:
+        n_units = cfg.epochs
+        steps_per_unit = math.ceil(len(data.train_kf) / cfg.batch_size)
+        unit_word, unit_tag = 'epoch', 'e'
         print(f'{len(data.train_kf)} train keyframes / batch {cfg.batch_size} = {steps_per_unit} '
               f'optimiser steps per epoch, {n_units * steps_per_unit} in total')
+    if cfg.eval_every_epoch and cfg.adapt_style in ('online', 'wonline'):
+        print(f'  WARNING: eval_every_epoch evaluates after EVERY {unit_word} - {n_units} '
+              f'evaluations. Set it False for base + final only.')
 
     # What a saved adapter records about its run. Built before the loop: checkpoints need it too.
     run_cfg = {'adapt_style': cfg.adapt_style, 'epochs': cfg.epochs, 'batch_size': cfg.batch_size,
-               'n_units': n_units,          # epochs, or arriving keyframes in 'online'
+               'window_size': cfg.window_size,   # 'wonline' only; recorded whatever the style
+               'n_units': n_units,          # epochs, arriving keyframes ('online'), windows
                'steps_per_epoch': steps_per_unit, 'samples_per_epoch': len(data.train_kf),
                'lr': cfg.lr, 'weight_decay': cfg.weight_decay, 'grad_clip': cfg.grad_clip,
                'lambda_pose': cfg.lambda_pose, 'coupled_scale': cfg.coupled_scale,

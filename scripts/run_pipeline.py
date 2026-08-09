@@ -56,10 +56,10 @@ UNDISTORT   = False
 CROP_BORDER = 0
 
 # ---------------------------------------------------------------- run control
-STAGES           = ('extract', 'adapt', 'prior', 'end2end')   # any subset; run in pipeline order
+STAGES           = ('extract', 'adapt', 'end2end')   # any subset; run in pipeline order
 SKIP_EXISTING    = True                # reuse a stage's output if it is already on disk
-MIN_FREE_VRAM_MB = 10000               # shared GPU: checked once at the start of main()
-FRACTION         = 40                  # % of the sequence the adapter trains on; also SPLIT_AT
+MIN_FREE_VRAM_MB = 8000                # shared GPU: checked once at the start of main()
+FRACTION         = 6                   # % of the sequence the adapter trains on; also SPLIT_AT
 START            = 0
 STREAM_RES       = 341 * 640           # tracking resolution budget
 DEPTH_PNG_SCALE  = 256.0               # metres = px / this. MUST match the dataset: 6553.5
@@ -71,8 +71,8 @@ RENDER_EVAL      = False               # hi2.py's eval_rendering -> renders/ + p
 # Both REQUIRED, and unique within their scene only. Lineage is DATA, not naming: an adapter's
 # config.json holds the extract it trained on. FRACTION is not in the name - put it there yourself.
 OUT_ROOT     = 'outputs'
-EXTRACT_NAME = 'dense_kf_p40'
-ADAPT_NAME   = 'online_r8_e1'
+EXTRACT_NAME = 'dense_kf_p6'
+ADAPT_NAME   = 'wonline_r8_e15_w10_p6'
 
 # ---------------------------------------------------------------- stage I/O
 # A stage RECEIVES its paths and reads no path global, so it can be pointed at another run's
@@ -127,15 +127,20 @@ LORA = LoRAConfig(
 ADAPT = AdaptConfig(
     stream_res=STREAM_RES,
     p_single_view=1, max_left=4, max_right=4, radius=8,
-    adapt_style='online',      # 'normal' = shuffled epochs over the train set; 'online' =
+    adapt_style='wonline',      # 'normal' = shuffled epochs over the train set; 'online' =
                                # keyframes in ARRIVAL order, `epochs` consecutive steps on each
-                               # before the next arrives (batch_size unused, eval/checkpoint
-                               # cadences then count keyframes - set eval_every_epoch False)
-    epochs=1, batch_size=2,
+                               # before the next arrives (batch_size unused); 'wonline' = a
+                               # SLIDING WINDOW of the arrival + the `window_size`-1 keyframes
+                               # before it, `epochs` shuffled batched passes over it, then slide
+                               # by one (no partial warm-up window). Under the latter two the
+                               # eval/checkpoint cadences count keyframes / windows, not epochs -
+                               # set eval_every_epoch False
+    epochs=15, batch_size=2,
+    window_size=10,            # 'wonline' only
     lr=1e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
     coupled_scale=True, min_mask_pixels=16, seed=0, log_every=20,
     # ---- train / val split over the exported keyframes ----
-    train_frac=0.9,            # val = the contiguous LAST 20% of the exported keyframes;
+    train_frac=1.0,            # val = the contiguous LAST 20% of the exported keyframes;
                                # 1.0 = train on every keyframe, no val set
     eval_on_val=True,          # depth L1 on held-out keyframes, base vs adapted
     eval_on_train=True,        # also on the train subset, so the train/val gap is visible
@@ -149,7 +154,7 @@ ADAPT = AdaptConfig(
 #   'omnidata' -> .../omni | 'vggt_base' -> .../base | ADAPT_OUT -> .../<ADAPT_NAME> |
 #   f'{ADAPT_CKPT}/epoch_005' -> .../<ADAPT_NAME>_chkp_005
 # That is what makes an arm reusable. priors[0] is the baseline column.
-END2END_PRIORS = ('omnidata', 'vggt_base', ADAPT_OUT, experiment_dir(OUT_ROOT, 'adapt', SCENE, 'online_r8_e3'),experiment_dir(OUT_ROOT, 'adapt', SCENE, 'online_r8_e5') , experiment_dir(OUT_ROOT, 'adapt', SCENE, 'normal_r8_e10'))
+END2END_PRIORS = ('omnidata', 'vggt_base', ADAPT_OUT, experiment_dir(OUT_ROOT, 'adapt', SCENE, 'wonline_r8_e3_w10_p10'), experiment_dir(OUT_ROOT, 'adapt', SCENE, 'normal_r8_e20_p10'), experiment_dir(OUT_ROOT, 'adapt', SCENE, 'normal_r8_e10')) #experiment_dir(OUT_ROOT, 'adapt', SCENE, 'normal_r8_e20_p10')
 
 END2END = End2EndConfig(
     priors=END2END_PRIORS,

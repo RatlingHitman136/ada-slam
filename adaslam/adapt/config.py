@@ -6,7 +6,7 @@ back by LoRAVGGT.from_adapter.
 from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
-ADAPT_STYLES = ('normal', 'online')
+ADAPT_STYLES = ('normal', 'online', 'wonline')
 
 # VGGT trained with width pinned to exactly 518 and height a multiple of 14, landscape or square
 # (training/config/default.yaml:5, training/data/base_dataset.py:95-113).
@@ -83,10 +83,14 @@ class AdaptConfig:
     radius: int              # neighbour search radius, in frames
     # ---------------------------------------------------------------- optimisation
     # The styles differ ONLY in the order batches reach the loop (trainer.py:schedule). A UNIT is
-    # an epoch in 'normal' and one arriving keyframe in 'online'; the cadences below count units.
-    adapt_style: str         # 'normal' | 'online'
-    epochs: int              # 'normal': passes over the train set | 'online': steps per keyframe
+    # an epoch in 'normal', one arriving keyframe in 'online' and one window in 'wonline'; the
+    # cadences below count units.
+    adapt_style: str         # 'normal' | 'online' | 'wonline'
+    epochs: int              # 'normal': passes over the train set | 'online': steps per keyframe |
+                             # 'wonline': passes over the window
     batch_size: int          # not read in 'online' - a keyframe arrives alone
+    window_size: int         # 'wonline' ONLY: keyframes per window (the arrival + the
+                             # window_size-1 before it). Unread by the other two styles.
     lr: float
     weight_decay: float
     grad_clip: float
@@ -108,6 +112,9 @@ class AdaptConfig:
     def __post_init__(self):
         if self.adapt_style not in ADAPT_STYLES:
             raise ValueError(f'adapt_style={self.adapt_style!r} is not one of {ADAPT_STYLES}')
+        # only where it is read; whether it fits the keyframe count is data, checked in the trainer
+        if self.adapt_style == 'wonline' and self.window_size < 1:
+            raise ValueError(f'window_size={self.window_size} must be >= 1 in the wonline style')
         if not 0.0 < self.train_frac <= 1.0:
             raise ValueError(f'train_frac={self.train_frac} must be in (0, 1]')
         if self.checkpoint_every < 0:
