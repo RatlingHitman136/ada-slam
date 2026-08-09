@@ -172,8 +172,13 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
                'checkpoint_every': cfg.checkpoint_every}
 
     def record(unit):
-        """run_cfg for a save of `unit`, with the evaluation known by then."""
-        return {**run_cfg, 'saved_epoch': unit, 'eval_history': history}
+        """run_cfg for a save of `unit`, with the evaluation and elapsed time known by then.
+
+        Evaluated at call time, so a checkpoint records the time elapsed SO FAR and the final save
+        the whole loop. It belongs here and not in run_cfg, which is built before the loop runs.
+        """
+        return {**run_cfg, 'saved_epoch': unit, 'eval_history': history,
+                'train_seconds': round(time.time() - t0, 1)}
 
     if ckpt_dir and cfg.checkpoint_every:
         print(f'checkpointing every {cfg.checkpoint_every} {unit_word}s -> {ckpt_dir}/epoch_NNN/')
@@ -253,8 +258,8 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
                 f'{r[key]:>10.4f}' if r.get(key) is not None else f'{"n/a":>10}' for r in history))
     if cfg.keep_best and best['epoch'] is not None:
         print(f'  {unit_word} {best["epoch"]} kept (best val L1 {best["val_l1"]:.4f})')
-    print(f'trained {n_train/1e6:.1f}M adapter params; log in {out_dir}/train_log.json. '
-          f'The caller writes the adapter.')
+    print(f'trained {n_train/1e6:.1f}M adapter params in {time.time()-t0:.0f}s; log in '
+          f'{out_dir}/train_log.json. The caller writes the adapter.')
 
     # 'state' and 'run' are save()'s state= and extra=
     return {'state': best['state'] if keep else None,

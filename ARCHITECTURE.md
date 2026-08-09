@@ -415,7 +415,8 @@ outputs/
     adapter.safetensors           ~48 MB
     config.json                   the structure from_adapter rebuilds: rank, alpha, targets,
                                   lora_patch_embed, vggt_hw — plus `scene`, the extract directory
-                                  it trained on, which is where lineage is recorded
+                                  it trained on, which is where lineage is recorded, and
+                                  `train_seconds`, the wall time of the training loop at this save
     train_log.json
     checkpoints/epoch_NNN/        every ADAPT.checkpoint_every epochs, each a COMPLETE adapter
                                   dir that from_adapter loads and an arm can run
