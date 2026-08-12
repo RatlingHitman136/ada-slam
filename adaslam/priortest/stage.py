@@ -36,6 +36,7 @@ def run_prior_test(slam_cfg, cfg, out_root, skip_existing=False):
 
     No `runner`: each prior goes through slam.PriorProbe, never a SLAM run.
     """
+    banner(f'prior test  -> {out_root}')
     cfg.check_priors_exist()
     split_at, own = resolve_split(cfg.priors)
     spec_of_split = next((s for s in cfg.priors if own[s] is not None), None)

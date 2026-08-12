@@ -46,6 +46,10 @@ def run_end2end_test(runner, slam_cfg, cfg, out_root, arm_config, split_at, skip
     several adapters and their checkpoints. `arm_config` is the base tracking YAML, identical for
     every arm.
     """
+    banner(f'end2end  -> {out_root}')
+    print(f'tracking config for every arm: {arm_config} (unmodified; an extract stage\'s kf_* '
+          f'knobs apply to that run only)')
+
     # here, not in __post_init__: that runs before chdir and must not touch the filesystem, and
     # these adapters legitimately do not exist yet when the whole pipeline runs
     cfg.check_priors_exist()

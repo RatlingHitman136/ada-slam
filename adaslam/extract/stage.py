@@ -4,7 +4,7 @@ import shutil
 import time
 
 from ..common import DEPTH_DIR, HANDOFF_UP, extract_run_dir
-from ..print_utils import tee
+from ..print_utils import banner, tee
 from ..runtime import free_vram
 from ..slam import write_tracking_config
 
@@ -23,6 +23,7 @@ def run_extract(runner, cfg, out, length, base_config, skip_existing=False):
     `out` is the EXPERIMENT directory; the run goes into out/full. This is the ONLY run that gets
     the keyframe knobs layered onto `base_config`. Returns the keyframes exported, or None.
     """
+    banner(f'extract  -> {out}')
     run_dir = extract_run_dir(out)
     tracking_cfg = write_tracking_config(run_dir, base_config,
                                          motion_thresh=cfg.kf_motion_thresh,

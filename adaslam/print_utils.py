@@ -32,9 +32,45 @@ def tee(path):
             yield
 
 
-def delta_header(labels, width=12, name_width=26):
-    """The column headers and rule above a block of delta_row()s."""
-    print(f"  {'metric':<{name_width}}{labels[0]:>{width}}"
+def delta_table(labels, values, value_name='value', lower_better=True, name_width=26, width=13):
+    """ONE ROW PER ENTITY: its value, the signed delta against values[0], and that as a percent.
+
+    The transpose of delta_header/delta_row, for the case those read badly: ONE metric across MANY
+    entities, which is exactly what a scene's end2end arms are - dozens of them, one ATE each, so
+    an arm per column runs off the terminal while an arm per row does not.
+
+    values[0] is the baseline every other row is measured against, and prints no delta of its own.
+    """
+    base = values[0]
+    vs = f'vs {labels[0]}'[:width]
+    print(f"  {'experiment':<{name_width}}{value_name:>{width}}{vs:>{width}}{'%':>{width}}")
+    print('  ' + '-' * (name_width + 3 * width + 3))
+
+    for i, (lbl, v) in enumerate(zip(labels, values)):
+        if v is None:
+            print(f'  {lbl:<{name_width}}{"n/a":>{width}}')
+            continue
+        line = f'  {lbl:<{name_width}}{v:>{width}.4f}'
+        if i == 0:
+            line += f'{"-":>{width}}{"-":>{width}}'          # the baseline itself
+        elif base is None:
+            # a real value, but no baseline to measure it against - not the same as being one
+            line += f'{"n/a":>{width}}{"n/a":>{width}}'
+        else:
+            d = v - base
+            mark = ' ' if abs(d) < 1e-9 else ('+' if (d < 0) == lower_better else '-')
+            pct = f'{d / base * 100:+.1f}%' if base else 'n/a'
+            line += f'{d:>+{width}.4f}{pct:>{width}}{mark:>3}'
+        print(line)
+
+
+def delta_header(labels, width=12, name_width=26, name='metric'):
+    """The column headers and rule above a block of delta_row()s.
+
+    `name` heads the row-label column - 'metric' when rows are metrics, but a delta_row() table
+    can be indexed by anything (ate_over_time.py indexes it by frame).
+    """
+    print(f"  {name:<{name_width}}{labels[0]:>{width}}"
           + ''.join(f'{lbl:>{width}}{"delta":>10}' for lbl in labels[1:]))
     print('  ' + '-' * (name_width + width + (width + 10) * (len(labels) - 1)))
 

@@ -48,9 +48,13 @@ class LoRAVGGT:
     # ---------------------------------------------------------------- construction
 
     @classmethod
-    def from_adapter(cls, adapter, cfg: LoRAConfig):
-        """Build the model the adapter was TRAINED with: its config.json wins over `cfg` (9.5)."""
-        return cls(cls.recorded_config(adapter, cfg), adapter=adapter)
+    def from_adapter(cls, adapter, cfg: LoRAConfig, seed=None):
+        """Build the model the adapter was TRAINED with: its config.json wins over `cfg` (9.5).
+
+        `adapter=None` falls through to a plain stock-VGGT build - recorded_config returns `cfg`
+        untouched and nothing is loaded - which is what lets a warm and a cold start be one call.
+        """
+        return cls(cls.recorded_config(adapter, cfg), adapter=adapter, seed=seed)
 
     @staticmethod
     def recorded_config(adapter, cfg: LoRAConfig):

@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
 ADAPT_STYLES = ('normal', 'online', 'wonline')
+VAL_SOURCES = ('tail', 'rest')
 
 # VGGT trained with width pinned to exactly 518 and height a multiple of 14, landscape or square
 # (training/config/default.yaml:5, training/data/base_dataset.py:95-113).
@@ -100,7 +101,18 @@ class AdaptConfig:
     seed: int
     log_every: int
     # ---------------------------------------------------------------- split + eval
-    train_frac: float        # val = the contiguous TAIL of the keyframes; 1.0 = no val set
+    # SELECT, then split: kf_fraction picks which of the exported keyframes are trained on at all,
+    # and val_source says where the rest of the export goes.
+    kf_fraction: float       # of the exported keyframes, TRAIN on this fraction, taken
+                             # equidistant over the keyframe LIST (keyframes are unevenly spaced
+                             # in time, so this is every Nth keyframe). 1.0 = every one.
+    val_source: str          # 'tail' = the contiguous last (1 - train_frac) of the selection, so
+                             #          val measures generalising FORWARD and the trained region
+                             #          is a strict prefix. train_frac is read only in this mode.
+                             # 'rest' = every exported keyframe the selection SKIPPED, interleaved
+                             #          through the whole sequence - "the keyframes it never
+                             #          trained on". Needs kf_fraction < 1 to leave anything over.
+    train_frac: float        # 'tail' ONLY: val = the contiguous TAIL; 1.0 = no val set
     eval_on_train: bool      # report on the train subset too, so the train/val gap is visible
     eval_on_val: bool
     eval_every_epoch: bool   # False = base + final only; True in 'online' = one eval per keyframe
@@ -115,6 +127,16 @@ class AdaptConfig:
         # only where it is read; whether it fits the keyframe count is data, checked in the trainer
         if self.adapt_style == 'wonline' and self.window_size < 1:
             raise ValueError(f'window_size={self.window_size} must be >= 1 in the wonline style')
+        if not 0.0 < self.kf_fraction <= 1.0:
+            raise ValueError(f'kf_fraction={self.kf_fraction} must be in (0, 1]')
+        if self.val_source not in VAL_SOURCES:
+            raise ValueError(f'val_source={self.val_source!r} is not one of {VAL_SOURCES}')
+        # not a data question like window_size: at kf_fraction 1.0 the selection IS the export, so
+        # 'rest' is empty for every possible keyframe count
+        if self.val_source == 'rest' and self.kf_fraction >= 1.0:
+            raise ValueError("val_source='rest' validates on the keyframes kf_fraction skipped, "
+                             'but kf_fraction=1.0 selects every one and leaves none over. Lower '
+                             "kf_fraction, or use val_source='tail'.")
         if not 0.0 < self.train_frac <= 1.0:
             raise ValueError(f'train_frac={self.train_frac} must be in (0, 1]')
         if self.checkpoint_every < 0:

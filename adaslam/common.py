@@ -8,9 +8,10 @@ DEPTH_DIR, MASK_DIR = 'depth_slam', 'mask_slam'   # extract writes them, adapt r
 
 # ---------------------------------------------------------------- the outputs/ layout (7.1)
 # outputs/<stage>/<scene>/<experiment>/, the experiment holding what the NEXT stage consumes and
-# nothing else. Here rather than in a stage package because run_pipeline.py needs the names too.
+# nothing else. Here rather than in a stage package because the drivers need the names too.
 EXTRACT_RUN_SUBDIR = 'full'                        # the raw SLAM run; deletable afterwards
 ADAPT_CKPT_SUBDIR = 'checkpoints'
+ADAPTER_FILE = 'adapter.safetensors'               # what an adapt experiment hands to its readers
 TEST_KINDS = ('end2end', 'prior')
 HANDOFF_UP = ('traj_full.txt', 'intrinsics.npy')   # COPIED up from full/, so full/ stays complete
 

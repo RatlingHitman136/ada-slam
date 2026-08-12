@@ -25,17 +25,50 @@ def tum_to_c2w(row):
     return T
 
 
-def split_keyframes(kf, cfg):
-    """Train / val split over the exported keyframes: val is the contiguous TAIL.
+def evenly(seq, n):
+    """`n` items of `seq`, evenly spaced BY INDEX, order preserved. Fewer if indices collide."""
+    seq = list(seq)
+    if n >= len(seq):
+        return seq
+    pick = np.linspace(0, len(seq) - 1, n).round().astype(int)
+    return [seq[i] for i in sorted(set(pick.tolist()))]
 
-    So val measures generalisation forward, and the trained region is a strict PREFIX of the
-    extract window.
+
+def select_keyframes(kf, cfg):
+    """The exported keyframes this run trains on at all: `kf_fraction` of them, equidistant.
+
+    Equidistant over the keyframe LIST, not over frames - keyframes are unevenly spaced in time,
+    so this is every Nth keyframe.
     """
     kf = list(kf)                          # already ascending: poses_slam.txt column 0
+    if cfg.kf_fraction >= 1.0:
+        return kf
+    return evenly(kf, max(2, int(round(len(kf) * cfg.kf_fraction))))
+
+
+def split_keyframes(kf, cfg):
+    """Train / val split over a keyframe list: val is the contiguous TAIL.
+
+    So val measures generalisation forward, and the trained region is a strict PREFIX.
+    """
+    kf = list(kf)
     if cfg.train_frac >= 1.0 or len(kf) < 5:
         return kf, []
     cut = int(round(len(kf) * cfg.train_frac))
     return kf[:cut], kf[cut:]
+
+
+def training_split(kf, cfg):
+    """(train, val) over the exported keyframes - the ONE place both val modes live.
+
+    Select first, then decide what the rest of the export is for: 'rest' validates on every
+    keyframe the selection skipped (interleaved through the whole sequence), 'tail' on the
+    contiguous end of the selection itself.
+    """
+    sel = select_keyframes(kf, cfg)
+    if cfg.val_source == 'rest':
+        return sel, [int(t) for t in kf if t not in set(sel)]
+    return split_keyframes(sel, cfg)
 
 
 class SceneData:
@@ -57,8 +90,10 @@ class SceneData:
         traj = np.loadtxt(f'{scene_dir}/traj_full.txt')
         self.c2w = {int(r[0]): tum_to_c2w(r) for r in traj}
         self.t_min, self.t_max = int(traj[0, 0]), int(traj[-1, 0])
+        # self.kf stays the WHOLE export: t_min/t_max and the recorded split_at are about the
+        # extract window, not about which of its keyframes this run happens to train on
         self.kf = [int(t) for t in np.loadtxt(f'{scene_dir}/poses_slam.txt')[:, 0]]
-        self.train_kf, self.val_kf = split_keyframes(self.kf, cfg)
+        self.train_kf, self.val_kf = training_split(self.kf, cfg)
 
         # intrinsics: stored at the tracker's resolution, rescale to the VGGT input size
         fx, fy, cx, cy = np.load(f'{scene_dir}/intrinsics.npy')

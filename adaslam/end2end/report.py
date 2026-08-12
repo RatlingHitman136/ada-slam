@@ -3,7 +3,7 @@
 Pure formatting over evaluate()'s dicts, so both re-run against results.json on disk with no GPU.
 Column headers are the arms' inferred directory names; the full label stays in results.json.
 """
-from ..print_utils import delta_header, delta_row
+from ..print_utils import delta_table
 
 POPULATIONS = ('all', 'seen', 'unseen')
 
@@ -34,7 +34,11 @@ def print_report(res):
 
 
 def compare(labels, res):
-    """Every arm side by side, one table per population - the shape priortest/report.py prints."""
+    """Every arm as a ROW, one table per population: its ATE, and the delta against labels[0].
+
+    Transposed relative to priortest/report.py, deliberately: that test prints seven metrics over a
+    handful of arms, this one prints a single metric over as many arms as a scene has accumulated.
+    """
     base = res[0]
     k = base['split_at']
 
@@ -47,8 +51,8 @@ def compare(labels, res):
         if n0 is not None and n1 is not None and n0 != n1:
             print(f'  !! {lbl} evaluated {n1} poses, baseline {n0} - arms are not comparable')
 
-    # the column must fit an adapter's name plus a checkpoint suffix
-    width = max(12, max(len(lbl) for lbl in labels) + 2)
+    # the NAME column must fit an adapter's name plus a checkpoint suffix
+    name_width = max(14, max(len(lbl) for lbl in labels) + 2)
     n_all = _n(base, 'all')
     over = f'over {n_all} poses, ' if n_all is not None else ''
     print(f'  full-sequence comparison {over}split at frame {k}')
@@ -57,9 +61,15 @@ def compare(labels, res):
         if all(_ate(r, pop) is None for r in res):
             continue
         print(f'\n  [{pop}]')
-        delta_header(labels, width=width)
-        delta_row('ATE RMSE (m)', [_ate(r, pop) for r in res], True, width=width)
+        delta_table(labels, [_ate(r, pop) for r in res], value_name='ATE RMSE (m)',
+                    lower_better=True, name_width=name_width)
 
     print("\n  '+' better than the baseline column, '-' worse.")
-    print("  'unseen' is the row that matters: it is the only evidence the adaptation")
-    print('  generalises rather than having memorised the keyframes it trained on.')
+    if any(_ate(r, 'unseen') is not None for r in res):
+        print("  'unseen' is the row that matters: it is the only evidence the adaptation")
+        print('  generalises rather than having memorised the keyframes it trained on.')
+    else:
+        # split_at at or past the end of the sequence - cont_adapt_pipeline.py's default, where
+        # the training keyframes span the whole sequence and no frame index separates them (9.7)
+        print("  no 'unseen' population at this split, so 'all' is the comparison. Read the")
+        print("  adapt run's val depth L1 for whether it generalises beyond its training set.")

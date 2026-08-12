@@ -15,13 +15,29 @@ from ..runtime import sh
 RESULTS = 'results.json'
 
 
+def load_ape(out):
+    """The per-pose APE evo saved for a finished arm: (err, frame indices, GT distance).
+
+    ONE definition of the evo/ layout - run_ate writes these files and this reads them back, as
+    does scripts/ate_over_time.py. `err` is APE (translation, metres) AFTER the single Sim(3)
+    alignment fitted over the whole trajectory, one value per frame of traj_full.txt;
+    `dist` is the REFERENCE trajectory's cumulative path length, not the estimate's.
+    """
+    d = f'{out}/evo'
+    if not os.path.exists(f'{d}/error_array.npy'):
+        raise SystemExit(f'{d}/error_array.npy not found - {out} has not been scored yet '
+                         f'(run the end2end stage, or delete the directory and re-run it)')
+    return (np.load(f'{d}/error_array.npy'),
+            np.load(f'{d}/timestamps.npy'),
+            np.load(f'{d}/distances_from_start.npy'))
+
+
 def run_ate(out, gt_traj):
     """evo with Sim3 alignment. Returns (overall rmse, per-frame errors, timestamps)."""
     sh(f'cd {out} && evo_ape tum {os.path.abspath(gt_traj)} traj_full.txt -vas '
        f'--save_results evo.zip --no_warnings > ape.txt 2>&1')
     sh(f'rm -rf {out}/evo && unzip -q {out}/evo.zip -d {out}/evo')
-    err = np.load(f'{out}/evo/error_array.npy')
-    ts = np.load(f'{out}/evo/timestamps.npy')
+    err, ts, _ = load_ape(out)
     return float(np.sqrt((err ** 2).mean())), err, ts
 
 

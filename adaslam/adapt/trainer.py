@@ -11,7 +11,7 @@ import time
 import numpy as np
 import torch
 
-from .data import SceneData
+from .data import SceneData, evenly
 from .losses import depth_loss, pose_loss
 
 
@@ -20,9 +20,8 @@ def eval_depth(lora, data, kfs, cfg):
     """Scale-aligned masked depth L1 over a keyframe subset - the export table's metric."""
     if not kfs:
         return None
-    if cfg.eval_max_kf and len(kfs) > cfg.eval_max_kf:
-        pick = np.linspace(0, len(kfs) - 1, cfg.eval_max_kf).round().astype(int)
-        kfs = [kfs[i] for i in sorted(set(pick.tolist()))]
+    if cfg.eval_max_kf:
+        kfs = evenly(kfs, cfg.eval_max_kf)
     was_training = lora.model.training
     lora.model.eval()
     rng = np.random.default_rng(cfg.seed)
@@ -86,9 +85,13 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
     data = SceneData(scene_dir, image_dir, lora.cfg, cfg)
     print(f'scene {scene_dir}: {len(data.kf)} keyframes, frames {data.t_min}..{data.t_max}, '
           f'supervised on {data.ddir}/')
-    tail = f', frames {data.val_kf[0]}..{data.val_kf[-1]}' if data.val_kf else ''
-    print(f'split @ {cfg.train_frac}: {len(data.train_kf)} train / {len(data.val_kf)} val '
-          f'keyframes (val = the contiguous tail{tail})')
+    span = f', frames {data.val_kf[0]}..{data.val_kf[-1]}' if data.val_kf else ''
+    how = (f'kf_fraction={cfg.kf_fraction} -> val = every keyframe not selected'
+           if cfg.val_source == 'rest' else
+           f'kf_fraction={cfg.kf_fraction}, train_frac={cfg.train_frac} -> val = the contiguous '
+           f'tail of the selection')
+    print(f'split: {len(data.train_kf)} train / {len(data.val_kf)} val keyframes  '
+          f'({how}{span})')
     if not data.val_kf:
         print('  note: empty val set - val eval and keep_best are disabled')
     for line in data.aspect_report():
@@ -119,7 +122,8 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
     best = {'val_l1': float('inf'), 'epoch': None, 'state': None}
 
     if not data.train_kf:
-        raise SystemExit('no training keyframes - raise train_frac or check the export')
+        raise SystemExit('no training keyframes - raise kf_fraction / train_frac, or check the '
+                         'export')
 
     # a UNIT is an epoch, one arriving keyframe in 'online', one window in 'wonline' - see
     # schedule(). Whatever it is, the units it yields are 0..n_units-1: the final eval and the
@@ -163,10 +167,17 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
                'lambda_pose': cfg.lambda_pose, 'coupled_scale': cfg.coupled_scale,
                'p_single_view': cfg.p_single_view, 'max_left': cfg.max_left,
                'max_right': cfg.max_right, 'radius': cfg.radius, 'scene': scene_dir,
-               # the frame this adapter stopped seeing; priortest reads it HERE, not from the
-               # extract dir, which may be deleted long before the adapter is
+               # the END OF THE EXTRACT WINDOW, not of the training data: priortest reads it HERE,
+               # not from the extract dir, which may be deleted long before the adapter is. Under
+               # val_source='rest' the training keyframes span the whole window, so `train_end`
+               # below is the last one rather than a boundary anything is unseen past.
                'split_at': int(data.t_max) + 1,
+               'train_end': int(data.train_kf[-1]) + 1 if data.train_kf else None,
                'seed': cfg.seed, 'train_frac': cfg.train_frac,
+               'kf_fraction': cfg.kf_fraction, 'val_source': cfg.val_source,
+               # the adapter this run STARTED from, or None for stock VGGT-1B - lineage as data,
+               # read off the model rather than passed in, so checkpoints record it too
+               'init_adapter': lora.adapter,
                'n_train_kf': len(data.train_kf), 'n_val_kf': len(data.val_kf),
                'val_kf': data.val_kf, 'keep_best': cfg.keep_best,
                'checkpoint_every': cfg.checkpoint_every}

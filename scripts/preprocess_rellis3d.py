@@ -347,7 +347,7 @@ def main():
     print(f'  max png value  : {stats[:,4].max():.0f} of 65535{sat}')
     print(f'  calib.txt      : {fx*s} {fy*s} {cx*s} {cy*s}   (no distortion - do NOT pass '
           f'--undistort/--cropborder)')
-    print(f'  set DEPTH_PNG_SCALE = {args.depth_png_scale} in run_pipeline.py PARAMETERS')
+    print(f'  set DEPTH_PNG_SCALE = {args.depth_png_scale} in init_adapt_pipeline.py PARAMETERS')
 
 
 if __name__ == '__main__':

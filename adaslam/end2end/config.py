@@ -12,13 +12,14 @@ from dataclasses import dataclass
 from typing import Tuple
 
 from ..adapt import LoRAConfig
-from ..common import ADAPT_CKPT_SUBDIR
+from ..common import ADAPT_CKPT_SUBDIR, ADAPTER_FILE
 
 OMNIDATA, VGGT_BASE = 'omnidata', 'vggt_base'
 # The two priors that are not adapters, and the directory each is scored into.
 SENTINELS = {OMNIDATA: 'omni', VGGT_BASE: 'base'}
 
-ADAPTER_FILE = 'adapter.safetensors'
+# ADAPTER_FILE lives in common.py: adapt/stage.py needs the same name to warm-start from an
+# adapter, and it cannot import this module - end2end imports adapt, so that would be a cycle.
 _CKPT_PREFIX = 'epoch_'
 
 
