@@ -49,7 +49,7 @@ import numpy as np
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)          # repo root, so `adaslam` imports
 
-from adaslam.common import test_dir                                      # noqa: E402
+from adaslam.common import ONLINE_ARM_SUFFIX, test_dir                   # noqa: E402
 from adaslam.end2end.metrics import RESULTS, load_ape                    # noqa: E402
 from adaslam.print_utils import delta_header, delta_row                  # noqa: E402
 
@@ -60,12 +60,34 @@ def rmse(x):
     return float(np.sqrt((np.asarray(x, float) ** 2).mean())) if len(x) else None
 
 
+def no_such_arm(scene, arm, have):
+    """The message for a name that is not an arm directory. A scene accumulates dozens of arms,
+    so dumping all of them buries the answer - lead with what the name probably meant."""
+    lines = [f'no arm {arm!r} in scene {scene!r}.']
+
+    # The one STRUCTURAL near-miss, and the likeliest: an online run (13) names its ADAPTER
+    # <name> and its arm <name>_live, so the adapt directory's name is not an arm.
+    if f'{arm}{ONLINE_ARM_SUFFIX}' in have:
+        lines.append(f'  Did you mean {arm}{ONLINE_ARM_SUFFIX}?')
+        lines.append(f'  An online run (13) names its ADAPTER {arm} (under outputs/adapt/) and its '
+                     f'ARM {arm}{ONLINE_ARM_SUFFIX}')
+        lines.append('  (under outputs/test/end2end/). The trajectory this reads is the second.')
+    else:
+        near = [h for h in have if arm in h or h in arm] or \
+               [h for h in have if h.split('_')[0] == arm.split('_')[0]]
+        if near:
+            lines.append(f'  Closest: {" ".join(near[:8])}')
+        else:
+            lines.append(f'  This scene has {len(have)} arms: {" ".join(have)}')
+    return '\n'.join(lines)
+
+
 def load_arm(root, scene, arm):
     """One arm's per-frame APE, keyed by frame index, plus what results.json says about it."""
     out = f'{test_dir(root, "end2end", scene)}/{arm}'
     if not os.path.isdir(out):
-        have = sorted(os.listdir(test_dir(root, 'end2end', scene)))
-        raise SystemExit(f'no arm {arm!r} in scene {scene!r}; this scene has: {" ".join(have)}')
+        raise SystemExit(no_such_arm(scene, arm,
+                                     sorted(os.listdir(test_dir(root, 'end2end', scene)))))
     err, ts, dist = load_ape(out)
     res = json.load(open(f'{out}/{RESULTS}')) if os.path.exists(f'{out}/{RESULTS}') else {}
     frames = ts.astype(int)

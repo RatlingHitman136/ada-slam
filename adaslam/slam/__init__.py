@@ -6,6 +6,8 @@ functions, not at import time: the reader Process is spawned and re-imports this
 from .config import SlamConfig
 from .prior_probe import PriorProbe
 from .runner import SlamResult, SlamRunner
+from .stock_prior import stock_prior_extractor
 from .tracking_config import write_tracking_config
 
-__all__ = ['PriorProbe', 'SlamConfig', 'SlamResult', 'SlamRunner', 'write_tracking_config']
+__all__ = ['PriorProbe', 'SlamConfig', 'SlamResult', 'SlamRunner', 'stock_prior_extractor',
+           'write_tracking_config']

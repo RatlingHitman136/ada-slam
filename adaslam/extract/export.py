@@ -26,19 +26,25 @@ class ExportInputs:
     shape: tuple           # (K, H, W)
 
 
-def confidence_mask(poses, disps, intrinsics_full, cfg):
+def confidence_mask(poses, disps, intrinsics_full, cfg, ix=None):
     """Multi-view consistency mask, as util/droid_visualization.py:104-110.
 
     depth_filter counts how many of 6 neighbours agree per pixel. The arrays MUST be sliced to the
     real keyframe count, or trailing keyframes match unused buffer slots still holding 1.0.
+
+    `ix` selects WHICH keyframes to score against all of `poses`/`disps`; None = every one, which
+    is what the extract stage wants. The online stage passes a single index instead: it masks one
+    arriving keyframe per call and would otherwise re-score the whole map every time.
     """
     import droid_backends
-    K = disps.shape[0]
-    ix = torch.arange(K, device='cuda', dtype=torch.long)
-    thresh = cfg.mask_filter_thresh * torch.ones(K, device='cuda', dtype=torch.float)
+    if ix is None:
+        ix = torch.arange(disps.shape[0], device='cuda', dtype=torch.long)
+    else:
+        ix = torch.as_tensor(ix, device='cuda', dtype=torch.long).reshape(-1)
+    thresh = cfg.mask_filter_thresh * torch.ones(len(ix), device='cuda', dtype=torch.float)
     count = droid_backends.depth_filter(poses, disps, intrinsics_full / 8.0, ix, thresh)
     return (count >= cfg.mask_min_count) & \
-           (disps > cfg.mask_min_disp_ratio * disps.mean(dim=[1, 2], keepdim=True))
+           (disps[ix] > cfg.mask_min_disp_ratio * disps[ix].mean(dim=[1, 2], keepdim=True))
 
 
 def load_export(run_dir, cfg):

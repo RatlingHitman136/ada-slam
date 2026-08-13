@@ -15,6 +15,12 @@ ADAPTER_FILE = 'adapter.safetensors'               # what an adapt experiment ha
 TEST_KINDS = ('end2end', 'prior')
 HANDOFF_UP = ('traj_full.txt', 'intrinsics.npy')   # COPIED up from full/, so full/ stays complete
 
+# An online run produces BOTH an adapter and the arm that trained it, and end2end/config.py:arm_name
+# would name them the same directory - so the live arm carries this suffix. Without it, later
+# testing the frozen final adapter as an ordinary END2END_PRIORS entry would overwrite the live
+# run's trajectory with a different experiment's (13).
+ONLINE_ARM_SUFFIX = '_live'
+
 
 def extract_run_dir(exp_dir):
     """The untouched HI-SLAM2 run inside an extract experiment directory."""
