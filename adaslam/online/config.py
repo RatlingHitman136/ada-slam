@@ -11,16 +11,29 @@ from dataclasses import dataclass
 # a fixed train set does not exist while the set is still arriving.
 ONLINE_STYLES = ('online', 'wonline')
 WARMUP_PRIORS = ('omnidata',   # upstream's own prior - a genuinely different model
-                 'self')       # the same VGGT this run adapts, frozen until warmup_kf
+                 'self')       # the same VGGT this run adapts, frozen until handover_kf
 
 
 @dataclass(frozen=True)
 class OnlineConfig:
     """Adapting the depth prior DURING the SLAM run that supervises it."""
     # ---------------------------------------------------------------- warm-up
-    warmup_kf: int           # keyframes served by the fallback prior. Adaptation starts after
-                             # them too: the first optimiser step is at keyframe warmup_kf + 1.
-    warmup_prior: str        # 'omnidata' | 'self' - see WARMUP_PRIORS above
+    # TWO GATES, deliberately separate: warmup_kf is when the adapter starts LEARNING, handover_kf
+    # is when it starts SERVING. They were one field, and that made the knob untunable - raising it
+    # bought a longer fallback-served phase and paid for it with an equally delayed adaptation
+    # start, so the two effects cancelled (rellis_00000: 10 -> 26.38, 12 -> 26.34, 13 -> 26.01,
+    # 15 -> 27.28, no trend). Split, the fallback keeps driving while the adapter trains in the
+    # background on what the tracker has already settled, and that costs nothing: the optimiser
+    # steps run either way. handover_kf == warmup_kf reproduces the old single-gate behaviour
+    # exactly, which is what every adapter written before this field did.
+    warmup_kf: int           # keyframes before the first optimiser step: it lands at warmup_kf + 1
+    handover_kf: int         # keyframes served by the FALLBACK prior; VGGT serves from here on.
+                             # Must be >= warmup_kf. The frame it lands on is recorded as
+                             # `warmup_end_frame` - that key name predates the split and is kept,
+                             # because adapters already on disk are read through it (9.5).
+    warmup_prior: str        # 'omnidata' | 'self' - see WARMUP_PRIORS above. Note the split is
+                             # INERT at 'self': both branches are then the same model object, so
+                             # below handover_kf it serves weights that are already adapting.
 
     # ---------------------------------------------------------------- schedule
     # Same vocabulary as adapt/trainer.py:schedule, so 12.1's adapt_cost table still applies.
@@ -69,6 +82,11 @@ class OnlineConfig:
         if self.warmup_kf < 1:
             raise ValueError(f'warmup_kf={self.warmup_kf} must be >= 1: keyframe 0 has no settled '
                              f'predecessor to adapt on, so something must serve it')
+        if self.handover_kf < self.warmup_kf:
+            raise ValueError(f'handover_kf={self.handover_kf} is below warmup_kf='
+                             f'{self.warmup_kf}: the adapter cannot serve before it has taken a '
+                             f'step. Set them equal for the old single-gate behaviour, or raise '
+                             f'handover_kf to let the fallback drive while the adapter trains')
         if self.adapt_style == 'wonline' and self.window_size < 1:
             raise ValueError(f'window_size={self.window_size} must be >= 1 in the wonline style')
         if self.lag < 1:

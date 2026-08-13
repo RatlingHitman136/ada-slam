@@ -59,7 +59,7 @@ UNDISTORT   = False
 CROP_BORDER = 0
 
 # ---------------------------------------------------------------- run control
-STAGES           = ('extract', 'adapt', 'end2end')   # any subset; run in pipeline order
+STAGES           = ('end2end')   # any subset; run in pipeline order
 SKIP_EXISTING    = True                # reuse a stage's output if it is already on disk
 MIN_FREE_VRAM_MB = 7000                # shared GPU: checked once at the start of main()
 FRACTION         = 9                   # % of the sequence the adapter trains on; also SPLIT_AT
@@ -74,8 +74,8 @@ RENDER_EVAL      = False               # hi2.py's eval_rendering -> renders/ + p
 # Both REQUIRED, and unique within their scene only. Lineage is DATA, not naming: an adapter's
 # config.json holds the extract it trained on. FRACTION is not in the name - put it there yourself.
 OUT_ROOT     = 'outputs'
-EXTRACT_NAME = 'dense_kf_p9'
-ADAPT_NAME   = 'wonline_e10_w10_p9_lr2'
+EXTRACT_NAME = 'low_dense_kf'
+ADAPT_NAME   = 'wonline_r8_e3_w10_p10'
 
 # ---------------------------------------------------------------- stage I/O
 # A stage RECEIVES its paths and reads no path global, so it can be pointed at another run's
@@ -127,7 +127,7 @@ EXTRACT = ExtractConfig(
 LORA = LoRAConfig(
     weights='pretrained_models/vggt',
     vggt_hw=VGGT_HW,           # None -> derived in main()
-    rank=8, alpha=8,
+    rank=8, alpha=16,
     targets=('attn.qkv', 'attn.proj', 'mlp.fc1', 'mlp.fc2'),
     patch_embed=False)         # False = adapt only the alternating-attention stack
 
@@ -142,9 +142,9 @@ ADAPT = AdaptConfig(
                                # by one (no partial warm-up window). Under the latter two the
                                # eval/checkpoint cadences count keyframes / windows, not epochs -
                                # set eval_every_epoch False
-    epochs=3, batch_size=2,
+    epochs=10, batch_size=2,
     window_size=10,            # 'wonline' only
-    lr=1e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
+    lr=0.5e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
     coupled_scale=True, min_mask_pixels=16, seed=0, log_every=20,
     # ---- which exported keyframes are trained on, and what the rest are for ----
     kf_fraction=1.0,           # 1.0 = train on EVERY exported keyframe. This pipeline densifies

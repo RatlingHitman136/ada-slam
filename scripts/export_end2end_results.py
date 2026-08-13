@@ -113,7 +113,8 @@ INIT_COLUMNS = ('arm', 'style', 'epochs', 'window', 'lr',
                 'ate_all', 'd_ate_vs_omni', 'd_ate_pct', 'exported_at')
 
 LIVE_COLUMNS = ('arm', 'style', 'steps_per_kf', 'window', 'lr', 'alpha', 'lag',
-                'warmup_kf', 'warmup_prior', 'warmup_end_frame', 'first_adapted_kf',
+                'warmup_kf', 'handover_kf', 'warmup_prior', 'warmup_end_frame',
+                'first_adapted_kf',
                 'n_units', 'n_train_kf', 'adapt_cost', 'train_seconds', 'init_adapter',
                 'ate_all', 'd_ate_vs_omni', 'd_ate_pct', 'exported_at')
 
@@ -340,6 +341,11 @@ def live_cells(cfg, n_frames):
     separates nothing. No extract / extract_kf: there is no extract stage, and `scene` records the
     arm's OWN output directory. What replaces them is warmup_end_frame - the one frame index that
     does mean something here, where the fallback prior handed over to VGGT.
+
+    `warmup_kf` and `handover_kf` are TWO gates, not one (online/config.py): the first is when the
+    adapter started learning, the second when it started serving. They were one field, so on every
+    adapter written before the split `handover_kf` is blank and equal to `warmup_kf` by
+    construction - blank because that is what "not measured" looks like everywhere else here.
     """
     return {
         'steps_per_kf': num(cfg.get('epochs')),
@@ -347,6 +353,9 @@ def live_cells(cfg, n_frames):
         'alpha': num(cfg.get('alpha')),
         'lag': num(cfg.get('lag')),
         'warmup_kf': num(cfg.get('warmup_kf')),
+        # blank on every adapter written before online/config.py split the one warm-up gate in two;
+        # there handover_kf WAS warmup_kf, and a blank says "not measured" rather than asserting it
+        'handover_kf': num(cfg.get('handover_kf')),
         'warmup_prior': cfg.get('warmup_prior', ''),
         'warmup_end_frame': num(cfg.get('warmup_end_frame')),
         'first_adapted_kf': num(cfg.get('first_adapted_kf')),

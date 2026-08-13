@@ -191,7 +191,11 @@ class LiveTrainer:
                 'lambda_pose': cfg.lambda_pose, 'coupled_scale': cfg.coupled_scale,
                 'context_kf': cfg.context_kf, 'lag': cfg.lag, 'seed': cfg.seed,
                 'stream_res': cfg.stream_res,
-                'warmup_kf': cfg.warmup_kf, 'warmup_prior': cfg.warmup_prior,
+                # two gates, not one (online/config.py): warmup_kf is when learning starts,
+                # handover_kf when serving does. warmup_end_frame is the FRAME the second landed
+                # on - the key name predates the split and is kept, adapters on disk use it.
+                'warmup_kf': cfg.warmup_kf, 'handover_kf': cfg.handover_kf,
+                'warmup_prior': cfg.warmup_prior,
                 'warmup_end_frame': self.warmup_end_frame,
                 'checkpoint_every_kf': cfg.checkpoint_every_kf,
                 # lineage as data, read off the model rather than passed in - so checkpoints carry

@@ -95,7 +95,7 @@ RENDER_EVAL      = False               # hi2.py's eval_rendering -> renders/ + p
 # REQUIRED, and unique within its scene only. Lineage is DATA, not naming: the adapter's
 # config.json records the run that supervised it and the adapter it continued from.
 OUT_ROOT    = 'outputs'
-ONLINE_NAME = 'live_e5_lr0.5_a16_w12_lag3_base'
+ONLINE_NAME = 'live_e3_w10_b5_a16_w12_lag3_base'
 
 # ---------------------------------------------------------------- stage I/O
 # A stage RECEIVES its paths and reads no path global. Pure string joins - no disk access here.
@@ -140,24 +140,32 @@ LORA = LoRAConfig(
 
 # ---------------------------------------------------------------- online adaptation (stage 1)
 ONLINE = OnlineConfig(
-    # ---- warm-up: what serves SLAM before the adapter takes over ----
-    warmup_kf=12,              # keyframes served by the fallback. 12 is TrackFrontend.warmup, so
-                               # the handover lands right after initialisation. Adaptation starts
-                               # after them too: the first step is at keyframe warmup_kf + 1.
-    warmup_prior='self',   # 'omnidata' = upstream's prior, a genuinely different model
-                               # 'self'     = the same VGGT this run adapts, frozen until then
-                               #              (with ADAPT_INIT set, that is a pretrained adapter)
+    # ---- warm-up: TWO gates - when the adapter starts LEARNING, and when it starts SERVING ----
+    warmup_kf=12,              # keyframes before the first optimiser step, which lands at
+                               # warmup_kf + 1. 12 is TrackFrontend.warmup, so learning begins
+                               # right after initialisation, on keyframes local BA has settled.
+    handover_kf=12,            # keyframes served by the FALLBACK; VGGT serves from here on. Must
+                               # be >= warmup_kf; equal is the old single-gate behaviour. Between
+                               # the two the adapter trains while Omnidata still drives, which is
+                               # FREE - the steps run either way. Measured on rellis_00000: at 40
+                               # units the adapter is already -14.3% vs omni as a frozen prior
+                               # (chkp_039), stock VGGT is +6.2%, so the crossover is somewhere
+                               # below keyframe 53 and 30 is a first bracket on it.
+    warmup_prior='omnidata',   # 'omnidata' = upstream's prior, a genuinely different model
+                               # 'self'     = the same VGGT this run adapts (with ADAPT_INIT set,
+                               #              a pretrained adapter). Makes the split INERT: both
+                               #              branches are then the same, adapting, model.
 
     # ---- schedule: the vocabulary of adapt/trainer.py:schedule, live ----
-    adapt_style='online',      # 'online'  = the arriving keyframe alone, steps_per_kf steps
+    adapt_style='wonline',      # 'online'  = the arriving keyframe alone, steps_per_kf steps
                                # 'wonline' = a SLIDING WINDOW of the arrival + the window_size-1
                                #             keyframes before it, steps_per_kf shuffled batched
                                #             passes, so each is revisited window_size times
-    steps_per_kf=5,            # optimiser steps ('online') / shuffled passes ('wonline') per
+    steps_per_kf=3,            # optimiser steps ('online') / shuffled passes ('wonline') per
                                # arriving keyframe. This is the runtime knob: it multiplies the
                                # forward+backward cost of the whole run.
-    window_size=6,             # 'wonline' ONLY
-    batch_size=2,              # 'wonline' ONLY - a keyframe arrives alone in 'online'
+    window_size=10,             # 'wonline' ONLY
+    batch_size=5,              # 'wonline' ONLY - a keyframe arrives alone in 'online'
     lag=3,                     # keyframes back from the end the target is taken. 2 is
                                # track_frontend.py:65's own line: __update reports changes up to
                                # t1-2, so that is the newest index the repo already treats as
@@ -170,9 +178,9 @@ ONLINE = OnlineConfig(
     stream_res=STREAM_RES,     # must equal SLAM.stream_res
 
     # ---- optimisation ----
-    lr=.5e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
+    lr=1e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
     coupled_scale=True, min_mask_pixels=16, seed=0,
-    log_every=1,               # every step: there are only steps_per_kf of them per keyframe
+    log_every=2,               # every step: there are only steps_per_kf of them per keyframe
 
     # ---- supervision mask (the same knobs ExtractConfig uses for depth_slam/) ----
     mask_filter_thresh=0.005,  # depth_filter disparity agreement
@@ -180,7 +188,7 @@ ONLINE = OnlineConfig(
     mask_min_disp_ratio=0.5,   # drop pixels below this fraction of the frame's mean disparity
 
     # ---- output ----
-    checkpoint_every_kf=0)     # 0 = off; N = a loadable adapter dir every N adapted keyframes,
+    checkpoint_every_kf=50)     # 0 = off; N = a loadable adapter dir every N adapted keyframes,
                                # each testable as an arm named <ONLINE_NAME>_chkp_NNN
 
 # ---------------------------------------------------------------- reference arms (stage 2)
@@ -191,7 +199,7 @@ END2END_PRIORS = ('omnidata', 'vggt_base')
 # The seen/unseen boundary. None = the whole sequence, i.e. everything counts as "seen" and the
 # [unseen] table is empty - the honest default here, exactly as in cont_adapt_pipeline.py: the
 # adapter learned across the WHOLE sequence, so no frame index separates trained from untrained.
-SPLIT_AT = None
+SPLIT_AT = 200
 
 END2END = End2EndConfig(
     priors=END2END_PRIORS,
@@ -240,8 +248,10 @@ def main():
           f'{stream_hw[1]/stream_hw[0]:.3f})   VGGT input: {LORA.vggt_hw[1]}x{LORA.vggt_hw[0]}'
           f'{" (derived)" if VGGT_HW is None else " (pinned by VGGT_HW)"}')
     print(f'run       : frames 0..{length-1} of {n_frames}')
-    print(f'warm-up   : {ONLINE.warmup_kf} keyframes on {ONLINE.warmup_prior}; adaptation starts '
-          f'at keyframe {ONLINE.warmup_kf + 1}')
+    print(f'warm-up   : {ONLINE.handover_kf} keyframes on {ONLINE.warmup_prior}; adaptation starts '
+          f'at keyframe {ONLINE.warmup_kf + 1}'
+          + (f' - SPLIT, {ONLINE.handover_kf - ONLINE.warmup_kf} keyframes of training before '
+             f'handover' if ONLINE.handover_kf > ONLINE.warmup_kf else ''))
     print(f'schedule  : {ONLINE.adapt_style}, {ONLINE.steps_per_kf} steps per arriving keyframe'
           + (f', window {ONLINE.window_size} batch {ONLINE.batch_size}'
              if ONLINE.adapt_style == 'wonline' else ''))

@@ -5,6 +5,6 @@ Tracking:
     active: False       # 00000 is 242 m net over a 332 m path - one-way, no loop to close
 
 opt_params:
-  position_lr_max_steps: 14000   # colour refinement, which also refines the keyframe poses (11.2).
+  position_lr_max_steps: 0   # colour refinement, which also refines the keyframe poses (11.2).
                                  # TUM's 7000 is sized for ~1400 frames; this sequence has 2847.
                                  # Must be identical across A/B arms.

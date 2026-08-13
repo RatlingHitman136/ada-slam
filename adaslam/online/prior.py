@@ -6,10 +6,15 @@ arm's prior leaking into the next.
 
 What it adds is two branches around the parent's extractor:
 
-  * before warmup_kf keyframes exist, SLAM is served by the FALLBACK prior, so the map has
+  * before handover_kf keyframes exist, SLAM is served by the FALLBACK prior, so the map has
     something to bootstrap from that this run has not yet influenced;
   * from warmup_kf + 1 on, every call first takes a burst of optimiser steps on the keyframes the
     tracker has already settled, then predicts with the weights that produced.
+
+The two gates are SEPARATE (config.py): learning starts at warmup_kf + 1, serving at handover_kf.
+Between them the adapter trains on settled keyframes while the fallback still drives, which is free
+- those optimiser steps run either way - and is the only way to hand over an adapter that is
+already worth serving. handover_kf == warmup_kf is the old single-gate behaviour.
 
 Normals stay Omnidata on BOTH branches (the parent's job), so depth remains the only variable
 between this arm and the baselines.
@@ -55,11 +60,19 @@ class OnlineVggtPrior(VggtPrior):
             from ..slam import stock_prior_extractor
             self._fallback = stock_prior_extractor()
 
-        which = 'Omnidata' if self._fallback else 'this same VGGT, frozen'
+        split = online_cfg.handover_kf - online_cfg.warmup_kf
+        which = ('Omnidata' if self._fallback else
+                 'this same VGGT, frozen' if not split else 'this same VGGT, ALREADY ADAPTING')
         self.label = (f'VGGT adapted ONLINE ({online_cfg.adapt_style}, '
                       f'{online_cfg.steps_per_kf} steps/kf) / Omnidata normals')
-        print(f'online     : first {online_cfg.warmup_kf} keyframes served by {which}; '
+        print(f'online     : first {online_cfg.handover_kf} keyframes served by {which}; '
               f'adaptation starts at keyframe {online_cfg.warmup_kf + 1}')
+        if split:
+            print(f'             gates SPLIT: the adapter trains on {split} keyframes before it '
+                  f'serves anything')
+            if not self._fallback:
+                print(f"             ...but warmup_prior='self' makes the fallback the very model "
+                      f'being adapted, so the split changes nothing here')
         print(f'             target = 1/disps_up of keyframe counter-1-{online_cfg.lag} '
               f'(local BA, not global), context {online_cfg.context_kf} keyframes')
 
@@ -86,7 +99,9 @@ class OnlineVggtPrior(VggtPrior):
                 with torch.enable_grad():
                     trainer.on_keyframe(video)
 
-            if n < cfg.warmup_kf:
+            # the SERVING gate, which is not the learning gate above: between warmup_kf and
+            # handover_kf the adapter is taking steps while the fallback still drives.
+            if n < cfg.handover_kf:
                 return fallback(mf, im_tensor)
             # recorded on the TRAINER, which is what writes the adapter's config.json. It is the
             # one frame index that separates fallback-served tracking from VGGT-served tracking,
