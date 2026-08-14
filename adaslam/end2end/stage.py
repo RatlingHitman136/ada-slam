@@ -11,14 +11,31 @@ from ..common import probe_stream_hw
 from ..print_utils import banner
 from ..runtime import free_vram
 
-from .config import SENTINELS, VGGT_BASE, adapter_path, arm_name
+from .config import OMNIDATA_DENSE, SENTINELS, VGGT_BASE, adapter_path, arm_name
 from .metrics import RESULTS, evaluate
 from .prior import VggtPrior
 from .report import compare, print_report
 
 
 def make_prior(spec, cfg, stream_hw=None):
-    """The one place a prior spec becomes a depth prior. None = stock Omnidata."""
+    """The one place a prior spec becomes a depth prior. None = stock Omnidata.
+
+    Reached only when the arm has no traj_full.txt at all: run_end2end_test checks cached_results
+    and the reuse-and-re-score branch first. That is what makes the OMNIDATA_DENSE refusal below
+    a guard rather than a wall - an arm already on disk is reused and never comes through here.
+    """
+    if spec == OMNIDATA_DENSE:
+        # NOT a prior variant: the same Omnidata prior at a different KEYFRAME DENSITY, which is a
+        # property of the tracking config. Every arm here shares one arm_config (see the print at
+        # the top of run_end2end_test), so building it would run stock keyframing and write the
+        # result into a directory named for a dense run - a silently wrong arm of exactly the kind
+        # 9.3 exists to prevent. Refuse instead.
+        raise SystemExit(
+            f'{spec!r} cannot be produced by the end2end stage: it is the Omnidata prior at '
+            f'DENSIFIED keyframing, and keyframe density lives in the tracking config, which is '
+            f'identical for every arm of a comparison. Run scripts/dense_kf_arm.py to produce '
+            f'{arm_name(spec)}, then list {spec!r} in END2END_PRIORS with SKIP_EXISTING=True to '
+            f'have it reused from disk (SKIP_EXISTING is what reaches the cache before this).')
     if spec not in SENTINELS:
         return VggtPrior(cfg, adapter_path(spec), stream_hw)
     if spec == VGGT_BASE:

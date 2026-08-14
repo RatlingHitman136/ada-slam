@@ -326,14 +326,15 @@ Vendored DPT/MiDaS code, used **only** for inference of the Omnidata checkpoints
 | `init_adapt_pipeline.py` | **The VGGT track's initial-adaptation driver** — extract a densified *prefix*, adapt on all of it, compare arms. §9.1. |
 | `cont_adapt_pipeline.py` | **Its continual-adaptation sibling** — extract the *whole* sequence at stock keyframe density, adapt on a thin equidistant sample of it (optionally continuing from an earlier adapter), compare arms. §9.7. |
 | `online_adapt_pipeline.py` | **The single-stage driver** — §13. No extract and no frozen second pass: ONE SLAM run whose depth prior LoRA-adapts on each keyframe local BA settles, then the reference arms and one comparison table. Same PARAMETERS-block shape as the two above; the stage is `adaslam/online/`. |
-| `export_end2end_results.py` | **One scene's end2end arms as a CSV**, for a Notion database — §12. `-n <name> -s <scene> [--init\|--cont\|--live]` → `outputs/<name>.csv`. Read-only over `outputs/`: it joins each arm's `results.json` to the adapt `config.json` behind it and the extract that trained it, and decomposes the un-sortable experiment name into columns. One kind per run, `--init` by default; each driver gets its own column set and its own Notion database, and which arms belong to which is read off the experiment-name prefix (`live*`, `cont*`). `--cont` is a named placeholder that raises. Its one computed number is `adapt_cost`. |
+| `export_end2end_results.py` | **One scene's end2end arms as a CSV**, for a Notion database — §12. `-n <name> -s <scene> [--init\|--cont\|--live]` → `outputs/<name>.csv`. Read-only over `outputs/`: it joins each arm's `results.json` to the adapt `config.json` behind it and the extract that trained it, and decomposes the un-sortable experiment name into columns. One kind per run, `--init` by default; each driver gets its own column set and its own Notion database, and which arms belong to which is read off the experiment-name prefix (`live*`, `cont*`). Its computed numbers are `adapt_cost`, `train_pct` / `train_span_pct` and the `--cont` table's `regime`. |
 | `ate_over_time.py` | **Where in the sequence an arm's ATE lives** — §12.3. `-s <scene> <arm> [<arm> …]` prints the per-pose APE evo already saved, one row per frame (`--keyframes` / `--bins N` for the other two granularities, `--csv` to dump). Read-only, no GPU, nothing recomputed. Its docstring is the how-to-read-it, and it is needed: the value is a residual after one *global* Sim(3) fit, so it neither starts at zero nor rises monotonically. |
+| `plot_trajectories.py` | **Where in *space* it lives** — §12.4. `-s <scene> -o <name> <arm> …` draws the estimated paths from above into `outputs/plots/<name>.png`, every pose coloured green→red by its APE on one scale shared by the whole image. Read-only, no GPU: it applies the Sim(3) evo already saved (`evo/alignment_transformation_sim3.npy`) to `traj_full.txt` and colours by `evo/error_array.npy`. |
 
-The VGGT track adds four more — see §9 and §12: **two drivers**, `init_adapt_pipeline.py` and
+The VGGT track adds five more — see §9 and §12: **two drivers**, `init_adapt_pipeline.py` and
 `cont_adapt_pipeline.py` (extract → adapt → end2end comparison, differing only in *which*
-keyframes the adapter is trained on — §9.1, §9.7), and **two read-only views** over what they
-wrote, `export_end2end_results.py` (arms as CSV rows) and `ate_over_time.py` (one arm's error
-along the sequence). The standalone single-stage tools `export_slam_depth.py` and
+keyframes the adapter is trained on — §9.1, §9.7), and **three read-only views** over what they
+wrote, `export_end2end_results.py` (arms as CSV rows), `ate_over_time.py` (one arm's error
+along the sequence) and `plot_trajectories.py` (the paths in space). The standalone single-stage tools `export_slam_depth.py` and
 `lora_adapt_vggt.py` are **deleted**: once every stage became an importable package under
 `adaslam/` (§9.5) they were thin argparse wrappers over code reachable in three lines from a
 REPL, and a second way to invoke a stage is a second place for its defaults to drift.
@@ -1117,7 +1118,7 @@ invocation**, enforced by an argparse mutually-exclusive group, `--init` when no
 | flag | driver | columns |
 |---|---|---|
 | `--init` *(default)* | `init_adapt_pipeline.py` (§9.1) | `epochs window lr train_pct train_frames n_train_kf adapt_cost train_seconds extract extract_kf` |
-| `--cont` | `cont_adapt_pipeline.py` (§9.7) | **not implemented** — raises before any work |
+| `--cont` | `cont_adapt_pipeline.py` (§9.7) | `regime epochs window lr kf_fraction val_source train_frac train_span_pct n_train_kf n_val_kf adapt_cost train_seconds init_adapter extract extract_kf base_train_l1 train_l1 base_val_l1 val_l1 d_val_l1` |
 | `--live` | `online_adapt_pipeline.py` (§13) | `steps_per_kf window lr alpha lag warmup_kf warmup_prior warmup_end_frame first_adapted_kf n_units n_train_kf adapt_cost train_seconds init_adapter` |
 
 all three sharing `arm style ate_all d_ate_vs_omni d_ate_pct exported_at`.
@@ -1138,6 +1139,31 @@ the frame indices `n_train_kf` counts (§13.5). It also drops `train_pct` / `tra
 (`split_at` is the whole sequence for every live run) and `extract` / `extract_kf` (no extract
 stage, and `scene` records the arm's own directory) — which retires §13.4's caveat about that
 column.
+
+The `--cont` table deviates in two places, both forced by §9.7's design. **It exports a metric
+other than ATE**: `base_train_l1 / train_l1 / base_val_l1 / val_l1 / d_val_l1`, the `eval_history`
+rows for the base model and for the unit the adapter was *saved* at — matched by **tag**
+(`e24`, `k22`, `w224`), not taken as `history[-1]`, since under `keep_best` the trainer records
+the whole history beside a smaller `saved_epoch` (`trainer.py:277`) and the last row can be an
+evaluation of weights the arm never ran. §12.2 refuses `ate_seen`/`ate_unseen` for being computed
+at incomparable splits and the same objection applies here — the **val set differs by regime and
+by the knob under it** (a tail of 176 keyframes at `train_frac` 0.25 and 117 at 0.5, the 211 the
+selection skipped at `kf_fraction` 0.1, none at all under `full`), and `eval_max_kf` caps the
+evaluated subset without recording the cap. It is answered rather than dodged: there is no
+split-independent substitute
+(val L1 on the keyframes a thin sample skipped *is* what §9.7 set out to measure), the grouping
+keys are columns, and on a warm start `base_val_l1` is the **incoming adapter's** error, so
+`d_val_l1` — what this run itself added — is the column that compares across lineages. Second,
+`regime` (`prefix` / `sample` / `full`) is derived from `val_source` + `train_frac`, and
+`train_span_pct` from `train_end`, because init's `train_pct` reads 100 for every run here — the
+extract *is* the whole sequence. It is not `kf_fraction` restated either: 25% of the keyframes
+reaches frame 672 of 2847 (23.6%), since keyframes are unevenly spaced.
+
+The prefix cross-check runs the other way too, and **only one way**: `val_source: 'rest'` or
+`kf_fraction < 1` can only have come from `cont_adapt_pipeline.py` (`init_adapt_pipeline.py` pins
+both, and `AdaptConfig` rejects `'rest'` at `kf_fraction 1.0`), so a run carrying either mark
+without the `cont` prefix is reported. The converse proves nothing — a cont run at
+`KF_FRACTION=1.0` records exactly what an init run records — which is why the prefix still decides.
 
 ### 12.1 `adapt_cost` — the time reference
 
@@ -1231,6 +1257,48 @@ sit at 332.2 m while the error climbs to 56 m. And `cumRMSE` accumulates the row
 *frames*, not the row values, so its last entry equals `results.json:ate_all` exactly
 (31.278976) — a free check on the whole table. (An equal-weighted RMSE of per-bin RMSEs is not
 the RMSE when the bins differ in size, which is what that column got wrong first.)
+
+### 12.4 `plot_trajectories.py` — where in *space* the error is
+
+§12.3 answers *when*; this answers *where*. Same input, drawn instead of tabulated:
+
+```
+python scripts/plot_trajectories.py -s rellis_00000 -o omni_vs_lora omni base normal_r8_e20_p10
+```
+
+→ `outputs/plots/omni_vs_lora.png`. A column of 2847 residuals cannot show that a run cut a
+corner or wandered while the rig was parked; the path can.
+
+**Nothing is recomputed.** `evo/` already holds both halves — `error_array.npy` is the per-pose
+APE and `alignment_transformation_sim3.npy` is the 4×4 Sim(3) `evo_ape -vas` fitted, scale baked
+into the rotation block. Applying the second to `traj_full.txt`'s translations puts the estimate
+in GT coordinates, and the residual there **equals the first to ~6e-14** — so geometry and colour
+come from one transform, the same one `results.json:ate_all` was measured under. The script
+checks that identity per arm and refuses to draw if it exceeds 1e-6, because a stale `evo/`
+beside a re-run `traj_full.txt` would still produce a plausible picture. `metrics.py` grew
+`load_alignment` and `gt_traj_of` for it, beside `load_ape`, so the `evo/` layout stays defined
+once; `arm_dir` + `no_such_arm` moved there from `ate_over_time.py` for the same reason.
+
+Three things decided by the data rather than typed:
+
+- **The GT** comes from `evo/info.json:ref_name`, the absolute path evo recorded. A scene id does
+  not determine its dataset directory (`rellis_00000` → `data/RELLIS/00000`, but the TUM scene is
+  named after its own), and only a driver's PARAMETERS block knows the mapping. Arms disagreeing
+  on `ref_name` are a hard error — they are not in one frame.
+- **The plane** drops the GT axis with the least spread, which is the vertical one for a ground
+  vehicle (rellis_00000: x 154 m, y 202 m, z 1.5 m → x/y, *not* the x/z a camera-convention
+  dataset would want). `--plane` overrides.
+- **The layout**: ≤3 arms overlay on one panel, 4+ facet into small multiples on shared axes.
+  Colour is spent on error, so arm identity is carried by marker shape and the legend — never by
+  colour, and not by dash pattern either, since a path is one `LineCollection` of ~2850
+  centimetre-long segments and a linestyle on it renders solid.
+
+**Reading it.** The same three caveats as §12.3 apply, and one more that only the picture raises:
+**each arm carries its own Sim(3)**, so two paths here are each individually best-fitted to GT.
+That is what makes their *shapes* comparable and their absolute offsets not. Green is not
+"correct" either — the ramp spans the arms you asked for, and the best pose of the best arm on
+rellis_00000 still sits 1.9 m from GT. A stretch that reddens while the path barely moves is
+§12.3's flat-`dist(m)` case seen directly: the rig stopped and the estimate drifted.
 
 ---
 

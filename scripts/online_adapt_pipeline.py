@@ -95,7 +95,7 @@ RENDER_EVAL      = False               # hi2.py's eval_rendering -> renders/ + p
 # REQUIRED, and unique within its scene only. Lineage is DATA, not naming: the adapter's
 # config.json records the run that supervised it and the adapter it continued from.
 OUT_ROOT    = 'outputs'
-ONLINE_NAME = 'live_e3_w10_b5_a16_w12_lag3_base'
+ONLINE_NAME = 'live_e5_a16_w12_lag3_base'
 
 # ---------------------------------------------------------------- stage I/O
 # A stage RECEIVES its paths and reads no path global. Pure string joins - no disk access here.
@@ -157,15 +157,15 @@ ONLINE = OnlineConfig(
                                #              branches are then the same, adapting, model.
 
     # ---- schedule: the vocabulary of adapt/trainer.py:schedule, live ----
-    adapt_style='wonline',      # 'online'  = the arriving keyframe alone, steps_per_kf steps
+    adapt_style='online',      # 'online'  = the arriving keyframe alone, steps_per_kf steps
                                # 'wonline' = a SLIDING WINDOW of the arrival + the window_size-1
                                #             keyframes before it, steps_per_kf shuffled batched
                                #             passes, so each is revisited window_size times
-    steps_per_kf=3,            # optimiser steps ('online') / shuffled passes ('wonline') per
+    steps_per_kf=5,            # optimiser steps ('online') / shuffled passes ('wonline') per
                                # arriving keyframe. This is the runtime knob: it multiplies the
                                # forward+backward cost of the whole run.
     window_size=10,             # 'wonline' ONLY
-    batch_size=5,              # 'wonline' ONLY - a keyframe arrives alone in 'online'
+    batch_size=2,              # 'wonline' ONLY - a keyframe arrives alone in 'online'
     lag=3,                     # keyframes back from the end the target is taken. 2 is
                                # track_frontend.py:65's own line: __update reports changes up to
                                # t1-2, so that is the newest index the repo already treats as
@@ -180,7 +180,7 @@ ONLINE = OnlineConfig(
     # ---- optimisation ----
     lr=1e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
     coupled_scale=True, min_mask_pixels=16, seed=0,
-    log_every=2,               # every step: there are only steps_per_kf of them per keyframe
+    log_every=5,               # every step: there are only steps_per_kf of them per keyframe
 
     # ---- supervision mask (the same knobs ExtractConfig uses for depth_slam/) ----
     mask_filter_thresh=0.005,  # depth_filter disparity agreement

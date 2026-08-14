@@ -4,8 +4,17 @@ An arm is a DEPTH-PRIOR GENERATOR, not a fixed name - every kind is one entry in
 
     'omnidata'                                          upstream's prior, the baseline
     'vggt_base'                                         stock VGGT-1B, no adapter
+    'omnidata_dense'                                    upstream's prior at DENSIFIED keyframing
     outputs/adapt/<scene>/<aname>                       an adapt stage's handoff directory
     outputs/adapt/<scene>/<aname>/checkpoints/epoch_005  one of its checkpoints
+
+`omnidata_dense` is the odd one and the docstring has to say so: it is not a different prior at all,
+it is the SAME Omnidata prior tracked at the extract's keyframe density. Density is a property of
+the tracking config, and run_end2end_test hands every arm ONE arm_config (stage.py) - so this stage
+cannot produce that arm, and listing it here only ever REUSES one already on disk. It is produced by
+scripts/dense_kf_arm.py; stage.py:make_prior refuses to build it rather than silently running a
+stock-density arm into a directory named for a dense one. Reuse needs SKIP_EXISTING, since that is
+what reaches the cache before make_prior is called.
 """
 import os
 from dataclasses import dataclass
@@ -14,9 +23,12 @@ from typing import Tuple
 from ..adapt import LoRAConfig
 from ..common import ADAPT_CKPT_SUBDIR, ADAPTER_FILE
 
-OMNIDATA, VGGT_BASE = 'omnidata', 'vggt_base'
-# The two priors that are not adapters, and the directory each is scored into.
-SENTINELS = {OMNIDATA: 'omni', VGGT_BASE: 'base'}
+OMNIDATA, VGGT_BASE, OMNIDATA_DENSE = 'omnidata', 'vggt_base', 'omnidata_dense'
+# The priors that are not adapters, and the directory each is scored into. Everything that reads
+# this vocabulary - arm_name, adapter_path, check_priors_exist, arm_dirs, priortest's arm_split_at
+# and export_end2end_results.py's SENTINEL_ARMS - is generic over the dict, so a sentinel is one
+# entry. make_prior is the deliberate exception: see the docstring above on OMNIDATA_DENSE.
+SENTINELS = {OMNIDATA: 'omni', VGGT_BASE: 'base', OMNIDATA_DENSE: 'omni_dense'}
 
 # ADAPTER_FILE lives in common.py: adapt/stage.py needs the same name to warm-start from an
 # adapter, and it cannot import this module - end2end imports adapt, so that would be a cycle.

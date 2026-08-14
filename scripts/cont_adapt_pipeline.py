@@ -89,7 +89,7 @@ RENDER_EVAL      = False               # hi2.py's eval_rendering -> renders/ + p
 OUT_ROOT     = 'outputs'
 EXTRACT_NAME = 'low_dense_kf'          # the whole sequence at STOCK keyframe density - one
                                        # expensive run, reused by every adapt run below it
-ADAPT_NAME   = 'cont_normal_e5_kf100_b_base'
+ADAPT_NAME   = 'cont_normal_e25_pre25_b_base'
 
 # ---------------------------------------------------------------- stage I/O
 # A stage RECEIVES its paths and reads no path global, so it can be pointed at another run's
@@ -147,7 +147,7 @@ EXTRACT = ExtractConfig(
 LORA = LoRAConfig(
     weights='pretrained_models/vggt',
     vggt_hw=VGGT_HW,           # None -> derived in main()
-    rank=8, alpha=8,
+    rank=8, alpha=16,
     targets=('attn.qkv', 'attn.proj', 'mlp.fc1', 'mlp.fc2'),
     patch_embed=False)         # False = adapt only the alternating-attention stack
 
@@ -165,7 +165,7 @@ ADAPT = AdaptConfig(
                                # by one (no partial warm-up window). Under the latter two the
                                # eval/checkpoint cadences count keyframes / windows, not epochs -
                                # set eval_every_epoch False
-    epochs=5, batch_size=2,
+    epochs=25, batch_size=2,
     window_size=10,            # 'wonline' only
     lr=1e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
     coupled_scale=True, min_mask_pixels=16, seed=0, log_every=20,
@@ -174,12 +174,12 @@ ADAPT = AdaptConfig(
     val_source='tail',         # val = every keyframe the selection skipped, interleaved through
                                # the whole sequence. This is the row to read: it says whether a
                                # sparse sample generalises to the frames between its samples.
-    train_frac=1.0,            # unread under val_source='rest' (that mode's val is the
+    train_frac=0.25,            # unread under val_source='rest' (that mode's val is the
                                # complement, not a tail)
     eval_on_val=True,          # depth L1 on the never-trained keyframes, base vs adapted
     eval_on_train=True,        # also on the train subset, so the train/val gap is visible
     eval_every_epoch=False,    # False = only before training and after the last epoch
-    eval_max_kf=100,           # subsample each eval subset to at most this many; 0 = no cap.
+    eval_max_kf=200,           # subsample each eval subset to at most this many; 0 = no cap.
                                # val is ~90% of the export here, so this cap is what keeps the
                                # eval cheap - it subsamples evenly, so it still spans the sequence
     keep_best=False,           # False = save the last epoch; True = snapshot on val improvement
@@ -190,7 +190,7 @@ ADAPT = AdaptConfig(
 #   'omnidata' -> .../omni | 'vggt_base' -> .../base | ADAPT_OUT -> .../<ADAPT_NAME> |
 #   f'{ADAPT_CKPT}/epoch_005' -> .../<ADAPT_NAME>_chkp_005
 # That is what makes an arm reusable. priors[0] is the baseline column.
-END2END_PRIORS = ('omnidata', 'vggt_base', ADAPT_OUT, experiment_dir(OUT_ROOT, 'adapt', SCENE, 'online_r8_e15_p10'))
+END2END_PRIORS = ('omnidata', 'vggt_base', ADAPT_OUT, experiment_dir(OUT_ROOT, 'adapt', SCENE, 'live_e3_w10_a16_w12_lag3_base'))
 
 # The seen/unseen boundary. None = the whole sequence, i.e. everything counts as "seen" and the
 # [unseen] table is empty - the honest default here, because an equidistant selection puts

@@ -6,7 +6,8 @@ insensitive to the way it is better? Minutes per arm, because nothing here track
 import json
 import os
 
-from ..end2end.config import SENTINELS, VGGT_BASE, adapter_path, arm_name
+from ..end2end.config import (OMNIDATA, OMNIDATA_DENSE, SENTINELS, VGGT_BASE, adapter_path,
+                              arm_name)
 from ..end2end.prior import VggtPrior
 from ..print_utils import banner
 from ..runtime import free_vram
@@ -24,6 +25,15 @@ def make_prior(spec, cfg):
 
     No stream_hw: the aspect warning belongs to a run that will feed BA.
     """
+    if spec == OMNIDATA_DENSE:
+        # Refused for the opposite reason to end2end's: there IS no tracking here, so keyframe
+        # density has nothing to act on and this would score a byte-identical duplicate of `omni`
+        # into a second directory - a row that looks like evidence and is not.
+        raise SystemExit(
+            f'{spec!r} has no meaning in the prior test: it differs from {SENTINELS[OMNIDATA]!r} '
+            f'only in KEYFRAME DENSITY, and this test runs no SLAM at all (each frame goes through '
+            f'PriorProbe). It would duplicate the omni row. Use {SENTINELS[OMNIDATA]!r} here; '
+            f'{spec!r} belongs in END2END_PRIORS.')
     if spec not in SENTINELS:
         return VggtPrior(cfg, adapter_path(spec))
     if spec == VGGT_BASE:

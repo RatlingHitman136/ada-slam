@@ -8,6 +8,7 @@ import os
 
 import numpy as np
 
+from ..common import ONLINE_ARM_SUFFIX, test_dir
 from ..runtime import sh
 
 # One arm's scores, recording the split_at they were computed at - arms are reused, and a score
@@ -30,6 +31,71 @@ def load_ape(out):
     return (np.load(f'{d}/error_array.npy'),
             np.load(f'{d}/timestamps.npy'),
             np.load(f'{d}/distances_from_start.npy'))
+
+
+def load_alignment(out):
+    """The Sim(3) evo fitted for a finished arm, as a 4x4 with the SCALE BAKED IN.
+
+    Same layout contract as load_ape - run_ate writes it, this reads it back. Applying it to
+    traj_full.txt's translations puts the estimate in the GT frame, and the residual there
+    equals error_array.npy to ~6e-14, so anything drawn through it is positioned by the same
+    transform the numbers in results.json were measured under.
+    """
+    p = f'{out}/evo/alignment_transformation_sim3.npy'
+    if not os.path.exists(p):
+        raise SystemExit(f'{p} not found - {out} was not scored with alignment (run_ate passes '
+                         f'evo -vas, which saves it), so its trajectory cannot be put in the GT '
+                         f'frame')
+    return np.load(p)
+
+
+def gt_traj_of(out):
+    """The GT trajectory `out` was scored against - the absolute path evo recorded at the time.
+
+    A scene id does not determine its dataset directory (`rellis_00000` -> `data/RELLIS/00000`,
+    but the TUM scene is named after its own directory), and only each driver's PARAMETERS block
+    knows the mapping. The arm itself does, though: evo wrote the reference it was given.
+    """
+    p = f'{out}/evo/info.json'
+    if not os.path.exists(p):
+        raise SystemExit(f'{p} not found - {out} has not been scored yet (run the end2end '
+                         f'stage), so the GT it should be compared against is not recorded')
+    return json.load(open(p))['ref_name']
+
+
+def no_such_arm(scene, arm, have):
+    """The message for a name that is not an arm directory. A scene accumulates dozens of arms,
+    so dumping all of them buries the answer - lead with what the name probably meant."""
+    lines = [f'no arm {arm!r} in scene {scene!r}.']
+
+    # The one STRUCTURAL near-miss, and the likeliest: an online run (13) names its ADAPTER
+    # <name> and its arm <name>_live, so the adapt directory's name is not an arm.
+    if f'{arm}{ONLINE_ARM_SUFFIX}' in have:
+        lines.append(f'  Did you mean {arm}{ONLINE_ARM_SUFFIX}?')
+        lines.append(f'  An online run (13) names its ADAPTER {arm} (under outputs/adapt/) and its '
+                     f'ARM {arm}{ONLINE_ARM_SUFFIX}')
+        lines.append('  (under outputs/test/end2end/). The trajectory this reads is the second.')
+    else:
+        near = [h for h in have if arm in h or h in arm] or \
+               [h for h in have if h.split('_')[0] == arm.split('_')[0]]
+        if near:
+            lines.append(f'  Closest: {" ".join(near[:8])}')
+        else:
+            lines.append(f'  This scene has {len(have)} arms: {" ".join(have)}')
+    return '\n'.join(lines)
+
+
+def arm_dir(root, scene, arm):
+    """`<root>/test/end2end/<scene>/<arm>`, checked - the one place a typed arm id is resolved.
+
+    Every read-only view over a scored arm starts here, so the near-miss message above is
+    written once and both scripts/ate_over_time.py and scripts/plot_trajectories.py get it.
+    """
+    out = f'{test_dir(root, "end2end", scene)}/{arm}'
+    if not os.path.isdir(out):
+        raise SystemExit(no_such_arm(scene, arm,
+                                     sorted(os.listdir(test_dir(root, 'end2end', scene)))))
+    return out
 
 
 def run_ate(out, gt_traj):

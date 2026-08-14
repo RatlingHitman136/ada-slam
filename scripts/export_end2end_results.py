@@ -12,15 +12,18 @@ across the whole sequence, and `warmup_prior` does not exist for one that adapte
 one kind per invocation, argparse-enforced, `--init` when none is given:
 
     --init   (default)  init_adapt_pipeline.py  - extract a prefix, adapt on it, test frozen (9.1)
-    --cont              cont_adapt_pipeline.py  - NOT IMPLEMENTED, see main()             (9.7)
+    --cont              cont_adapt_pipeline.py  - extract the WHOLE sequence, adapt on a slice
+                                                  of it, optionally continuing from another
+                                                  adapter, test frozen                    (9.7)
     --live              online_adapt_pipeline.py - one SLAM run that adapts as it tracks  (13)
 
 WHICH ARMS a table holds is decided by the experiment-name PREFIX its driver's names carry -
 `live*` for the online driver, `cont*` for the continual one, everything else init. That is the one
 and only place this file reads a name (see below), and it is unavoidable: nothing inside an arm's
-directory records which driver produced it. For `live` there IS corroborating data,
-config.json's `online: true`, so the two are cross-checked and a disagreement is printed rather
-than silently resolved.
+directory records which driver produced it. Where config.json CAN corroborate the prefix the two
+are cross-checked and a disagreement is printed rather than silently resolved: `online: true` for
+a live run, either way; a thinned keyframe selection for a continual one, one way only
+(thinned_selection).
 
 Two rules sit on top of the prefix:
 
@@ -31,6 +34,27 @@ Two rules sit on top of the prefix:
     is scored it is a blank duplicate of the `<name>_live` row beside it rather than an arm
     waiting its turn. An init adapter with no arm still gets its blank row - there the blank is
     the point.
+
+THE CONT TABLE deviates from the other two in one place, and it is the depth L1 columns. What a
+continual run varies is WHICH of the whole sequence's keyframes it trained on and WHAT IT STARTED
+FROM, which is three recorded fields and a lineage: `regime` names the combination (derived from
+val_source and train_frac, never from the arm name), `train_span_pct` says how far into the
+sequence the training keyframes reach - init's `train_pct` cannot be reused, since `split_at` is
+the whole sequence for every run here. Then:
+
+  * `base_*_l1` / `*_l1` are the eval_history rows for the BASE model and for the SAVED unit
+    (12.2 exports no ate_seen/ate_unseen for being computed at incomparable splits; the same
+    argument bites here, and is answered rather than dodged). The val SET differs by regime and by
+    the knob under it - a tail of 176 keyframes at train_frac 0.25 and of 117 at 0.5, the 211 the
+    selection skipped at kf_fraction 0.1, NONE at all under 'full' - so an L1 compares only down a
+    group of runs that share them, and every one of those fields is a column to group a view by.
+    Unlike ate_seen there is no split-independent alternative to fall back on:
+    val L1 on the keyframes a thin sample skipped IS what 9.7 set out to measure. eval_max_kf caps
+    how many of them were actually evaluated and is not recorded in config.json.
+  * `base_val_l1` on a WARM START is the incoming adapter's error, not stock VGGT's (9.7 verified
+    exactly this: 0.1029 cold vs 0.0440 continued, at the same first evaluation). So the pair is
+    not an absolute; `d_val_l1` - what this run added - is what compares across lineages, and
+    `init_adapter` is the column that says which reading applies.
 
 Three things it deliberately does NOT do:
 
@@ -63,9 +87,9 @@ NOTION. One database per scene AND per kind - `arm` is only unique within one sc
 kinds do not share a column set.
 
   1. first time   /database -> Import -> CSV. Then set the property types once: `arm` stays
-                  Title, `style` / `extract` / `warmup_prior` / `init_adapter` -> Select, every
-                  numeric column -> Number, `exported_at` -> Date. Merges preserve types, so this
-                  is a one-off.
+                  Title, `style` / `extract` / `warmup_prior` / `init_adapter` / `regime` /
+                  `val_source` -> Select, every numeric column -> Number, `exported_at` -> Date.
+                  Merges preserve types, so this is a one-off.
   2. after that   database ... menu -> Merge with CSV. Notion matches rows on the Title, so `arm`
                   makes a re-export UPDATE rows in place instead of duplicating them; new arms
                   are appended.
@@ -75,6 +99,9 @@ kinds do not share a column set.
   `train_pct`, sorted `ate_all` ascending (the best result each frame budget can reach); and a
   small one filtered to `arm is omni or base`. --live: grouped by `init_adapter` (continuing from
   an offline adapter vs starting stock is the biggest split there), sorted `ate_all` ascending.
+  --cont: grouped by `regime`, sorted `ate_all` ascending - the L1 columns are comparable down
+  one such group and not across them; and a second grouped by `init_adapter`, which is the split
+  9.7 exists to measure.
 """
 import argparse
 import csv
@@ -95,7 +122,9 @@ from adaslam.end2end.config import SENTINELS, arm_name                   # noqa:
 # arm_name is IMPORTED rather than reimplemented: the pipeline infers an arm's directory from its
 # prior spec (7.1), and a second naming rule here would join the wrong rows the day one changes.
 OMNI_ARM = SENTINELS['omnidata']
-SENTINEL_ARMS = frozenset(SENTINELS.values())   # omni, base - the baselines every table carries
+# omni, base, omni_dense - the baselines every table carries. Derived from SENTINELS rather than
+# listed, so a sentinel added there shows up in all three tables without an edit here.
+SENTINEL_ARMS = frozenset(SENTINELS.values())
 
 RESULTS, CONFIG = 'results.json', 'config.json'
 
@@ -112,11 +141,23 @@ INIT_COLUMNS = ('arm', 'style', 'epochs', 'window', 'lr',
                 'extract', 'extract_kf',
                 'ate_all', 'd_ate_vs_omni', 'd_ate_pct', 'exported_at')
 
+CONT_COLUMNS = ('arm', 'style', 'regime', 'epochs', 'window', 'lr',
+                'kf_fraction', 'val_source', 'train_frac', 'train_span_pct',
+                'n_train_kf', 'n_val_kf', 'adapt_cost', 'train_seconds',
+                'init_adapter', 'extract', 'extract_kf',
+                'base_train_l1', 'train_l1', 'base_val_l1', 'val_l1', 'd_val_l1',
+                'ate_all', 'd_ate_vs_omni', 'd_ate_pct', 'exported_at')
+
 LIVE_COLUMNS = ('arm', 'style', 'steps_per_kf', 'window', 'lr', 'alpha', 'lag',
                 'warmup_kf', 'handover_kf', 'warmup_prior', 'warmup_end_frame',
                 'first_adapted_kf',
                 'n_units', 'n_train_kf', 'adapt_cost', 'train_seconds', 'init_adapter',
                 'ate_all', 'd_ate_vs_omni', 'd_ate_pct', 'exported_at')
+
+# The letter adapt/trainer.py tags a unit with, per style (trainer.py:134/146/154) - so an
+# eval_history row can be matched to the unit an adapter was SAVED at rather than assumed to be
+# the last one. See eval_rows.
+UNIT_TAG = {'online': 'k', 'wonline': 'w'}      # anything else is an epoch
 
 
 def num(v, nd=4):
@@ -185,6 +226,50 @@ def window_of(cfg):
     two styles (online/config.py:30).
     """
     return cfg.get('window_size') if cfg.get('adapt_style', 'normal') == 'wonline' else None
+
+
+def regime_of(cfg):
+    """WHICH of the whole sequence's keyframes a continual run trained on, as one word.
+
+        prefix   the contiguous first train_frac of the keyframe list, val = the tail after it
+        sample   an equidistant kf_fraction of the whole list, val = every keyframe it skipped
+        full     every one of them, and no val set at all
+
+    Derived from the two fields that DECIDE it, never from the arm name (`cont_..._pre25_...` is a
+    label like every other name here). It is redundant with val_source + train_frac by
+    construction, and earns its column anyway: it is the one thing a Notion view must group by
+    before the L1 columns mean anything, and a Select beats a compound filter over two numbers.
+    """
+    if not cfg:                                     # a sentinel row trained on nothing
+        return ''
+    if cfg.get('val_source') == 'rest':
+        return 'sample'
+    return 'prefix' if (cfg.get('train_frac') or 1.0) < 1.0 else 'full'
+
+
+def train_frac_of(cfg):
+    """train_frac, but only for the val_source that reads it - see window_of for the same reason.
+
+    Under val_source='rest' val is the COMPLEMENT of the selection, so the split is kf_fraction's
+    business and the recorded train_frac is a leftover from the PARAMETERS block (it reads 1.0 on
+    every 'rest' run on disk while 90% of the export is held out).
+    """
+    return None if cfg.get('val_source') == 'rest' else cfg.get('train_frac')
+
+
+def eval_rows(cfg):
+    """(the base eval_history row, the row for the unit the adapter was SAVED at), {} when absent.
+
+    Matched BY TAG rather than taken as history[0] and history[-1]. Under keep_best the trainer
+    records the whole history beside a smaller saved_epoch (adapt/trainer.py:277), so the last row
+    can be an evaluation of weights this arm never runs. Both are allowed to be missing: a
+    checkpoint written under eval_every_epoch=False carries the base row and nothing else, and
+    that is a blank cell rather than an earlier unit's number.
+    """
+    history = cfg.get('eval_history') or []
+    tag = f"{UNIT_TAG.get(cfg.get('adapt_style', 'normal'), 'e')}{cfg.get('saved_epoch')}"
+    return (next((r for r in history if r.get('tag') == 'base'), {}),
+            next((r for r in history if r.get('tag') == tag), {}))
 
 
 def init_adapter_of(cfg):
@@ -264,6 +349,18 @@ def kind_of(arm):
     return KIND_INIT
 
 
+def thinned_selection(cfg):
+    """config.json PROVES a continual run - only that driver trains on part of its export.
+
+    One way only, which is why the prefix is still what decides. init_adapt_pipeline.py pins
+    kf_fraction=1.0 / val_source='tail' (it densified the extract on purpose, so thinning it again
+    would undo that), and AdaptConfig rejects val_source='rest' at kf_fraction 1.0 - so either
+    mark can only have come from cont_adapt_pipeline.py. The converse says nothing: a cont run at
+    KF_FRACTION=1.0 records exactly what an init run records, and no field distinguishes them.
+    """
+    return cfg.get('val_source') == 'rest' or (cfg.get('kf_fraction') or 1.0) < 1.0
+
+
 def select(rows, kind):
     """The rows one kind's table holds - its own arms plus the sentinel baselines.
 
@@ -281,8 +378,18 @@ def select(rows, kind):
             print(f'WARNING: {arm} is named for the {named!r} driver but its config.json {does} '
                   f"record online: true - it is exported as {named!r}. Rename the experiment "
                   f"({PREFIX[KIND_LIVE]}* for an online run) to fix it")
+        # the other direction of the same argument, and only half of it: this catches a continual
+        # run named without the prefix, never the reverse (see thinned_selection)
+        elif cfg and named != KIND_CONT and thinned_selection(cfg):
+            print(f'WARNING: {arm} is named for the {named!r} driver but its config.json records '
+                  f"kf_fraction={cfg.get('kf_fraction')} / val_source={cfg.get('val_source')!r}, "
+                  f'which only {PREFIX[KIND_CONT]}_adapt_pipeline.py produces - it is exported as '
+                  f'{named!r}. Rename the experiment ({PREFIX[KIND_CONT]}* for a continual run) '
+                  f'to fix it')
 
-        if arm in SENTINEL_ARMS:      # omni is what the deltas are against; base is 13's reference
+        # omni is what the deltas are against, base is 13's reference, omni_dense is the
+        # keyframe-density control - all three belong in every table
+        if arm in SENTINEL_ARMS:
             out.append(r)
             continue
         if named != kind:
@@ -330,6 +437,47 @@ def init_cells(cfg, n_frames):
     }
 
 
+def cont_cells(cfg, n_frames):
+    """The columns only a continual run has: a slice of the WHOLE sequence, and a lineage.
+
+    No train_pct / train_frames: the extract is the whole sequence, so split_at is n_frames for
+    every run and init's column would read 100 down the table. train_span_pct replaces it off
+    `train_end` - 1 + the last TRAINING keyframe's frame index - which separates a 'prefix' run
+    from the rest. It is not kf_fraction restated either: keyframes are unevenly spaced, so 25% of
+    them reaches frame 672 of 2847 (23.6%), and under 'sample' it reads ~100 at any kf_fraction.
+
+    The L1 pairs are eval_history's, one per subset; read the module docstring before comparing
+    two of them. Blank is honest here and common: 'full' has no val set, and eval_on_* can be off.
+    """
+    extract, train_end = cfg.get('scene'), cfg.get('train_end')
+    base, final = eval_rows(cfg)
+    base_val, val = base.get('val_l1'), final.get('val_l1')
+    return {
+        'regime': regime_of(cfg),
+        'epochs': num(cfg.get('epochs')),
+        'window': num(window_of(cfg)),
+        'kf_fraction': num(cfg.get('kf_fraction')),
+        'val_source': cfg.get('val_source', ''),
+        'train_frac': num(train_frac_of(cfg)),
+        'train_span_pct': num(round(train_end / n_frames * 100, 1)
+                              if train_end and n_frames else None, 1),
+        'n_train_kf': num(cfg.get('n_train_kf')),
+        'n_val_kf': num(cfg.get('n_val_kf')),
+        'adapt_cost': num(adapt_cost(cfg)),
+        'train_seconds': num(cfg.get('train_seconds'), 1),
+        'init_adapter': init_adapter_of(cfg),
+        'extract': os.path.basename(extract.rstrip('/')) if extract else '',
+        'extract_kf': num(extract_keyframes(extract)),
+        'base_train_l1': num(base.get('train_l1')),
+        'train_l1': num(final.get('train_l1')),
+        # on a warm start this is the INCOMING adapter's error, not stock VGGT's (9.7) - which is
+        # why the delta, what this run itself added, is the column that compares across lineages
+        'base_val_l1': num(base_val),
+        'val_l1': num(val),
+        'd_val_l1': num(val - base_val if (val is not None and base_val is not None) else None),
+    }
+
+
 def live_cells(cfg, n_frames):
     """The columns only a live run has - warm-up, lag, and a train set that arrived as it ran.
 
@@ -367,9 +515,9 @@ def live_cells(cfg, n_frames):
     }
 
 
-# columns and the cell builder for the middle of a row, per kind. KIND_CONT is deliberately absent:
-# main() rejects it before any work, and an entry here would be a table nobody designed.
+# columns and the cell builder for the middle of a row, per kind
 KINDS = {KIND_INIT: (INIT_COLUMNS, init_cells),
+         KIND_CONT: (CONT_COLUMNS, cont_cells),
          KIND_LIVE: (LIVE_COLUMNS, live_cells)}
 
 
@@ -419,21 +567,13 @@ def main():
                        help='arms from init_adapt_pipeline.py - anything not named for another '
                             'driver, plus the baselines (default)')
     kinds.add_argument('--cont', dest='kind', action='store_const', const=KIND_CONT,
-                       help=f'arms from cont_adapt_pipeline.py ({PREFIX[KIND_CONT]}*) - '
-                            f'NOT IMPLEMENTED')
+                       help=f'arms from cont_adapt_pipeline.py ({PREFIX[KIND_CONT]}*), plus '
+                            f'the baselines')
     kinds.add_argument('--live', dest='kind', action='store_const', const=KIND_LIVE,
                        help=f'arms from online_adapt_pipeline.py ({PREFIX[KIND_LIVE]}*), plus '
                             f'the baselines')
     ap.set_defaults(kind=KIND_INIT)
     args = ap.parse_args()
-
-    if args.kind == KIND_CONT:
-        raise SystemExit(
-            '--cont is not implemented yet: the continual table (9.7) needs a column set of its '
-            'own, and none of what separates those runs - kf_fraction, val_source, and the '
-            "val_l1 series in config.json's eval_history - is an --init column. Note the name is "
-            'the only reliable marker there too: a cont run at KF_FRACTION=1.0 records '
-            "val_source: 'tail' exactly like an init run. Use --init or --live.")
 
     os.chdir(_ROOT)                              # --root is repo-root relative, however invoked
 
