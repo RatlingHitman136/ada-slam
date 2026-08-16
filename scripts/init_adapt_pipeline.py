@@ -32,7 +32,7 @@ from adaslam.common import (ADAPT_CKPT_SUBDIR, DEPTH_DIR, experiment_dir, extrac
 from adaslam.end2end import End2EndConfig, run_end2end_test
 from adaslam.extract import ExtractConfig, run_extract
 from adaslam.pipeline import (check_sequence, enter, print_arm_dirs, resolve_lora,
-                              warn_runtime_undistort)
+                              scene_key, warn_runtime_undistort, window_frames)
 from adaslam.priortest import PriorTestConfig, run_prior_test
 from adaslam.runtime import ensure_venv_on_path, gpu_gate, raise_fd_limit
 from adaslam.slam import SlamConfig, SlamRunner
@@ -59,11 +59,40 @@ UNDISTORT   = False
 CROP_BORDER = 0
 
 # ---------------------------------------------------------------- run control
-STAGES           = ('end2end')   # any subset; run in pipeline order
-SKIP_EXISTING    = True                # reuse a stage's output if it is already on disk
+STAGES           = ('prior',)          # any subset; run in pipeline order.
+                                       # E2 batch: prior stage only. The end2end block below is
+                                       # left intact as E1's config - flip this back to
+                                       # ('end2end',) to resume that ladder. The two stages write
+                                       # to different trees (test/prior vs test/end2end), so an
+                                       # E1 run on another host and this one cannot collide.
+SKIP_EXISTING    = True                # reuse a stage's output if it is already on disk.
+                                       # TRUE for this E0b batch. It was False for E0 batch 1, to
+                                       # force the five arms scored 2026-08-02..04 to be recomputed
+                                       # through the eval path as edited on 08-14; that gate
+                                       # PASSED bit-exact (omni, base and normal_r8_e10 reproduce
+                                       # to 0.000000 on every metric), so the old rows are valid
+                                       # and nothing needs recomputing again. True also means a
+                                       # re-run of this file is a no-op rather than a clobber -
+                                       # which matters here, because outputs/ is shared storage.
 MIN_FREE_VRAM_MB = 7000                # shared GPU: checked once at the start of main()
-FRACTION         = 9                   # % of the sequence the adapter trains on; also SPLIT_AT
+FRACTION         = 7                   # % of the sequence the adapter trains on; also SPLIT_AT.
+                                       # 7 -> split_at = 2847*7//100 = 199, the p7 extract's
+                                       # boundary (frames 0-198). That is the span the best small-
+                                       # prefix offline arm (wonline_r8_e10_w10_p7, ATE 23.864)
+                                       # trained on AND the span the earliest live checkpoint
+                                       # scored below reached, so ate_unseen means the same thing
+                                       # for both. Nothing here trains - only ate_all is compared.
 START            = 0
+STOP             = None                # exclusive: the window is [START, STOP), so (200, 2647) is
+                                       # frames 200..2646 and (0, None) is the whole sequence.
+                                       # A WINDOWED run gets its own outputs/ tree - see SCENE_KEY.
+
+# WHERE A WINDOWED RUN'S OUTPUTS GO. end2end/config.py:arm_name maps 'omnidata' to `omni` whatever
+# the window, so a windowed baseline would overwrite the full-sequence one and leave nothing to
+# compare either against. The window therefore keys the SCENE directory instead: the full sequence
+# keeps SCENE, anything else becomes SCENE_f<START>-<STOP> with its own omni/base, which
+# SKIP_EXISTING fills on first use. Pure string work, so it belongs in this block (9.5 rule 3).
+SCENE_KEY = scene_key(SCENE, START, STOP)
 STREAM_RES       = 341 * 640           # tracking resolution budget
 DEPTH_PNG_SCALE  = 256.0               # metres = px / this. MUST match the dataset: 6553.5
                                        # (TUM/Replica) saturates at 10 m, 256 at 256 m
@@ -75,24 +104,27 @@ RENDER_EVAL      = False               # hi2.py's eval_rendering -> renders/ + p
 # config.json holds the extract it trained on. FRACTION is not in the name - put it there yourself.
 OUT_ROOT     = 'outputs'
 EXTRACT_NAME = 'low_dense_kf'
-ADAPT_NAME   = 'wonline_r8_e3_w10_p10'
+# E1 scores a LIVE run's checkpoint ladder, so ADAPT_NAME names that run: it is what makes
+# ADAPT_CKPT point at the 46 checkpoints below. No adapt stage runs here.
+ADAPT_NAME   = 'live_e3_w10_a16_w12_lag3_more_chkp_base'
 
 # ---------------------------------------------------------------- stage I/O
 # A stage RECEIVES its paths and reads no path global, so it can be pointed at another run's
 # results. Pure string joins - this block must not touch the disk.
-OUT_EXTRACT  = experiment_dir(OUT_ROOT, 'extract', SCENE, EXTRACT_NAME)
+OUT_EXTRACT  = experiment_dir(OUT_ROOT, 'extract', SCENE_KEY, EXTRACT_NAME)
 
 ADAPT_IN     = OUT_EXTRACT                              # an extract export
 ADAPT_IMAGES = COLORS                                   # keyframe RGB, indexed by frame number
-ADAPT_OUT    = experiment_dir(OUT_ROOT, 'adapt', SCENE, ADAPT_NAME)
+ADAPT_OUT    = experiment_dir(OUT_ROOT, 'adapt', SCENE_KEY, ADAPT_NAME)
 ADAPT_CKPT   = f'{ADAPT_OUT}/{ADAPT_CKPT_SUBDIR}'       # epoch_NNN/; cadence is checkpoint_every
 ADAPT_INIT   = None                                     # the adapter to CONTINUE from; None =
                                                         # stock VGGT-1B. Same vocabulary as an
                                                         # END2END_PRIORS entry, e.g.
-                                                        # experiment_dir(OUT_ROOT,'adapt',SCENE,'x')
+                                                        # experiment_dir(OUT_ROOT, 'adapt',
+                                                        #                SCENE_KEY, 'x')
 
-OUT_END2END  = test_dir(OUT_ROOT, 'end2end', SCENE)     # one subdirectory per prior generator
-OUT_PRIOR    = test_dir(OUT_ROOT, 'prior', SCENE)       # same arm names, scored without SLAM
+OUT_END2END  = test_dir(OUT_ROOT, 'end2end', SCENE_KEY)     # one subdirectory per prior generator
+OUT_PRIOR    = test_dir(OUT_ROOT, 'prior', SCENE_KEY)       # same arm names, scored without SLAM
 
 # VGGT's input size; an adapter's own recorded size wins over this. Derived in main(), not here -
 # this block must not touch the disk (9.3).
@@ -101,7 +133,7 @@ VGGT_HW          = None                # None = derive | (378, 518) TUM | (294, 
 # ---------------------------------------------------------------- the SLAM runs
 # What every invocation shares; what differs per run is an argument to SlamRunner.run() instead.
 SLAM = SlamConfig(
-    weights=DROID_WEIGHTS, colors=COLORS, calib=CALIB, start=START,
+    weights=DROID_WEIGHTS, colors=COLORS, calib=CALIB, start=START, stop=STOP,
     undistort=UNDISTORT, crop_border=CROP_BORDER, stream_res=STREAM_RES,
     render_eval=RENDER_EVAL)
 
@@ -167,8 +199,58 @@ ADAPT = AdaptConfig(
 #   'omnidata' -> .../omni | 'vggt_base' -> .../base | ADAPT_OUT -> .../<ADAPT_NAME> |
 #   f'{ADAPT_CKPT}/epoch_005' -> .../<ADAPT_NAME>_chkp_005
 # That is what makes an arm reusable. priors[0] is the baseline column.
-# experiment_dir(OUT_ROOT, 'adapt', SCENE, 'online_e30_p7'), experiment_dir(OUT_ROOT, 'adapt', SCENE, 'online_e30_p7_lr2'), experiment_dir(OUT_ROOT, 'adapt', SCENE, 'wonline_e5_w10_p7_lr2')
-END2END_PRIORS = ('omnidata', 'vggt_base', ADAPT_OUT, experiment_dir(OUT_ROOT, 'adapt', SCENE, 'normal_r8_e15_p10'))
+
+
+# `_a` names another run's adapt handoff directory. Defined HERE rather than further down because
+# both END2END_PRIORS and PRIOR_PRIORS use it and this one comes first.
+def _a(name):
+    return experiment_dir(OUT_ROOT, 'adapt', SCENE_KEY, name)
+
+
+# The best live run so far: wonline, steps_per_kf 8, w10, a16, lr 1.2e-4, lag 3 -> live ATE 24.473.
+E8 = _a('live_e8_w10_a16_w12_lag3_base')
+
+# E1: WHERE IN A LIVE RUN DOES THE ADAPTER BECOME GOOD?
+# `live_e3_w10_a16_w12_lag3_more_chkp_base` was run with checkpoint_every_kf=5 and left 46
+# checkpoints spanning units 4..229 = 6.7%..87.8% of the sequence. Scoring them FROZEN turns the
+# run into a curve of adapter quality against how much of the sequence it had seen, which is the
+# one thing the live ATE cannot show. The comparison target is the offline arm trained on the SAME
+# span: p7 23.864 / p10 23.498 / p20 23.769 / p40 23.750 (omni baseline 31.279).
+#
+# Why it matters: the live pipeline reaches 24.473 only at steps_per_kf=8, which costs 118 min of
+# training INSIDE the scored run (training blocks tracking, online/prior.py:102-104) for ~7x more
+# forward passes than the offline p7 arm needs. If this ladder is flat after unit ~20, most of that
+# is avoidable; if it climbs to the end, the cost is structural.
+#
+# 10 of the 46, dense where the question lives (5 below 20% coverage), geometric after. Comments
+# are unit, last TRAINING frame, and share of the sequence - read off train_log.json, not names.
+END2END_PRIORS = (
+    # priors[0] is the baseline column. Both already exist, so SKIP_EXISTING makes them cache
+    # hits; they only re-score at the new split_at, which takes seconds and leaves ate_all alone.
+    'omnidata', 'vggt_base',
+    f'{ADAPT_CKPT}/epoch_004',   # unit   4, frame  190,  6.7%  <- vs offline p7  23.864
+    f'{ADAPT_CKPT}/epoch_009',   # unit   9, frame  222,  7.8%
+    f'{ADAPT_CKPT}/epoch_014',   # unit  14, frame  299, 10.5%  <- vs offline p10 23.498
+    f'{ADAPT_CKPT}/epoch_024',   # unit  24, frame  421, 14.8%
+    f'{ADAPT_CKPT}/epoch_039',   # unit  39, frame  559, 19.7%  <- near-replicate of the existing
+                                 #            live_e3_w10_a16_w12_lag3_base_chkp_039 (26.793),
+                                 #            which differs only in lr - a free reproducibility read
+    f'{ADAPT_CKPT}/epoch_049',   # unit  49, frame  694, 24.4%  <- pairs with the e8 arm below
+    f'{ADAPT_CKPT}/epoch_079',   # unit  79, frame 1033, 36.3%  <- vs offline p40 23.750
+    f'{ADAPT_CKPT}/epoch_124',   # unit 124, frame 1442, 50.7%
+    f'{ADAPT_CKPT}/epoch_179',   # unit 179, frame 2044, 71.8%
+    f'{ADAPT_CKPT}/epoch_229',   # unit 229, frame 2500, 87.8%
+    # The e8 run at the SAME 24.4% coverage (its epoch_049 also ends at frame 694). Same style,
+    # window, alpha, lag and lr; ONLY steps_per_kf differs, 8 vs 3. The one controlled test of
+    # whether repetition pays off EARLY or only accrues by the end of the run - which is what
+    # decides whether the 118 min can be truncated.
+    f'{E8}/{ADAPT_CKPT_SUBDIR}/epoch_049',        # unit 49, frame 694, 24.4%
+    # Endpoints, one run each.
+    ADAPT_OUT,                   # more_chkp FINAL, frozen. Its LIVE ATE is 25.913; frozen tells
+                                 # us whether that came from the adapter or from the prior changing
+                                 # during the run.
+    E8,                          # the 24.473 arm, frozen. No frozen arm exists for it yet.
+)
 
 END2END = End2EndConfig(
     priors=END2END_PRIORS,
@@ -182,7 +264,56 @@ END2END = End2EndConfig(
 # ---------------------------------------------------------------- prior test (stage 4)
 # The same generators vs GT depth, no SLAM run - minutes an arm. It attributes an end2end null:
 # "no better prior" vs "HI-SLAM2 cannot feel the difference" (9.2.2).
-PRIOR_PRIORS = END2END_PRIORS          # same arms, so the two tests' directories line up
+# E0: does `scale_cv` (cross-frame scale consistency) predict ATE across EVERY training regime,
+# or only across the offline arms it was first measured on? The existing table is 15 arms, all
+# offline, all scored 2026-08-02..04 - it has never been shown a live or cont adapter. This set
+# spans every style (normal / online / wonline), both drivers (init / cont / live), both inits
+# (stock / warm-start) and the full ATE range 23.5..38.3, so the fit has real leverage.
+#
+# `_a` is defined up in the end2end block, which comes first; each entry is an adapt handoff
+# directory, and its arm directory is INFERRED from the basename (end2end/config.py:arm_name).
+#
+# ---- ALREADY SCORED (E0 batch 1 + E0b batch 2, 27 arms, DONE). Do not re-add: outputs/ is
+#      shared storage, so two hosts scoring the same arm would write one directory twice.
+#      batch 1: 'omnidata', 'vggt_base', normal_r8_e10, wonline_r8_e5, online_r8_e3,
+#        wonline_r8_e3_w10_p10, normal_r8_e20_p10, online_r8_e15_p10, wonline_r8_e20_w10_p6,
+#        normal_r8_e5_p5, cont_normal_e10_pre50_b_base, cont_normal_e5_kf100_b_base,
+#        cont_online_e10_kf10_b_wonline_r8_e20_w10_p6, live_e3_w10_a16_w12_lag3_base,
+#        live_e3_a16_w13_lag3_base, live_e3_a16_w12_lag4_normal_r8_e20_p10,
+#        live_e3_ctx2_a16_w12_lag3_base
+#      batch 2 (p5..p9 operating point): wonline_r8_e10_w10_p7, wonline_e5_w10_p7_lr2,
+#        normal_r8_e30_p7, online_e30_p7, wonline_r8_e10_w10_p6, normal_e20_p6_lr10,
+#        online_e40_p6_lr5, wonline_e10_w10_p9_lr2, normal_r8_e40_p9, wonline_e80_w5_p5
+#
+# ---- E2 BATCH (this list): CV_depth across the live REPETITION sweep.
+# E2 established that raising steps_per_kf moves live ATE 25.951 -> 24.473 (e1 -> e8). Offline,
+# the same lever moved CV_depth 0.1355 -> 0.0174 at p6 (wonline e10 -> e20), and CV_depth is the
+# one metric that discriminates WITHIN a matched family (+0.90/+0.95 at p6/p7). So: does the live
+# sweep show the same mechanism, or does it reach 24.473 some other way?
+#
+# One family, so the comparison is matched: wonline, window 10, alpha 16, warmup/handover 12,
+# lag 3, stock init, no ctx. ONLY steps_per_kf and lr differ. That also lets lr be partly
+# deconfounded - §1.9b flagged it as confounded, because e8 is lr1.2e-4 while e10/e12 are lr1e-4 -
+# since e1 and e3 each appear at BOTH learning rates below.
+#
+# live_e3_w10_a16_w12_lag3_base (e3, lr1e-4, CV_depth 0.1173) is already scored and deliberately
+# omitted; it is the anchor this batch is read against.
+PRIOR_PRIORS = (
+    # -- lr 1.0e-4, rising repetition. priors[0] is the baseline column, so deltas read as
+    #    "vs the least-repetition arm", which is the axis under test.
+    _a('live_e1_w10_a16_w12_lag3_base'),          # e1   kf_vis  2330   25 min   live ATE 25.865
+    _a('live_e5_w10_a16_w12_lag3_base'),          # e5   kf_vis 11550   77 min   live ATE 25.592
+    _a('live_e10_w10_a16_w12_lag3_base'),         # e10  kf_vis 23000  142 min   live ATE 25.367
+    _a('live_e12_w10_a16_w12_lag3_base'),         # e12  kf_vis 27960  173 min   live ATE 25.022
+    # -- lr 1.2e-4. e1 and e3 pair with the lr1e-4 arms above/anchor at the SAME repetition,
+    #    which is the only way to separate lr from steps_per_kf in the existing runs.
+    _a('live_e1_w10_lr1.2_a16_w12_lag3_base'),    # e1   kf_vis  2330   23 min   live ATE 25.951
+    _a('live_e3_w10_a16_w12_lag3_more_chkp_base'),# e3   kf_vis  6990   60 min   live ATE 25.913
+    _a('live_e8_w10_a16_w12_lag3_base'),          # e8   kf_vis 18640  118 min   live ATE 24.473
+                                                  #      THE ONE THAT MATTERS: did CV_depth fall
+                                                  #      toward the 0.0174 the offline p6 winner
+                                                  #      reaches, or is 24.473 reached some other way?
+)
 
 PRIOR = PriorTestConfig(
     priors=PRIOR_PRIORS,
@@ -221,10 +352,11 @@ def main():
         required=[CALIB, CONFIG, DROID_WEIGHTS] + ([GT_TRAJ] if 'end2end' in STAGES else []))
     warn_runtime_undistort(UNDISTORT, CROP_BORDER)
 
-    extract_length = n_frames * FRACTION // 100
+    window = window_frames(n_frames, START, STOP)
+    extract_length = window * FRACTION // 100     # a share of the WINDOW, not the sequence
     if extract_length < 20:
         raise SystemExit(f'{n_frames} frames * {FRACTION}% = {extract_length}, too few to track')
-    split_at = extract_length
+    split_at = START + extract_length     # ABSOLUTE: evo's timestamps are frame numbers
 
     # the arms must run stock tracking, or a denser-keyframe extract would silently mean denser
     # keyframes in the comparison too. Asserted here, the one place both paths are in scope.
@@ -234,7 +366,7 @@ def main():
 
     # both test trees; the arm directories inside them are created by the arms themselves
     for kind in ('end2end', 'prior'):
-        os.makedirs(test_dir(OUT_ROOT, kind, SCENE), exist_ok=True)
+        os.makedirs(test_dir(OUT_ROOT, kind, SCENE_KEY), exist_ok=True)
 
     # here, not in PARAMETERS: deriving reads a frame, which that block must not do. After chdir,
     # so relative COLORS resolves the same however invoked.
@@ -248,7 +380,7 @@ def main():
     print(f'stream    : {stream_hw[1]}x{stream_hw[0]} (aspect '
           f'{stream_hw[1]/stream_hw[0]:.3f})   VGGT input: {LORA.vggt_hw[1]}x{LORA.vggt_hw[0]}'
           f'{" (derived)" if VGGT_HW is None else " (pinned by VGGT_HW)"}')
-    print(f'adapter   : trains on frames 0..{extract_length-1} ({FRACTION}%), '
+    print(f'adapter   : trains on frames {START}..{split_at-1} ({FRACTION}% of the window), '
           f'evaluated on 0..{n_frames-1}')
     print(f'target    : {DEPTH_DIR}/   split at frame {split_at}')
     print(f'stages    : {" ".join(STAGES)}   render_eval {RENDER_EVAL}')

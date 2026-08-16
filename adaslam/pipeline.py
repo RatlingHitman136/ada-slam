@@ -23,6 +23,38 @@ def enter(root):
     os.chdir(root)
 
 
+def scene_key(scene, start, stop):
+    """The outputs/ directory name for a run over [start, stop) - `scene` when that is everything.
+
+    A WINDOWED run needs a tree of its own, and the reason is naming: end2end/config.py:arm_name
+    maps 'omnidata' to `omni` whatever the window, so a windowed baseline would overwrite the
+    full-sequence one and there would be nothing left to compare either against. Keying the scene
+    instead gives the window its own omni/base - SKIP_EXISTING fills them on first use - and makes
+    a cross-window table impossible, since the export takes exactly one -s.
+
+    Pure string and integer work, no disk: a PARAMETERS block calls this beside its path globals,
+    which run before main()'s chdir and again in every spawned child (9.5 rule 3).
+    """
+    return scene if (start == 0 and stop is None) else f'{scene}_f{start}-{stop}'
+
+
+def window_frames(n_frames, start, stop):
+    """How many frames [start, stop) actually holds, checked against the sequence.
+
+    Refused rather than clipped: a window running past the end means the driver and the dataset
+    disagree about which experiment this is, and Python's slice would silently shorten it.
+    """
+    end = n_frames if stop is None else stop
+    if start >= n_frames:
+        raise SystemExit(f'START={start} is at or past the end of a {n_frames}-frame sequence')
+    if end > n_frames:
+        raise SystemExit(f'STOP={stop} runs past the end of a {n_frames}-frame sequence; the '
+                         f'window is half-open, so the largest STOP is {n_frames} (or None)')
+    if end <= start:
+        raise SystemExit(f'the window [{start}, {end}) is empty')
+    return end - start
+
+
 def check_sequence(colors, depths=None, gt_traj=None, required=()):
     """Every `required` path exists and the sequence is self-consistent. Returns the frame count.
 

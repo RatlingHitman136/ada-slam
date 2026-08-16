@@ -44,7 +44,7 @@ from adaslam.common import (ADAPT_CKPT_SUBDIR, DEPTH_DIR, experiment_dir, extrac
 from adaslam.end2end import End2EndConfig, run_end2end_test
 from adaslam.extract import ExtractConfig, run_extract
 from adaslam.pipeline import (check_sequence, enter, print_arm_dirs, resolve_lora,
-                              warn_runtime_undistort)
+                              scene_key, warn_runtime_undistort, window_frames)
 from adaslam.priortest import PriorTestConfig, run_prior_test
 from adaslam.runtime import ensure_venv_on_path, gpu_gate, raise_fd_limit
 from adaslam.slam import SlamConfig, SlamRunner
@@ -77,6 +77,16 @@ MIN_FREE_VRAM_MB = 7000                # shared GPU: checked once at the start o
 EXTRACT_LENGTH   = 100000              # frames to extract over; 100000 = the WHOLE sequence,
                                        # which is the point of this driver
 START            = 0
+STOP             = None                # exclusive: the window is [START, STOP), so (200, 2647) is
+                                       # frames 200..2646 and (0, None) is the whole sequence.
+                                       # A WINDOWED run gets its own outputs/ tree - see SCENE_KEY.
+
+# WHERE A WINDOWED RUN'S OUTPUTS GO. end2end/config.py:arm_name maps 'omnidata' to `omni` whatever
+# the window, so a windowed baseline would overwrite the full-sequence one and leave nothing to
+# compare either against. The window therefore keys the SCENE directory instead: the full sequence
+# keeps SCENE, anything else becomes SCENE_f<START>-<STOP> with its own omni/base, which
+# SKIP_EXISTING fills on first use. Pure string work, so it belongs in this block (9.5 rule 3).
+SCENE_KEY = scene_key(SCENE, START, STOP)
 STREAM_RES       = 341 * 640           # tracking resolution budget
 DEPTH_PNG_SCALE  = 256.0               # metres = px / this. MUST match the dataset: 6553.5
                                        # (TUM/Replica) saturates at 10 m, 256 at 256 m
@@ -94,23 +104,23 @@ ADAPT_NAME   = 'cont_normal_e25_pre25_b_base'
 # ---------------------------------------------------------------- stage I/O
 # A stage RECEIVES its paths and reads no path global, so it can be pointed at another run's
 # results. Pure string joins - this block must not touch the disk.
-OUT_EXTRACT  = experiment_dir(OUT_ROOT, 'extract', SCENE, EXTRACT_NAME)
+OUT_EXTRACT  = experiment_dir(OUT_ROOT, 'extract', SCENE_KEY, EXTRACT_NAME)
 
 ADAPT_IN     = OUT_EXTRACT                              # an extract export
 ADAPT_IMAGES = COLORS                                   # keyframe RGB, indexed by frame number
-ADAPT_OUT    = experiment_dir(OUT_ROOT, 'adapt', SCENE, ADAPT_NAME)
+ADAPT_OUT    = experiment_dir(OUT_ROOT, 'adapt', SCENE_KEY, ADAPT_NAME)
 ADAPT_CKPT   = f'{ADAPT_OUT}/{ADAPT_CKPT_SUBDIR}'       # epoch_NNN/; cadence is checkpoint_every
 
 # WHICH ADAPTER THIS RUN STARTS FROM. None = stock VGGT-1B ("base"); otherwise the name of an
 # adapt experiment in this SCENE, i.e. the same vocabulary an END2END_PRIORS entry uses, so
 # continuing from a run and testing it are spelled alike. A checkpoint works too:
-#   f'{experiment_dir(OUT_ROOT, "adapt", SCENE, "x")}/{ADAPT_CKPT_SUBDIR}/epoch_005'
+#   f'{experiment_dir(OUT_ROOT, "adapt", SCENE_KEY, "x")}/{ADAPT_CKPT_SUBDIR}/epoch_005'
 ADAPT_INIT_NAME = None
 ADAPT_INIT = None if ADAPT_INIT_NAME is None else \
-    experiment_dir(OUT_ROOT, 'adapt', SCENE, ADAPT_INIT_NAME)
+    experiment_dir(OUT_ROOT, 'adapt', SCENE_KEY, ADAPT_INIT_NAME)
 
-OUT_END2END  = test_dir(OUT_ROOT, 'end2end', SCENE)     # one subdirectory per prior generator
-OUT_PRIOR    = test_dir(OUT_ROOT, 'prior', SCENE)       # same arm names, scored without SLAM
+OUT_END2END  = test_dir(OUT_ROOT, 'end2end', SCENE_KEY)     # one subdirectory per prior generator
+OUT_PRIOR    = test_dir(OUT_ROOT, 'prior', SCENE_KEY)       # same arm names, scored without SLAM
 
 # VGGT's input size; an adapter's own recorded size wins over this. Derived in main(), not here -
 # this block must not touch the disk (9.3).
@@ -119,7 +129,7 @@ VGGT_HW          = None                # None = derive | (378, 518) TUM | (294, 
 # ---------------------------------------------------------------- the SLAM runs
 # What every invocation shares; what differs per run is an argument to SlamRunner.run() instead.
 SLAM = SlamConfig(
-    weights=DROID_WEIGHTS, colors=COLORS, calib=CALIB, start=START,
+    weights=DROID_WEIGHTS, colors=COLORS, calib=CALIB, start=START, stop=STOP,
     undistort=UNDISTORT, crop_border=CROP_BORDER, stream_res=STREAM_RES,
     render_eval=RENDER_EVAL)
 
@@ -190,7 +200,7 @@ ADAPT = AdaptConfig(
 #   'omnidata' -> .../omni | 'vggt_base' -> .../base | ADAPT_OUT -> .../<ADAPT_NAME> |
 #   f'{ADAPT_CKPT}/epoch_005' -> .../<ADAPT_NAME>_chkp_005
 # That is what makes an arm reusable. priors[0] is the baseline column.
-END2END_PRIORS = ('omnidata', 'vggt_base', ADAPT_OUT, experiment_dir(OUT_ROOT, 'adapt', SCENE, 'live_e3_w10_a16_w12_lag3_base'))
+END2END_PRIORS = ('omnidata', 'vggt_base', ADAPT_OUT, experiment_dir(OUT_ROOT, 'adapt', SCENE_KEY, 'live_e3_w10_a16_w12_lag3_base'))
 
 # The seen/unseen boundary. None = the whole sequence, i.e. everything counts as "seen" and the
 # [unseen] table is empty - the honest default here, because an equidistant selection puts
@@ -249,8 +259,12 @@ def main():
         required=[CALIB, CONFIG, DROID_WEIGHTS] + ([GT_TRAJ] if 'end2end' in STAGES else []))
     warn_runtime_undistort(UNDISTORT, CROP_BORDER)
 
-    extract_length = min(EXTRACT_LENGTH, n_frames)
-    split_at = n_frames if SPLIT_AT is None else SPLIT_AT
+    window = window_frames(n_frames, START, STOP)
+    extract_length = min(EXTRACT_LENGTH, window)
+    # None = the whole RUN, which under a window is its end, not the sequence's - a split_at
+    # naming a frame the run never reached would put every pose in [seen] and none in
+    # [unseen] while claiming a boundary that does not exist
+    split_at = (START + window) if SPLIT_AT is None else SPLIT_AT
 
     # the arms must run stock tracking, and so must the extract here - but they still read
     # different files, and the arms must never be handed the generated one
@@ -260,7 +274,7 @@ def main():
 
     # both test trees; the arm directories inside them are created by the arms themselves
     for kind in ('end2end', 'prior'):
-        os.makedirs(test_dir(OUT_ROOT, kind, SCENE), exist_ok=True)
+        os.makedirs(test_dir(OUT_ROOT, kind, SCENE_KEY), exist_ok=True)
 
     # here, not in PARAMETERS: deriving reads a frame, which that block must not do. After chdir,
     # so relative COLORS resolves the same however invoked.
@@ -274,13 +288,14 @@ def main():
     print(f'stream    : {stream_hw[1]}x{stream_hw[0]} (aspect '
           f'{stream_hw[1]/stream_hw[0]:.3f})   VGGT input: {LORA.vggt_hw[1]}x{LORA.vggt_hw[0]}'
           f'{" (derived)" if VGGT_HW is None else " (pinned by VGGT_HW)"}')
-    print(f'extract   : frames 0..{extract_length-1} of {n_frames}')
+    print(f'extract   : frames {START}..{START+extract_length-1} of {n_frames}'
+          + (f'   WINDOW -> outputs tree {SCENE_KEY}' if SCENE_KEY != SCENE else ''))
     print(f'adapter   : trains on {KF_FRACTION:.0%} of those keyframes, equidistant; val is the '
           f'rest')
     print(f'            starts from '
           f'{ADAPT_INIT if ADAPT_INIT else "stock VGGT-1B (no adapter)"}')
     print(f'target    : {DEPTH_DIR}/   split at frame {split_at}'
-          f'{" (= whole sequence, so [unseen] is empty)" if SPLIT_AT is None else ""}')
+          f'{" (= the whole run, so [unseen] is empty)" if SPLIT_AT is None else ""}')
     print(f'stages    : {" ".join(STAGES)}   render_eval {RENDER_EVAL}')
     print(f'outputs   : {OUT_EXTRACT}')
     print(f'            {ADAPT_OUT}')

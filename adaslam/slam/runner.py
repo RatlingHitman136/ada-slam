@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 from ..runtime import free_vram
 
-from .stream import mono_stream
+from .stream import mono_stream, window_files
 
 # Every attribute Hi2 reads off its args namespace. Asserted, not trusted: a future Hi2 that reads
 # one more fails here instead of silently seeing whatever the SimpleNamespace carried.
@@ -42,9 +42,11 @@ def save_trajectory(hi2, traj_full, cfg, out):
     poses_wc = lietorch.SE3(hi2.video.poses[:t]).inv().data
     np.save(f'{out}/intrinsics.npy', hi2.video.intrinsics[0].cpu().numpy() * 8)
 
-    # the timestamp is the number in the filename, so %06d names make timestamps frame indices
+    # the timestamp is the number in the filename, so %06d names make timestamps frame indices -
+    # ABSOLUTE ones, whatever the window, which is what makes a windowed run's trajectory line up
+    # with GT, with evo's timestamps.npy and with adapt/data.py's pose dict
     tstamps_full = np.array([float(re.findall(r'[+]?(?:\d*\.\d+|\d+)', x)[-1])
-                             for x in sorted(os.listdir(cfg.colors))[cfg.start:]])[..., np.newaxis]
+                             for x in window_files(cfg)])[..., np.newaxis]
     tstamps_kf = tstamps_full[tstamps.cpu().numpy().astype(int)]
     np.savetxt(f'{out}/traj_kf.txt',
                np.concatenate([tstamps_kf, poses_wc.cpu().numpy()], axis=1))
@@ -88,7 +90,9 @@ class SlamRunner:
             reader = Process(target=mono_stream, args=(queue, cfg, length))
             reader.start()
 
-            n_frames = len(os.listdir(cfg.colors))
+            # the WINDOW, not the directory: len(os.listdir(colors)) over-reports the moment start
+            # or stop is set, and this number sizes the progress bar and SlamResult.n_frames
+            n_frames = min(len(window_files(cfg)), length)
             args = types.SimpleNamespace(
                 weights=cfg.weights, config=config, output=out, gtdepthdir=gtdepthdir,
                 buffer=min(1000, n_frames // 10 + 150) if buffer is None else buffer,
@@ -96,7 +100,7 @@ class SlamRunner:
                 render_eval=cfg.render_eval)
 
             hi2 = None
-            pbar = tqdm(range(min(n_frames, length)), desc='Processing keyframes')
+            pbar = tqdm(range(n_frames), desc='Processing keyframes')
             while True:
                 t, image, intrinsics, is_last = queue.get()
                 pbar.update()
@@ -123,4 +127,4 @@ class SlamRunner:
 
         del queue, reader
         free_vram()
-        return SlamResult(out=out, n_kf=n_kf, n_frames=min(n_frames, length))
+        return SlamResult(out=out, n_kf=n_kf, n_frames=n_frames)

@@ -52,7 +52,8 @@ from adaslam.end2end.config import OMNIDATA, OMNIDATA_DENSE, arm_name
 from adaslam.end2end.metrics import RESULTS, evaluate
 from adaslam.end2end.report import compare, print_report
 from adaslam.end2end.stage import make_prior
-from adaslam.pipeline import check_sequence, enter, resolve_lora, warn_runtime_undistort
+from adaslam.pipeline import (check_sequence, enter, resolve_lora, scene_key,
+                              warn_runtime_undistort, window_frames)
 from adaslam.print_utils import banner
 from adaslam.runtime import ensure_venv_on_path, gpu_gate, raise_fd_limit
 from adaslam.slam import SlamConfig, SlamRunner, write_tracking_config
@@ -100,6 +101,16 @@ KF_COVIS_THRESH     = 0.1       # backend.covis_thresh - extras inserted in term
 # ---------------------------------------------------------------- run control
 LENGTH           = 100000       # frames to run over; 100000 = the whole sequence
 START            = 0
+STOP             = None            # exclusive: the window is [START, STOP), so (200, 2647) is
+                                       # frames 200..2646 and (0, None) is the whole sequence.
+                                       # A WINDOWED run gets its own outputs/ tree - see SCENE_KEY.
+
+# WHERE A WINDOWED RUN'S OUTPUTS GO. end2end/config.py:arm_name maps 'omnidata' to `omni` whatever
+# the window, so a windowed baseline would overwrite the full-sequence one and leave nothing to
+# compare either against. The window therefore keys the SCENE directory instead: the full sequence
+# keeps SCENE, anything else becomes SCENE_f<START>-<STOP> with its own omni/base, which
+# SKIP_EXISTING fills on first use. Pure string work, so it belongs in this block (9.5 rule 3).
+SCENE_KEY = scene_key(SCENE, START, STOP)
 STREAM_RES       = 341 * 640    # tracking resolution budget - must match every other arm
 BUFFER           = 900          # NO overflow guard in SlamRunner.run (only run_extract warns).
                                 # dense_kf_p40 gave 226 keyframes over 1138 frames, so the whole
@@ -121,7 +132,7 @@ VGGT_HW = None
 
 # ---------------------------------------------------------------- the SLAM run
 SLAM = SlamConfig(
-    weights=DROID_WEIGHTS, colors=COLORS, calib=CALIB, start=START,
+    weights=DROID_WEIGHTS, colors=COLORS, calib=CALIB, start=START, stop=STOP,
     undistort=UNDISTORT, crop_border=CROP_BORDER, stream_res=STREAM_RES,
     render_eval=RENDER_EVAL)
 
@@ -174,10 +185,14 @@ def main():
     banner(f'dense-keyframing control arm  ({DENSE_SPEC})')
     n_frames = check_sequence(COLORS, gt_traj=GT_TRAJ, required=(CONFIG, CALIB, DROID_WEIGHTS))
     warn_runtime_undistort(UNDISTORT, CROP_BORDER)
-    length = min(LENGTH, n_frames)
-    split_at = n_frames if SPLIT_AT is None else SPLIT_AT
+    window = window_frames(n_frames, START, STOP)
+    length = min(LENGTH, window)
+    # None = the whole RUN, which under a window is its end, not the sequence's - a split_at
+    # naming a frame the run never reached would put every pose in [seen] and none in
+    # [unseen] while claiming a boundary that does not exist
+    split_at = (START + window) if SPLIT_AT is None else SPLIT_AT
 
-    out_root = test_dir(OUT_ROOT, 'end2end', SCENE)
+    out_root = test_dir(OUT_ROOT, 'end2end', SCENE_KEY)
     out = f'{out_root}/{arm_name(DENSE_SPEC)}'
     base_res = baseline_results(out_root, split_at)
 
@@ -191,7 +206,8 @@ def main():
           f'{base_res.get("n_all")} poses, split_at {split_at}')
     print(f'density   : motion {KF_MOTION_THRESH} / init {KF_INIT_THRESH} / redundant '
           f'{KF_REDUNDANT_THRESH} / covis {KF_COVIS_THRESH}  (stock: 2.4 / 4.0 / 4.0 / 0.2)')
-    print(f'run       : frames 0..{length-1}, buffer {BUFFER}')
+    print(f'run       : frames {START}..{START+length-1} of {n_frames}, buffer {BUFFER}'
+          + (f'   WINDOW -> outputs tree {SCENE_KEY}' if SCENE_KEY != SCENE else ''))
 
     if SKIP_EXISTING and os.path.exists(f'{out}/traj_full.txt'):
         print(f'\n{out}/traj_full.txt exists - reusing the SLAM run, re-scoring at '

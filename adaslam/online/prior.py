@@ -29,7 +29,8 @@ from .trainer import LiveTrainer
 class OnlineVggtPrior(VggtPrior):
     """VGGT adapted live on the SLAM depth of the run it is serving."""
 
-    def __init__(self, cfg, online_cfg, adapter=None, stream_hw=None, ckpt_dir=None, record=None):
+    def __init__(self, cfg, online_cfg, adapter=None, stream_hw=None, ckpt_dir=None, record=None,
+                 frame_offset=0):
         # Seed BEFORE super(), which builds the model: LoRALinear.A is kaiming-initialised when
         # LoRA is injected, so seeding afterwards is too late and the run is not reproducible
         # (9.5). The parent has no seed argument because an arm only ever runs a frozen adapter.
@@ -49,7 +50,10 @@ class OnlineVggtPrior(VggtPrior):
             torch.set_rng_state(rng_cpu)
             torch.cuda.set_rng_state_all(rng_cuda)
         self.online = online_cfg
-        self.trainer = LiveTrainer(self.model, online_cfg, ckpt_dir=ckpt_dir, record=record)
+        # frame_offset is SlamConfig.start: video.tstamp is run-relative, everything the trainer
+        # records must be absolute (trainer.py:frame)
+        self.trainer = LiveTrainer(self.model, online_cfg, ckpt_dir=ckpt_dir, record=record,
+                                   frame_offset=frame_offset)
 
         # CAPTURED HERE, NOT AT CALL TIME. SlamRunner.run overwrites
         # MotionFilter.prior_extractor with ours (runner.py:81-83) before the first frame, so
@@ -107,7 +111,7 @@ class OnlineVggtPrior(VggtPrior):
             # one frame index that separates fallback-served tracking from VGGT-served tracking,
             # so it is the split any later re-scoring would want (12.3).
             if trainer.warmup_end_frame is None and n:
-                trainer.warmup_end_frame = int(video.tstamp[n - 1].item()) + 1
+                trainer.warmup_end_frame = trainer.frame(video, n - 1) + 1
                 print(f'  [online] handover at keyframe {n}, frame '
                       f'{trainer.warmup_end_frame}: VGGT is the depth prior from here')
             return vggt_fn(mf, im_tensor)

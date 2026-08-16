@@ -328,7 +328,7 @@ Vendored DPT/MiDaS code, used **only** for inference of the Omnidata checkpoints
 | `online_adapt_pipeline.py` | **The single-stage driver** — §13. No extract and no frozen second pass: ONE SLAM run whose depth prior LoRA-adapts on each keyframe local BA settles, then the reference arms and one comparison table. Same PARAMETERS-block shape as the two above; the stage is `adaslam/online/`. |
 | `export_end2end_results.py` | **One scene's end2end arms as a CSV**, for a Notion database — §12. `-n <name> -s <scene> [--init\|--cont\|--live]` → `outputs/<name>.csv`. Read-only over `outputs/`: it joins each arm's `results.json` to the adapt `config.json` behind it and the extract that trained it, and decomposes the un-sortable experiment name into columns. One kind per run, `--init` by default; each driver gets its own column set and its own Notion database, and which arms belong to which is read off the experiment-name prefix (`live*`, `cont*`). Its computed numbers are `adapt_cost`, `train_pct` / `train_span_pct` and the `--cont` table's `regime`. |
 | `ate_over_time.py` | **Where in the sequence an arm's ATE lives** — §12.3. `-s <scene> <arm> [<arm> …]` prints the per-pose APE evo already saved, one row per frame (`--keyframes` / `--bins N` for the other two granularities, `--csv` to dump). Read-only, no GPU, nothing recomputed. Its docstring is the how-to-read-it, and it is needed: the value is a residual after one *global* Sim(3) fit, so it neither starts at zero nor rises monotonically. |
-| `plot_trajectories.py` | **Where in *space* it lives** — §12.4. `-s <scene> -o <name> <arm> …` draws the estimated paths from above into `outputs/plots/<name>.png`, every pose coloured green→red by its APE on one scale shared by the whole image. Read-only, no GPU: it applies the Sim(3) evo already saved (`evo/alignment_transformation_sim3.npy`) to `traj_full.txt` and colours by `evo/error_array.npy`. |
+| `plot_trajectories.py` | **Where in *space* it lives** — §12.4. `-s <scene> -o <name> <arm> …` draws the estimated paths from above into `outputs/plots/<name>.png`, every pose coloured green→red by its APE on one scale shared by the whole image. Read-only, no GPU: it applies the Sim(3) evo already saved (`evo/alignment_transformation_sim3.npy`) to `traj_full.txt` and colours by `evo/error_array.npy`. `--align start` refits that transform on the first N poses through evo's own aligner instead, which is how scale drift is read — see §12.4. |
 
 The VGGT track adds five more — see §9 and §12: **two drivers**, `init_adapt_pipeline.py` and
 `cont_adapt_pipeline.py` (extract → adapt → end2end comparison, differing only in *which*
@@ -1269,15 +1269,54 @@ python scripts/plot_trajectories.py -s rellis_00000 -o omni_vs_lora omni base no
 → `outputs/plots/omni_vs_lora.png`. A column of 2847 residuals cannot show that a run cut a
 corner or wandered while the rig was parked; the path can.
 
-**Nothing is recomputed.** `evo/` already holds both halves — `error_array.npy` is the per-pose
-APE and `alignment_transformation_sim3.npy` is the 4×4 Sim(3) `evo_ape -vas` fitted, scale baked
-into the rotation block. Applying the second to `traj_full.txt`'s translations puts the estimate
-in GT coordinates, and the residual there **equals the first to ~6e-14** — so geometry and colour
-come from one transform, the same one `results.json:ate_all` was measured under. The script
+**By default nothing is recomputed.** `evo/` already holds both halves — `error_array.npy` is the
+per-pose APE and `alignment_transformation_sim3.npy` is the 4×4 Sim(3) `evo_ape -vas` fitted, scale
+baked into the rotation block. Applying the second to `traj_full.txt`'s translations puts the
+estimate in GT coordinates, and the residual there **equals the first to ~6e-14** — so geometry and
+colour come from one transform, the same one `results.json:ate_all` was measured under. The script
 checks that identity per arm and refuses to draw if it exceeds 1e-6, because a stale `evo/`
-beside a re-run `traj_full.txt` would still produce a plausible picture. `metrics.py` grew
-`load_alignment` and `gt_traj_of` for it, beside `load_ape`, so the `evo/` layout stays defined
-once; `arm_dir` + `no_such_arm` moved there from `ate_over_time.py` for the same reason.
+beside a re-run `traj_full.txt` would still produce a plausible picture (the check runs under
+`--align start` too — `frames` comes out of that same `evo/` whichever transform is drawn).
+`metrics.py` grew `load_alignment` and `gt_traj_of` for it, beside `load_ape`, so the `evo/` layout
+stays defined once; `arm_dir` + `no_such_arm` moved there from `ate_over_time.py` for the same
+reason.
+
+#### The paths do not lie on GT, and that is the result — `--align`
+
+On `rellis_00000` no arm's path touches GT anywhere, **not even at frame 0** (`omni`'s first pose
+is 37.6 m out). The alignment is not at fault, and this was checked rather than assumed:
+rebuilding it with evo's own `PosePath3D.align(ref, correct_scale=True)` reproduces the saved
+matrix **bit-for-bit**, and an independent Umeyama agrees on the scale (11.708680), the RMSE
+(31.278976) and the rotation (0°). `evo_traj` would return the same transform.
+
+What defeats it is that **the estimate's scale is not constant along the sequence**. In GT metres
+per tracker unit, over blocks of 300 frames, `omni` runs 6.26 → 8.18 → 14.24 → 28.55 → 36.88 —
+monotone, and **present in `traj_kf.txt` itself** (5.80 → 47.52), so it is the tracker's, not the
+trajectory filler's. GT covers 332.2 m; the estimate covers 25.4 units, which is 159 m at its own
+initial scale. A Sim(3) has **one** scale, so evo picks the compromise 11.71 and every pose is
+wrong by the difference. It is the cross-frame scale inconsistency this track targets (§9.7) seen
+in the trajectory instead of in a depth L1 column — and it is scene-specific, which is the check
+that it is real: first tenth vs last tenth of the poses reads **6.9× on rellis_00000** (`base`
+4.2×, `wonline_r8_e20_w10_p6` 5.6×) and **1.04× on the TUM scene**, whose paths do overlay.
+
+So the summary prints `scale` and `drift` per arm and says the above out loud above 1.5×, and
+`--align` chooses the transform:
+
+| | |
+|---|---|
+| `--align evo` *(default)* | the saved Sim(3) — the picture stays the one `ate_all` was measured under |
+| `--align start [-n N]` | a fresh Sim(3) on the first N drawn poses (default 10%, floor 10) |
+
+`start` is fitted through evo's **own** aligner — `PosePath3D.align(…, n=N)`, i.e. `evo_traj
+--align --correct_scale --n_to_align N` called as a library, never a hand-rolled Umeyama — and at
+`n=-1` it returns `alignment_transformation_sim3.npy` to the last bit, which is what says the two
+modes are the same machinery. It makes the paths **leave the same point together** so the drift
+reads as divergence: on rellis the first pose lands within 0.02 m and the last 152 m short, and
+the estimate visibly covers a third of the GT loop. It also **recomputes the colour** — APE under a
+different alignment is a different number — so the label under each arm switches from `ATE 31.28 m`
+to `start284 RMSE 78.87 m`, the colourbar and title name the alignment, and the console keeps both
+columns so the gap between them stays readable. On TUM the same view reads 0.068 vs an ATE of
+0.062 and the paths overlay along their whole length; that scene is the control for the machinery.
 
 Three things decided by the data rather than typed:
 
@@ -1294,7 +1333,8 @@ Three things decided by the data rather than typed:
   centimetre-long segments and a linestyle on it renders solid.
 
 **Reading it.** The same three caveats as §12.3 apply, and one more that only the picture raises:
-**each arm carries its own Sim(3)**, so two paths here are each individually best-fitted to GT.
+**each arm carries its own Sim(3)** (its own *refit*, under `--align start`), so two paths here are
+each individually best-fitted to GT.
 That is what makes their *shapes* comparable and their absolute offsets not. Green is not
 "correct" either — the ramp spans the arms you asked for, and the best pose of the best arm on
 rellis_00000 still sits 1.9 m from GT. A stretch that reddens while the path barely moves is

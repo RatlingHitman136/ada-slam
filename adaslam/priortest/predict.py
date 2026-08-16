@@ -20,18 +20,29 @@ _SPEC_PREFIX = '# eval_spec '
 
 
 def frame_paths(slam_cfg):
-    """Every colour frame the tracker would stream, in order. idx is the position in this list."""
-    files = sorted(os.listdir(slam_cfg.colors))[slam_cfg.start:]
+    """Every colour frame the tracker would stream, in order. idx is the position in this list.
+
+    The tracker's WINDOW, [start, stop) - the same slice mono_stream takes, so a windowed run is
+    scored on the frames it actually tracked and no others.
+    """
+    files = sorted(os.listdir(slam_cfg.colors))[slam_cfg.start:slam_cfg.stop]
     return [os.path.join(slam_cfg.colors, f) for f in files]
 
 
-def gt_paths(cfg, n_frames):
-    """GT depth by frame index. Every consumer in the repo indexes it this way (10.1)."""
+def gt_paths(cfg, slam_cfg, n_frames):
+    """GT depth for those same frames. Every consumer indexes it by frame number (10.1).
+
+    Sliced by the SAME window as frame_paths, which is the whole point: taking files[:n_frames]
+    from index 0 instead would pair colour frame start+i with GT depth i - invisible at start=0
+    and silently wrong at any other start.
+    """
     files = sorted(os.listdir(cfg.gt_depths))
-    if len(files) < n_frames:
-        raise SystemExit(f'{cfg.gt_depths} has {len(files)} depths but the stream has {n_frames} '
-                         f'frames; they must be 1:1 by index. Re-run scripts/preprocess_tum.py.')
-    return [os.path.join(cfg.gt_depths, f) for f in files[:n_frames]]
+    if len(files) < slam_cfg.start + n_frames:
+        raise SystemExit(f'{cfg.gt_depths} has {len(files)} depths but the stream needs frames '
+                         f'{slam_cfg.start}..{slam_cfg.start + n_frames - 1}; they must be 1:1 by '
+                         f'index with {slam_cfg.colors}. Re-run the dataset preprocess script.')
+    window = files[slam_cfg.start:slam_cfg.stop]
+    return [os.path.join(cfg.gt_depths, f) for f in window[:n_frames]]
 
 
 def read_cached(path, spec):
@@ -63,7 +74,7 @@ def build_rows(slam_cfg, cfg, prior, label):
     ratio of two numbers measured on identical pixels.
     """
     paths = frame_paths(slam_cfg)
-    gts = gt_paths(cfg, len(paths))
+    gts = gt_paths(cfg, slam_cfg, len(paths))
     rng = np.random.default_rng(cfg.seed)
     probe = PriorProbe(slam_cfg, prior)
     rows, samples, skipped = [], [], 0

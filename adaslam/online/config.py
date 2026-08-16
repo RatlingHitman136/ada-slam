@@ -13,6 +13,12 @@ ONLINE_STYLES = ('online', 'wonline')
 WARMUP_PRIORS = ('omnidata',   # upstream's own prior - a genuinely different model
                  'self')       # the same VGGT this run adapts, frozen until handover_kf
 
+# What the loss gate thresholds are read against. 'rel' is loss / median target depth
+# (adapt/losses.py:relative_loss); 'raw' is the depth loss as depth_loss returns it, in the
+# tracker's own units. 'raw' is offered because it is the obvious thing to try, not because it is
+# the sounder one - see gate_metric below.
+GATE_METRICS = ('rel', 'raw')
+
 
 @dataclass(frozen=True)
 class OnlineConfig:
@@ -69,6 +75,27 @@ class OnlineConfig:
     mask_min_count: int          # min agreeing neighbours out of 6
     mask_min_disp_ratio: float   # drop pixels below this fraction of the frame's mean disparity
 
+    # ---------------------------------------------------------------- the loss gate
+    # SKIP an arrival whose newest keyframe already fits, or whose target is broken. Both bounds
+    # are on the RELATIVE loss (adapt/losses.py:relative_loss), never the raw one: the raw loss
+    # carries the tracker's shrinking depth unit, so a raw threshold silently becomes an
+    # early-stopping schedule instead of a fit test.
+    #
+    # An UPPER bound is the half the evidence supports. The catastrophic units in a run are its
+    # HIGHEST-loss ones - rellis_00000 `more_chkp` carries two at 490x and 1902x the median
+    # relative loss, and the ATE degrades 24.704 -> 27.013 across exactly the interval containing
+    # them. A gate with only a floor would train on those PREFERENTIALLY, which is backwards.
+    # Reference distribution for that scene: median 0.023-0.029, p90 0.044-0.050, p98 0.056.
+    gate_metric: str             # 'rel' | 'raw' - which quantity the two bounds are read against.
+                                 # BOTH are always measured and logged; this only picks the one
+                                 # that decides. Their scales are NOT interchangeable, so the
+                                 # thresholds must be re-derived when this changes:
+                                 #   rel  median 0.023-0.029, p98 ~0.056, outliers 0.9-55
+                                 #   raw  median 0.015-0.026, p98 ~0.083, outliers 0.56-11
+                                 # measured over five live runs on rellis_00000.
+    gate_lo: float               # 0 = off; skip below this. Already-fit frames.
+    gate_hi: float               # 0 = off; skip above this. Broken/degenerate targets.
+
     # ---------------------------------------------------------------- output
     checkpoint_every_kf: int     # 0 = off; N = a full loadable adapter dir every N adapted units
 
@@ -100,3 +127,12 @@ class OnlineConfig:
         if self.checkpoint_every_kf < 0:
             raise ValueError(f'checkpoint_every_kf={self.checkpoint_every_kf} must be >= 0 '
                              f'(0 = off)')
+        if self.gate_metric not in GATE_METRICS:
+            raise ValueError(f'gate_metric={self.gate_metric!r} is not one of {GATE_METRICS}')
+        for name in ('gate_lo', 'gate_hi'):
+            if getattr(self, name) < 0:
+                raise ValueError(f'{name}={getattr(self, name)} must be >= 0 (0 = off)')
+        if 0 < self.gate_hi <= self.gate_lo:
+            raise ValueError(f'gate_hi={self.gate_hi} must exceed gate_lo={self.gate_lo}: with '
+                             f'both set the gate keeps the BAND between them, so this would skip '
+                             f'every arrival and no optimiser step would ever run')

@@ -41,14 +41,29 @@ def load_frame(cfg, path, calib, K):
     return image, intrinsics
 
 
+def window_files(cfg):
+    """The colour filenames inside cfg's [start, stop) window, sorted.
+
+    ONE definition, because three callers need it and a disagreement would be invisible:
+    mono_stream streams this list, save_trajectory turns it into timestamps, and SlamRunner.run
+    sizes the progress bar by it. Note what it is NOT - the whole directory:
+    len(os.listdir(colors)) over-reports the moment start or stop is set.
+    """
+    return sorted(os.listdir(cfg.colors))[cfg.start:cfg.stop]
+
+
 def mono_stream(queue, cfg, length):
-    """Push (t, image, intrinsics, is_last) for `length` frames from cfg.start onwards.
+    """Push (t, image, intrinsics, is_last) for the first `length` frames of cfg's window.
 
     `t` is the index within this run, not the frame number, and it is what Hi2 stores as the
     keyframe timestamp - save_trajectory maps it back through the filename list.
+
+    Two slices, not one: [start:stop] is the experiment's WINDOW and `length` caps how much of it
+    this particular call consumes (the extract stage runs a prefix, the arms run all of it). Doing
+    it as [start : start + length] instead would make `length` silently override `stop`.
     """
     calib, K = load_calib(cfg)
-    image_list = sorted(os.listdir(cfg.colors))[cfg.start:cfg.start + length]
+    image_list = window_files(cfg)[:length]
 
     for t, imfile in enumerate(image_list):
         image, intrinsics = load_frame(cfg, os.path.join(cfg.colors, imfile), calib, K)

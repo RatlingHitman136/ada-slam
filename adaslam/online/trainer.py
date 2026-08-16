@@ -13,7 +13,7 @@ import time
 import numpy as np
 import torch
 
-from ..adapt.losses import depth_loss, pose_loss
+from ..adapt.losses import depth_loss, pose_loss, relative_loss
 from ..adapt.trainer import batches_of
 
 from .target import LiveSampler, unit_keyframes
@@ -26,8 +26,15 @@ class LiveTrainer:
     whole run's configuration, which this class does not know.
     """
 
-    def __init__(self, lora, cfg, ckpt_dir=None, record=None):
+    def __init__(self, lora, cfg, ckpt_dir=None, record=None, frame_offset=0):
         self.lora, self.cfg = lora, cfg
+        # SlamConfig.start, handed down by the stage rather than mirrored into OnlineConfig - there
+        # is then one source for it and nothing to keep in sync. It matters because video.tstamp is
+        # the index WITHIN the run (mono_stream yields t = 0..len-1) while traj_full.txt, GT and
+        # evo/timestamps.npy are all absolute frame numbers. Every index this class records goes
+        # through frame() so the two agree; at start=0 they coincide, which is why they could
+        # disagree unnoticed until a window was runnable.
+        self.frame_offset = int(frame_offset)
         self.sampler = LiveSampler(cfg, lora.cfg.vggt_hw)
         self.trainable = lora.trainable_parameters()
         self.opt = torch.optim.AdamW(self.trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -42,7 +49,17 @@ class LiveTrainer:
         self.last_tstamp = None    # the target's FRAME index, so a pruned-and-refilled keyframe
                                    # slot is not mistaken for a new arrival - see on_keyframe
         self.warmup_end_frame = None   # set by the prior at handover; recorded, never read here
+        # the loss gate. gate_log holds EVERY arrival the gate saw, trained or not, so a threshold
+        # can be re-chosen from one run instead of re-running per candidate value.
+        self.gate_log = []
+        self.skipped = {'low': 0, 'high': 0, 'empty': 0}
         self.t0 = time.time()
+
+    # ---------------------------------------------------------------- frames
+
+    def frame(self, video, i):
+        """Keyframe slot `i` as an ABSOLUTE frame index - what traj_full.txt and GT are keyed by."""
+        return self.frame_offset + int(video.tstamp[i].item())
 
     # ---------------------------------------------------------------- schedule
 
@@ -58,6 +75,78 @@ class LiveTrainer:
             return [b for _ in range(self.cfg.steps_per_kf)
                     for b in batches_of(self.rng.permutation(kfs), self.cfg.batch_size)]
         return [[int(kfs[-1])] for _ in range(self.cfg.steps_per_kf)]
+
+    # ---------------------------------------------------------------- the loss gate
+
+    def gate_value(self, video, t):
+        """Keyframe `t` under the current weights, as (relative loss, raw loss). (None, None)
+        when the mask is too thin to measure.
+
+        BOTH are returned whichever one gate_metric selects, and both go into gate_log, so one run
+        answers the threshold question for either metric instead of needing a run per candidate.
+
+        One extra no-grad forward per arrival, against the steps_per_kf * window_size the burst it
+        may skip would cost - 80 for the e8 configuration, so ~1%. Deliberately NOT the first
+        training step's loss: reading that would mean one optimiser step had already landed on the
+        very target the gate exists to reject, and a 1902x-median target does its damage in one
+        step.
+
+        The model is in eval_mode here (on_keyframe enters train_mode after the gate), which is
+        also the mode it serves in - so the gate measures the weights as the tracker will see them.
+        """
+        images, gt, mask, _, _ = self.sampler.sample(video, t)
+        images, gt, mask = images.cuda(), gt.cuda(), mask.cuda()
+        if mask.sum() < self.cfg.min_mask_pixels:
+            return None, None                # depth_loss would return a zero with no gradient
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+            # cache_enabled=False IS LOAD-BEARING, and silently so. torch.autocast caches the
+            # bf16 casts of every weight it touches, and that cache lives until the OUTERMOST
+            # autocast region exits - which here is motion_filter.track's
+            # @torch.cuda.amp.autocast(enabled=True), i.e. not before this whole keyframe is done.
+            # Casting the LoRA weights under no_grad would therefore leave DETACHED bf16 copies in
+            # that cache, and _step's forward would reuse them a few lines later: its output comes
+            # back with requires_grad=False and backward() dies on "element 0 of tensors does not
+            # require grad". Nothing about the gate looks wrong when that happens - grad IS
+            # enabled, the model IS in train mode, the parameters DO require grad - so it is worth
+            # the sentence. Only this forward needs the opt-out: _step's own casts are made under
+            # grad and are correct to cache.
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16, cache_enabled=False):
+                pred_depth, _ = self.lora.forward(images)
+            l_d, _ = depth_loss(pred_depth.float(), gt, mask, self.cfg)
+        return relative_loss(l_d, gt, mask), float(l_d)
+
+    def gate(self, video, kfs, frame):
+        """Should this arrival be trained on? Records the verdict either way.
+
+        The gate keeps the BAND (gate_lo, gate_hi) of whichever metric gate_metric names: too low
+        means the frame already fits and the update is not worth its cost, too high means the
+        target is broken rather than informative. See online/config.py for why the upper bound is
+        the half with evidence behind it, and why 'rel' is the sounder of the two metrics.
+        """
+        cfg = self.cfg
+        lo, hi = cfg.gate_lo, cfg.gate_hi
+        if lo <= 0 and hi <= 0:
+            return True                      # gate off - do not spend the forward
+        rel, raw = self.gate_value(video, kfs[-1])
+        val = rel if cfg.gate_metric == 'rel' else raw
+        if val is None:
+            verdict = 'empty'
+        elif lo > 0 and val < lo:
+            verdict = 'low'
+        elif hi > 0 and val > hi:
+            verdict = 'high'
+        else:
+            verdict = 'train'
+        # both metrics are recorded whichever one decided, so gate_log.json can be re-thresholded
+        # on either axis afterwards without another run
+        self.gate_log.append({'frame': frame, 'rel': rel, 'raw': raw, 'metric': cfg.gate_metric,
+                              'verdict': verdict, 'unit': self.units})
+        if verdict == 'train':
+            return True
+        self.skipped[verdict] += 1
+        print(f'  [adapt] SKIP kf frame {frame}: {cfg.gate_metric} '
+              f'{"n/a" if val is None else f"{val:.4f}"} ({verdict})')
+        return False
 
     # ---------------------------------------------------------------- the step
 
@@ -78,10 +167,16 @@ class LiveTrainer:
         # next acceptance lands on the same index and would re-train the same target - measured on
         # rellis_00000, 500 frames: 88 calls collapse to 29 units. Identity is the frame TIMESTAMP,
         # not the index: indices shift under that same pruning, timestamps do not.
-        tstamp = float(video.tstamp[kfs[-1]].item())
+        tstamp = float(self.frame(video, kfs[-1]))
         if tstamp == self.last_tstamp:
             return None
         self.last_tstamp = tstamp
+
+        # AFTER the de-dup gate, so a skipped arrival is not retried on the next extractor call,
+        # and BEFORE first_kf is claimed, so first_adapted_kf stays "the first frame actually
+        # trained on" rather than the first one merely looked at.
+        if not self.gate(video, kfs, int(tstamp)):
+            return None
 
         batches = self.batches(kfs)
         if not batches:
@@ -101,7 +196,7 @@ class LiveTrainer:
         self.units += 1
         # by FRAME index, for the same reason as last_tstamp: keyframe slot 31 before a pruning and
         # slot 31 after it are different frames, and n_train_kf feeds 12.1's adapt_cost
-        self.trained_kf.update(int(video.tstamp[t].item()) for t in kfs)
+        self.trained_kf.update(self.frame(video, t) for t in kfs)
         self._checkpoint()
         return unit
 
@@ -144,7 +239,7 @@ class LiveTrainer:
         # same thing in both, FRAME indices: offline they come from poses_slam.txt, live they must
         # be translated off video.tstamp, because a keyframe slot is not stable across a pruning
         rec = {'epoch': unit, 'step': step, 'S': seq_lens,
-               'kfs': [int(video.tstamp[t].item()) for t in batch],
+               'kfs': [self.frame(video, t) for t in batch],
                **{k: float(np.mean(v)) for k, v in acc.items() if v}}
         self.log.append(rec)
 
@@ -191,6 +286,10 @@ class LiveTrainer:
                 'lambda_pose': cfg.lambda_pose, 'coupled_scale': cfg.coupled_scale,
                 'context_kf': cfg.context_kf, 'lag': cfg.lag, 'seed': cfg.seed,
                 'stream_res': cfg.stream_res,
+                # SlamConfig.start, i.e. the frame every index above is offset by. Recorded so a
+                # windowed adapter's first_adapted_kf / warmup_end_frame can be read without
+                # knowing which driver produced it.
+                'start': self.frame_offset,
                 # two gates, not one (online/config.py): warmup_kf is when learning starts,
                 # handover_kf when serving does. warmup_end_frame is the FRAME the second landed
                 # on - the key name predates the split and is kept, adapters on disk use it.
@@ -198,6 +297,14 @@ class LiveTrainer:
                 'warmup_prior': cfg.warmup_prior,
                 'warmup_end_frame': self.warmup_end_frame,
                 'checkpoint_every_kf': cfg.checkpoint_every_kf,
+                # the loss gate, and what it actually did. n_gate_checks counts arrivals that
+                # reached the gate, so n_gate_checks - sum(skipped) is what n_units should equal.
+                'gate_metric': cfg.gate_metric,
+                'gate_lo': cfg.gate_lo, 'gate_hi': cfg.gate_hi,
+                'n_gate_checks': len(self.gate_log),
+                'n_skipped_low': self.skipped['low'],
+                'n_skipped_high': self.skipped['high'],
+                'n_skipped_empty': self.skipped['empty'],
                 # lineage as data, read off the model rather than passed in - so checkpoints carry
                 # it too, exactly as adapt/trainer.py:180 does
                 'init_adapter': self.lora.adapter,
@@ -210,11 +317,26 @@ class LiveTrainer:
                     'run never got past warmup_kf keyframes')
         losses = [r['loss'] for r in self.log]
         head, tail = losses[:max(1, len(losses) // 10)], losses[-max(1, len(losses) // 10):]
-        return (f'  {self.units} units / {len(self.log)} steps / {self.visits} keyframe visits '
-                f'over {len(self.trained_kf)} distinct keyframes, from frame {self.first_kf}\n'
-                f'  loss first 10% {np.mean(head):.4f} -> last 10% {np.mean(tail):.4f} '
-                f'({time.time()-self.t0:.0f}s) - NOT a learning curve: every step has a different\n'
-                f'  target, so this tracks how hard the scene got as much as how well it fits')
+        out = (f'  {self.units} units / {len(self.log)} steps / {self.visits} keyframe visits '
+               f'over {len(self.trained_kf)} distinct keyframes, from frame {self.first_kf}\n'
+               f'  loss first 10% {np.mean(head):.4f} -> last 10% {np.mean(tail):.4f} '
+               f'({time.time()-self.t0:.0f}s) - NOT a learning curve: every step has a different\n'
+               f'  target, so this tracks how hard the scene got as much as how well it fits')
+        if self.gate_log:
+            n = sum(self.skipped.values())
+            out += (f'\n  gate on {self.cfg.gate_metric} ({self.cfg.gate_lo}, {self.cfg.gate_hi}): '
+                    f'{len(self.gate_log)} arrivals checked, {n} skipped '
+                    f'(low {self.skipped["low"]}, high {self.skipped["high"]}, '
+                    f'empty {self.skipped["empty"]})')
+            # BOTH metrics, so the run also reports what the OTHER threshold should have been
+            for key in ('rel', 'raw'):
+                v = [g[key] for g in self.gate_log if g[key] is not None]
+                if v:
+                    q = np.percentile(v, [25, 50, 90, 98, 100])
+                    out += (f'\n    {key:<3} p25 {q[0]:.4f}  median {q[1]:.4f}  p90 {q[2]:.4f}  '
+                            f'p98 {q[3]:.4f}  max {q[4]:.4f}')
+            out += '\n  retune either axis off gate_log.json - it needs no second run'
+        return out
 
     def release(self):
         """Drop the optimiser state before the model goes; the arm's evaluation needs neither."""

@@ -20,6 +20,26 @@ def depth_loss(pred_depth, gt_depth, mask, cfg, scale=None):
     return (g[mask] - s * p[mask]).abs().mean(), s
 
 
+def relative_loss(loss, gt_depth, mask):
+    """`loss` as a fraction of the frame's MEDIAN TARGET DEPTH - a unit-free fit measure.
+
+    depth_loss is in the tracker's own depth units, and those shrink along a run as the SLAM
+    solution's scale drifts: measured on rellis_00000, one run's first-step loss falls 0.029 ->
+    0.007 across units 0..209 with no change in how well it fits (the same loss expressed in GT
+    metres is flat). A threshold on the RAW loss is therefore an implicit schedule over the
+    sequence rather than a statement about fit - it stops adapting late and calls that a decision.
+
+    Dividing by the same frame's median target depth cancels the unit and leaves "mean absolute
+    error as a fraction of how far the scene is". Over the same run that reads 0.0195 -> 0.0262,
+    i.e. flat to ~1.3x, which is what makes one fixed threshold meaningful end to end.
+
+    None when there is nothing to measure, so callers can distinguish "fits well" from "no data".
+    """
+    if loss is None or not mask.any():
+        return None
+    return float(loss) / float(gt_depth[mask].median().clamp(min=1e-6))
+
+
 def pose_loss(pred_enc, gt_enc):
     """Translation (independently norm'd) + quaternion, over the non-reference frames."""
     if pred_enc.shape[0] < 2:

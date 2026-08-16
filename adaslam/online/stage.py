@@ -26,6 +26,7 @@ from ..runtime import free_vram
 from .prior import OnlineVggtPrior
 
 TRAIN_LOG = 'train_log.json'
+GATE_LOG = 'gate_log.json'      # every arrival the loss gate saw, trained or skipped
 
 
 def make_record(arm_out, split_at):
@@ -75,8 +76,11 @@ def run_online_adapt(runner, online_cfg, e2e_cfg, adapt_out, ckpt_dir, arm_out, 
     os.makedirs(adapt_out, exist_ok=True)
 
     t0 = time.time()
+    # runner.cfg IS the SlamConfig, so the window's start comes from its one definition rather
+    # than being mirrored into OnlineConfig and kept in sync by hand
     prior = OnlineVggtPrior(e2e_cfg, online_cfg, adapter=init, stream_hw=stream_hw,
-                            ckpt_dir=ckpt_dir, record=make_record(arm_out, split_at))
+                            ckpt_dir=ckpt_dir, record=make_record(arm_out, split_at),
+                            frame_offset=runner.cfg.start)
     label = prior.label
     try:
         # SlamRunner installs and restores the prior, so nothing leaks into a later arm even if
@@ -93,6 +97,13 @@ def run_online_adapt(runner, online_cfg, e2e_cfg, adapt_out, ckpt_dir, arm_out, 
         print(f'saved adapter to {prior.save(adapt_out, extra=extra)}')
         json.dump(trainer.log, open(f'{adapt_out}/{TRAIN_LOG}', 'w'))
         print(f'training log in {adapt_out}/{TRAIN_LOG}')
+        # separate file, not a row in train_log.json: that log's record shape is a contract shared
+        # with adapt/trainer.py, and a reader there would trip over a record with no 'loss'.
+        # Written whenever the gate ran at all, INCLUDING the arrivals it let through - which is
+        # what makes a threshold re-choosable without re-running.
+        if trainer.gate_log:
+            json.dump(trainer.gate_log, open(f'{adapt_out}/{GATE_LOG}', 'w'))
+            print(f'gate log in {adapt_out}/{GATE_LOG}')
     finally:
         prior.release()          # in a finally: a crashed run otherwise strands ~2.5 GB
     free_vram('online adapt')
