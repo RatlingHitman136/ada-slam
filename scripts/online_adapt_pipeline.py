@@ -2,41 +2,20 @@
 
     python scripts/online_adapt_pipeline.py    # from the repo root, adaslam venv active
 
-  1 online   HI-SLAM2 over the whole sequence with a VGGT prior that ADAPTS ITSELF. The first
-             WARMUP_KF keyframes are served by the fallback prior; from then on every arriving
-             keyframe first triggers a burst of LoRA steps on the keyframes local BA has already
-             settled, then is served by the weights that produced.
+  1 online   HI-SLAM2 over the whole sequence with a VGGT prior that ADAPTS ITSELF: each arriving
+             keyframe triggers a burst of LoRA steps on the keyframes local BA has settled, then
+             is served by the weights that produced
              -> an adapter in outputs/adapt/<SCENE>/<ONLINE_NAME>/
              -> an arm    in outputs/test/end2end/<SCENE>/<ONLINE_NAME>_live/
-  2 end2end  the REFERENCE arms (omni, base, any frozen adapter) so the online arm has something
-             to be compared against. Reused from disk when they have been run before, which they
-             usually have - a scene's baselines are run once.
+  2 end2end  the REFERENCE arms (omni, base, any frozen adapter), reused from disk when a scene
+             has already paid for them
 
-The two sibling drivers are the OFFLINE track and are unchanged: init_adapt_pipeline.py adapts on
-a densified prefix, cont_adapt_pipeline.py on a thin equidistant sample of the whole sequence. Both
-train on a finished export and then run a SECOND SLAM pass with the adapter frozen. This one has no
-extract stage and no frozen pass at all - the run that produces the supervision is the run being
-evaluated.
+Siblings: init_adapt_pipeline.py (9.1) and cont_adapt_pipeline.py (9.7) are the OFFLINE track -
+they train on a finished export, then run a SECOND pass with the adapter frozen. Here the run that
+produces the supervision is the run being evaluated. Run the preprocess script first.
 
-Three things follow from that, and they are why this is a driver of its own:
-
-  * the supervision is LOCAL-BA depth. The offline export dumps after GLOBAL BA (hi2.py:155), the
-    only instant where disps / disps_up / poses are mutually consistent. Live targets are noisier
-    by construction.
-  * the target is produced by BA that was itself pulled toward the prior being adapted, via JDSA.
-    mono_depth_alpha is small (0.001-0.01) so the target is mostly photometric, but this is a
-    self-training loop the offline pipeline does not have. Watch train_log.json's loss collapsing
-    while ATE worsens.
-  * there is no seen/unseen frontier for the ADAPTER - it learned across the whole sequence - so
-    SPLIT_AT defaults to the whole thing and ate_all is the row the comparison reduces to (12.2).
-    The one meaningful boundary, the handover frame, is recorded as `warmup_end_frame` in the
-    adapter's config.json; 12.3 notes any split re-scores for free from evo/error_array.npy.
-
-This file is the KNOB PANEL, not the implementation. No CLI, no environment. Run the dataset's
-preprocess script first.
-
-The config literals below are rebuilt in every spawned reader child - primitives only, no file
-access and no computation.
+The KNOB PANEL, not the implementation - the stage is adaslam/online/. The config literals below
+are rebuilt in every spawned reader child: primitives only, no disk, no computation.
 """
 import os    # nopep8
 import sys   # nopep8
@@ -82,60 +61,42 @@ CROP_BORDER = 0
 # ---------------------------------------------------------------- run control
 STAGES           = ('online', 'end2end')   # any subset; run in pipeline order
 SKIP_EXISTING    = True                # reuse a stage's output if it is already on disk
-MIN_FREE_VRAM_MB = 12000               # HIGHER than the offline drivers' 7000: this run holds
-                                       # VGGT-1B, its optimiser state AND the whole SLAM system at
-                                       # once. Measure on a short LENGTH before trusting it.
+MIN_FREE_VRAM_MB = 12000               # high: VGGT-1B, its optimiser and SLAM are all resident
 LENGTH           = 100000              # frames to run over; 100000 = the whole sequence
-START            = 0                   # the motivating experiment: drop 200 frames from each
-STOP             = None                # end of rellis_00000's 2847, leaving frames 200..2646.
-                                       # (0, None) is the whole sequence, as before.
+START            = 0
+STOP             = None                # exclusive: the window is [START, STOP); None = to the end
 
-# WHERE A WINDOWED RUN'S OUTPUTS GO. end2end/config.py:arm_name maps 'omnidata' to `omni` whatever
-# the window, so a windowed baseline would overwrite the full-sequence one and leave nothing to
-# compare either against. The window therefore keys the SCENE directory instead: the full sequence
-# keeps SCENE, anything else becomes SCENE_f<START>-<STOP> with its own omni/base, which
-# SKIP_EXISTING fills on first use. Pure string work, so it belongs in this block (9.5 rule 3).
+# a windowed run keys its own outputs tree, or its omni/base would overwrite the full sequence's
 SCENE_KEY = scene_key(SCENE, START, STOP)
 STREAM_RES       = 341 * 640           # tracking resolution budget
 BUFFER           = 900                 # keyframe buffer; must clear the sequence's keyframe count
 RENDER_EVAL      = False               # hi2.py's eval_rendering -> renders/ + psnr/ (11)
 
 # ---------------------------------------------------------------- experiment names
-# REQUIRED, and unique within its scene only. Lineage is DATA, not naming: the adapter's
-# config.json records the run that supervised it and the adapter it continued from.
+# REQUIRED, unique within its scene only; lineage is recorded in the adapter's config.json
 OUT_ROOT    = 'outputs'
-# E9 ARM A: the best live configuration to date (e8 / w10 / a16 / lr1.2e-4 / lag3 -> live ATE
-# 24.473) plus the loss gate's UPPER bound only. Everything else is held identical to that run, so
-# the only difference is the two catastrophic arrivals the gate removes.
 ONLINE_NAME = 'live_e12_w10_a16_w12_lag3_hi2_low045_rel_base'
 
 # ---------------------------------------------------------------- stage I/O
-# A stage RECEIVES its paths and reads no path global. Pure string joins - no disk access here.
+# a stage RECEIVES these and reads no path global; pure string joins, no disk access in this block
 ADAPT_OUT  = experiment_dir(OUT_ROOT, 'adapt', SCENE_KEY, ONLINE_NAME)
 ADAPT_CKPT = f'{ADAPT_OUT}/{ADAPT_CKPT_SUBDIR}'        # epoch_NNN/; cadence is checkpoint_every_kf
 
 OUT_END2END = test_dir(OUT_ROOT, 'end2end', SCENE_KEY)     # one subdirectory per arm
-# The live arm's own directory. The suffix is load-bearing: without it, later testing this run's
-# FROZEN final adapter as an ordinary END2END_PRIORS entry would infer the same directory and
-# overwrite this trajectory (common.py:ONLINE_ARM_SUFFIX).
+# the suffix keeps a later FROZEN test of this adapter from overwriting the live trajectory (13.4)
 ONLINE_ARM_NAME = f'{ONLINE_NAME}{ONLINE_ARM_SUFFIX}'
 ONLINE_ARM      = f'{OUT_END2END}/{ONLINE_ARM_NAME}'
 
-# WHICH ADAPTER THIS RUN STARTS FROM. None = stock VGGT-1B; otherwise the name of an adapt
-# experiment in this SCENE - the same vocabulary an END2END_PRIORS entry uses. A checkpoint works:
-#   f'{experiment_dir(OUT_ROOT, "adapt", SCENE_KEY, "x")}/{ADAPT_CKPT_SUBDIR}/epoch_005'
-# With WARMUP_PRIOR = 'self' this is also what serves the warm-up keyframes.
+# the adapter this run CONTINUES from: an adapt experiment in this scene, or None for stock VGGT-1B
 ADAPT_INIT_NAME = None
 ADAPT_INIT = None if ADAPT_INIT_NAME is None else \
     experiment_dir(OUT_ROOT, 'adapt', SCENE_KEY, ADAPT_INIT_NAME)
 
-# VGGT's input size; an adapter's own recorded size wins over this. Derived in main(), not here -
-# this block must not touch the disk (9.3).
+# VGGT's input size; an adapter's own recorded size wins over this. Resolved in main() (9.3)
 VGGT_HW = None                         # None = derive | (378, 518) TUM | (294, 518) Replica
 
 # ---------------------------------------------------------------- the SLAM runs
-# What every invocation shares - the online run and every reference arm - so they cannot disagree
-# about the stream, the calibration or the resolution.
+# what the online run and every reference arm share, so they cannot disagree about the stream
 SLAM = SlamConfig(
     weights=DROID_WEIGHTS, colors=COLORS, calib=CALIB, start=START, stop=STOP,
     undistort=UNDISTORT, crop_border=CROP_BORDER, stream_res=STREAM_RES,
