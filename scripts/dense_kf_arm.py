@@ -6,35 +6,16 @@
                                                 + dense_config.yaml, the config that produced it
   -> a two-row compare() table against the `omni` arm already on disk
 
-WHY THIS IS NOT AN END2END_PRIORS ENTRY. Every adapter that reaches -24% on rellis_00000 trained on
-a DENSIFIED extract - init_adapt_pipeline.py's EXTRACT halves the keyframe gates, giving ~5.0
-frames per keyframe against stock's ~12.2 - while the best whole-sequence adapter reaches -20.45% at
-a matched keyframe count and matched target shape quality. Density and span are perfectly confounded
-in every extract on disk, and that 3.6-point difference is the largest unexplained gap left.
+Density only ever touched an adapter's TRAINING DATA: run_end2end_test hands every arm the
+unmodified CONFIG on purpose (9.2.1), so the end2end stage cannot ask whether denser keyframing
+improves the trajectory on its own. Hence a script of its own, changing ONE thing against `omni`.
 
-But density only ever touched an adapter's TRAINING DATA. Every arm ever scored ran at stock
-keyframing: run_end2end_test hands every arm the unmodified CONFIG on purpose, and init's main()
-asserts it, precisely so a denser training set cannot masquerade as a tracking change (9.2.1). So
-"does denser keyframing improve the trajectory on its own?" has never been asked, and the end2end
-stage cannot ask it - one arm_config serves every arm of a comparison.
+No new logic - write_tracking_config, SlamRunner, make_prior and evaluate / print_report / compare
+are the ordinary arm path, so the outputs read like any other arm's. The directory is INFERRED,
+arm_name(DENSE_SPEC) (7.1), never typed.
 
-Hence a script of its own. It changes ONE thing against `omni`, the four kf_* knobs, and it is the
-only place that knows `omnidata_dense` means "BASE_SPEC's prior, tracked densely".
-
-WHAT IT REUSES. Everything; there is no new logic here. write_tracking_config writes the generated
-YAML, SlamRunner runs it (both already take the config and the output directory as arguments),
-make_prior turns BASE_SPEC into a prior object, and evaluate / print_report / compare score it
-exactly as an ordinary arm - same results.json shape, same evo layout, so ate_over_time.py and
-export_end2end_results.py read it with no special case.
-
-The arm's directory is INFERRED, `arm_name(DENSE_SPEC)` (7.1), never typed: end2end/config.py's
-SENTINELS is what makes `omnidata_dense` listable in another driver's END2END_PRIORS, and a name
-typed here would be a second naming rule to drift out of step with it.
-
-AFTERWARDS, to have it in a comparison table: add 'omnidata_dense' to END2END_PRIORS in any driver,
-with SKIP_EXISTING=True. It is then reused from disk at no GPU cost. Without the arm on disk (or
-with SKIP_EXISTING off) end2end/stage.py:make_prior refuses rather than running a stock-density arm
-into a directory named for a dense one.
+To have it in a comparison table afterwards: add 'omnidata_dense' to any driver's END2END_PRIORS
+with SKIP_EXISTING=True, and it is reused from disk at no GPU cost.
 """
 import os    # nopep8
 import sys   # nopep8
@@ -76,58 +57,39 @@ UNDISTORT   = False
 CROP_BORDER = 0
 
 # ---------------------------------------------------------------- what this arm is
-# DENSE_SPEC names the arm (-> omni_dense), BASE_SPEC supplies the prior. They are separate because
-# the whole point is that the two runs share a prior and differ only in keyframe density; pointing
-# BASE_SPEC at 'vggt_base' or an adapter directory would need its own DENSE_SPEC sentinel first,
-# since two specs inferring one directory is a hard error (End2EndConfig.__post_init__).
+# DENSE_SPEC names the arm (-> omni_dense), BASE_SPEC supplies the prior it shares with `omni`
 DENSE_SPEC = OMNIDATA_DENSE
 BASE_SPEC  = OMNIDATA
 LABEL      = 'Omnidata depth, DENSE keyframing'
 
-# The arm this is a control FOR: same prior, stock keyframing. Read from disk for the table; the
-# comparison is the entire deliverable, so a missing baseline is a hard stop rather than a warning.
+# the arm this is a control FOR: same prior, stock keyframing. A missing baseline is a hard stop
 BASELINE_ARM = arm_name(BASE_SPEC)
 
 # ---------------------------------------------------------------- keyframe density (the variable)
-# Identical to init_adapt_pipeline.py's EXTRACT, so this run's density is the density that trained
-# the -24% adapters. Stock, inherited from tum_config.yaml, is 2.4 / 4.0 / 4.0 / 0.2.
+# identical to init_adapt_pipeline.py's EXTRACT; stock (from the base config) is 2.4/4.0/4.0/0.2
 KF_MOTION_THRESH    = 1.2       # motion_filter.thresh - flow needed to propose a keyframe
 KF_INIT_THRESH      = 4.0       # motion_filter.init_thresh - the same gate before initialisation
-KF_REDUNDANT_THRESH = 2.0       # frontend.keyframe_thresh - the gate that actually moves the
-                                # count: track_frontend.py:49-52 prunes back whatever the motion
-                                # filter proposes (9.2.1)
+KF_REDUNDANT_THRESH = 2.0       # frontend.keyframe_thresh - the gate that moves the count (9.2.1)
 KF_COVIS_THRESH     = 0.1       # backend.covis_thresh - extras inserted in terminate(); LOWER=more
 
 # ---------------------------------------------------------------- run control
 LENGTH           = 100000       # frames to run over; 100000 = the whole sequence
 START            = 0
-STOP             = None            # exclusive: the window is [START, STOP), so (200, 2647) is
-                                       # frames 200..2646 and (0, None) is the whole sequence.
-                                       # A WINDOWED run gets its own outputs/ tree - see SCENE_KEY.
+STOP             = None         # exclusive: the window is [START, STOP); None = to the end
 
-# WHERE A WINDOWED RUN'S OUTPUTS GO. end2end/config.py:arm_name maps 'omnidata' to `omni` whatever
-# the window, so a windowed baseline would overwrite the full-sequence one and leave nothing to
-# compare either against. The window therefore keys the SCENE directory instead: the full sequence
-# keeps SCENE, anything else becomes SCENE_f<START>-<STOP> with its own omni/base, which
-# SKIP_EXISTING fills on first use. Pure string work, so it belongs in this block (9.5 rule 3).
+# a windowed run keys its own outputs tree, or its omni/base would overwrite the full sequence's
 SCENE_KEY = scene_key(SCENE, START, STOP)
 STREAM_RES       = 341 * 640    # tracking resolution budget - must match every other arm
-BUFFER           = 900          # NO overflow guard in SlamRunner.run (only run_extract warns).
-                                # dense_kf_p40 gave 226 keyframes over 1138 frames, so the whole
-                                # sequence should give ~565 - 2.4x stock's 233. Check the count
-                                # this prints; if it approaches BUFFER, raise it and re-run.
+BUFFER           = 900          # hard cap, NO overflow guard here; the run prints its count
 RENDER_EVAL      = False        # hi2.py's eval_rendering -> renders/ + psnr/ (11)
 MIN_FREE_VRAM_MB = 7000
 OUT_ROOT         = 'outputs'
 SKIP_EXISTING    = True         # reuse a finished run; scoring re-runs when the split differs
 
-# The seen/unseen boundary. MUST equal the baseline arm's recorded split_at or compare() refuses
-# the pair - which is the check working, not an obstacle. None = the whole sequence, which is what
-# `omni` on rellis_00000 was scored at (2847).
+# the seen/unseen boundary; MUST equal the baseline arm's recorded split_at or compare() refuses
 SPLIT_AT = 200
 
-# VGGT's input size. Unread while BASE_SPEC is 'omnidata' - no VGGT is built - but LoRAConfig is a
-# required End2EndConfig field, so it is stated rather than faked. None = derive from the stream.
+# VGGT's input size - unread while BASE_SPEC is 'omnidata', but End2EndConfig requires a LoRAConfig
 VGGT_HW = None
 
 # ---------------------------------------------------------------- the SLAM run
@@ -143,8 +105,7 @@ LORA = LoRAConfig(
     targets=('attn.qkv', 'attn.proj', 'mlp.fc1', 'mlp.fc2'),
     patch_embed=False)
 
-# evaluate() reads only gt_traj and make_prior reads nothing at all for 'omnidata', but the real
-# config is built rather than a stand-in: it is what makes BASE_SPEC a knob instead of a fiction.
+# the real config, not a stand-in: it is what makes BASE_SPEC a knob instead of a fiction
 END2END = End2EndConfig(
     priors=(BASE_SPEC,),
     length=LENGTH,
@@ -158,11 +119,7 @@ END2END = End2EndConfig(
 
 
 def baseline_results(out_root, split_at):
-    """The stock-density arm's results.json, checked for comparability. Hard stop if absent.
-
-    A dense arm on its own says nothing - the number only means something beside the arm it is a
-    control for - so this is checked BEFORE the SLAM run rather than after it.
-    """
+    """The stock-density arm's results.json, checked for comparability. Hard stop if absent."""
     path = f'{out_root}/{BASELINE_ARM}/{RESULTS}'
     if not os.path.exists(path):
         raise SystemExit(f'{path} not found: this run is a control for the {BASELINE_ARM!r} arm '
@@ -187,9 +144,7 @@ def main():
     warn_runtime_undistort(UNDISTORT, CROP_BORDER)
     window = window_frames(n_frames, START, STOP)
     length = min(LENGTH, window)
-    # None = the whole RUN, which under a window is its end, not the sequence's - a split_at
-    # naming a frame the run never reached would put every pose in [seen] and none in
-    # [unseen] while claiming a boundary that does not exist
+    # None = the end of the RUN, not of the sequence: a split the run never reached is no boundary
     split_at = (START + window) if SPLIT_AT is None else SPLIT_AT
 
     out_root = test_dir(OUT_ROOT, 'end2end', SCENE_KEY)
@@ -214,15 +169,13 @@ def main():
               f'split_at={split_at}')
     else:
         gpu_gate(MIN_FREE_VRAM_MB)
-        # into the ARM's own directory, so the config that produced the trajectory sits beside it -
-        # the same provenance rule extract_config.yaml follows inside <exp>/full/ (7.1)
+        # into the ARM's own directory, so the config that produced the trajectory sits beside it
         dense_config = write_tracking_config(
             out, CONFIG, motion_thresh=KF_MOTION_THRESH, init_thresh=KF_INIT_THRESH,
             keyframe_thresh=KF_REDUNDANT_THRESH, covis_thresh=KF_COVIS_THRESH,
             name='dense_config.yaml')
 
-        # BASE_SPEC, never DENSE_SPEC: make_prior refuses the latter by design, and rightly - it is
-        # this script, not that function, that knows density comes from the config above
+        # BASE_SPEC, never DENSE_SPEC: make_prior refuses the latter, and the density is the config
         prior = make_prior(BASE_SPEC, END2END, stream_hw)
         try:
             t0 = time.time()

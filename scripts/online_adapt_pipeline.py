@@ -114,45 +114,23 @@ LORA = LoRAConfig(
 # ---------------------------------------------------------------- online adaptation (stage 1)
 ONLINE = OnlineConfig(
     # ---- warm-up: TWO gates - when the adapter starts LEARNING, and when it starts SERVING ----
-    warmup_kf=12,              # keyframes before the first optimiser step, which lands at
-                               # warmup_kf + 1. 12 is TrackFrontend.warmup, so learning begins
-                               # right after initialisation, on keyframes local BA has settled.
-    handover_kf=12,            # keyframes served by the FALLBACK; VGGT serves from here on. Must
-                               # be >= warmup_kf; equal is the old single-gate behaviour. Between
-                               # the two the adapter trains while Omnidata still drives, which is
-                               # FREE - the steps run either way. Measured on rellis_00000: at 40
-                               # units the adapter is already -14.3% vs omni as a frozen prior
-                               # (chkp_039), stock VGGT is +6.2%, so the crossover is somewhere
-                               # below keyframe 53 and 30 is a first bracket on it.
-    warmup_prior='omnidata',   # 'omnidata' = upstream's prior, a genuinely different model
-                               # 'self'     = the same VGGT this run adapts (with ADAPT_INIT set,
-                               #              a pretrained adapter). Makes the split INERT: both
-                               #              branches are then the same, adapting, model.
+    warmup_kf=12,              # keyframes before the first optimiser step, which lands at +1
+    handover_kf=12,            # keyframes served by the FALLBACK prior; must be >= warmup_kf
+    warmup_prior='omnidata',   # 'omnidata' = upstream's prior | 'self' = the adapting VGGT itself
 
     # ---- schedule: the vocabulary of adapt/trainer.py:schedule, live ----
-    adapt_style='wonline',      # 'online'  = the arriving keyframe alone, steps_per_kf steps
-                               # 'wonline' = a SLIDING WINDOW of the arrival + the window_size-1
-                               #             keyframes before it, steps_per_kf shuffled batched
-                               #             passes, so each is revisited window_size times
-    steps_per_kf=12,            # optimiser steps ('online') / shuffled passes ('wonline') per
-                               # arriving keyframe. This is the runtime knob: it multiplies the
-                               # forward+backward cost of the whole run.
+    adapt_style='wonline',      # 'online' = the arrival alone | 'wonline' = a sliding window
+    steps_per_kf=12,            # steps ('online') / shuffled passes ('wonline') per arrival
     window_size=10,             # 'wonline' ONLY
     batch_size=2,              # 'wonline' ONLY - a keyframe arrives alone in 'online'
-    lag=3,                     # keyframes back from the end the target is taken. 2 is
-                               # track_frontend.py:65's own line: __update reports changes up to
-                               # t1-2, so that is the newest index the repo already treats as
-                               # settled enough to hand downstream.
+    lag=3,                     # keyframes back from the end the target is taken
 
     # ---- sample construction ----
-    context_kf=0,              # previous KEYFRAMES appended after the target. 0 = monocular and
-                               # depth-only, which is how prior_extractor itself calls the model.
-                               # >0 also supervises poses from video.poses, at >0 x the VRAM.
+    context_kf=0,              # previous KEYFRAMES appended after the target; 0 = monocular
     stream_res=STREAM_RES,     # must equal SLAM.stream_res
 
     # ---- optimisation ----
-    lr=1.2e-4,                 # the e8 run's lr - it beat e10 and e12 at 1e-4 with FEWER visits,
-                               # so lr and repetition are still confounded (see the plan, E2)
+    lr=1.2e-4,
     weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
     coupled_scale=True, min_mask_pixels=16, seed=0,
     log_every=5,               # every step: there are only steps_per_kf of them per keyframe
@@ -163,57 +141,19 @@ ONLINE = OnlineConfig(
     mask_min_disp_ratio=0.5,   # drop pixels below this fraction of the frame's mean disparity
 
     # ---- the loss gate: skip an arrival whose newest keyframe is not worth training on ----
-    # Both bounds read the RELATIVE loss (adapt/losses.py:relative_loss), never the raw one - the
-    # raw loss carries the tracker's shrinking depth unit, so a raw threshold is an early-stopping
-    # schedule in disguise, and E1 measured that early stopping does not help.
-    #
-    # Measured on rellis_00000, relative first-step loss per arrival: median 0.023-0.029,
-    # p90 0.044-0.050, p98 0.056 - then two catastrophic units at 14.2 and 55.3 (490x and 1902x
-    # the median), sitting in exactly the interval where that run's frozen ATE degrades
-    # 24.704 -> 27.013. Those are what gate_hi is for.
-    # WHICH quantity the two bounds below are read against. Both are always measured and written
-    # to gate_log.json, so one run can be re-thresholded on either axis afterwards; this only
-    # picks the one that decides. Measured over five live runs on rellis_00000 (train_log first-
-    # step loss per unit, which is the closest available proxy for what the gate sees):
-    #
-    #            median        p90       p98   |  the outliers a gate_hi must catch
-    #   rel   0.023-0.029  0.044-0.050  ~0.056 |  0.93, 4.39, 14.2, 55.3   (40x-1900x median)
-    #   raw   0.015-0.026  0.031-0.056  ~0.083 |  0.56, 0.71, 0.86, 2.5, 7.9, 11.0  (28x-543x)
-    #
-    # Both separate cleanly - the gap between the worst p98 and the smallest outlier is ~7x on
-    # raw and ~17x on rel. The catch is DRIFT: raw loss falls ~4x across a run purely because the
-    # tracker's depth unit shrinks (§1.13a), so a raw gate_lo is partly an early-stopping
-    # schedule and will skip late arrivals regardless of how well they fit. rel is flat to ~1.3x
-    # over the same span. Use 'raw' to test that claim, not because it is expected to win.
-    gate_metric='raw',
-    gate_lo=0.045,               # 0 = off; skip when rel < this. "Already fits, do not spend the
-                               # burst." 0.018 is that scene's p25. SPECULATIVE: the degradations
-                               # it is meant to explain carry no loss signature.
-    gate_hi=0.2,              # 0 = off; skip when rel > this. "Target is broken, not hard."
-                               # NOTE a floor-only gate would train on those PREFERENTIALLY -
-                               # they are the highest-loss arrivals in the run.
-                               #
-                               # FOR gate_metric='raw' USE INSTEAD:  gate_lo=0.010, gate_hi=0.20
-                               #   hi 0.20 is the geometric midpoint of the raw gap (worst p98
-                               #     0.083 -> smallest outlier 0.563 => sqrt = 0.216), so it clears
-                               #     normal arrivals by 2.4x and sits 2.8x under the first outlier
-                               #   lo 0.010 is ~p25 on the raw axis, matching what 0.02 does on rel
-                               #   EXPECT the raw floor to skip mostly LATE arrivals - that is the
-                               #   drift confound, and it is the thing the comparison measures.
+    # both quantities are always measured into gate_log.json; this only picks the deciding one
+    gate_metric='raw',         # 'rel' = relative loss, flat across a run | 'raw' = drifts with it
+    gate_lo=0.045,             # 0 = off; skip BELOW this - the target already fits
+    gate_hi=0.2,               # 0 = off; skip ABOVE this - the target is broken, not hard
 
     # ---- output ----
-    checkpoint_every_kf=50)    # 0 = off; N = a loadable adapter dir every N adapted keyframes,
-                               # each testable as an arm named <ONLINE_NAME>_chkp_NNN. 50 is ~free
-                               # and gives a coarse ladder to compare against the ungated run's.
+    checkpoint_every_kf=50)    # 0 = off; N = a loadable adapter dir every N adapted keyframes
 
 # ---------------------------------------------------------------- reference arms (stage 2)
-# The online arm needs something to be compared against. These are ordinary frozen arms and are
-# reused from disk, so a scene pays for them once. [0] is the baseline column.
+# ordinary frozen arms, reused from disk so a scene pays for them once; [0] is the baseline column
 END2END_PRIORS = ('omnidata', 'vggt_base')
 
-# The seen/unseen boundary. None = the whole sequence, i.e. everything counts as "seen" and the
-# [unseen] table is empty - the honest default here, exactly as in cont_adapt_pipeline.py: the
-# adapter learned across the WHOLE sequence, so no frame index separates trained from untrained.
+# the seen/unseen boundary; None = the whole run, so [unseen] is empty and ate_all is the row (12.2)
 SPLIT_AT = 200
 
 END2END = End2EndConfig(
@@ -235,8 +175,7 @@ ensure_venv_on_path()
 # ==============================================================================
 
 def main():
-    # before any Process is started, and only once per process; every relative path above is
-    # repo-root relative
+    # once per process, before any Process is started; every path above is repo-root relative
     enter(_ROOT)
 
     require_name('ONLINE_NAME', ONLINE_NAME)
@@ -248,15 +187,12 @@ def main():
 
     window = window_frames(n_frames, START, STOP)   # validated against the sequence
     length = min(LENGTH, window)
-    # None = the whole RUN, which under a window is its end, not the sequence's - a split_at
-    # naming a frame the run never reached would put every pose in [seen] and none in
-    # [unseen] while claiming a boundary that does not exist
+    # None = the end of the RUN, not of the sequence: a split the run never reached is no boundary
     split_at = (START + window) if SPLIT_AT is None else SPLIT_AT
 
     os.makedirs(OUT_END2END, exist_ok=True)
 
-    # here, not in PARAMETERS: deriving reads a frame, which that block must not do. After chdir,
-    # so relative COLORS resolves the same however invoked.
+    # here, not in PARAMETERS: deriving reads a frame, and this runs after chdir
     global LORA, END2END
     LORA, stream_hw = resolve_lora(LORA, COLORS, STREAM_RES)
     END2END = replace(END2END, lora=LORA)   # the vggt_base arm and the online prior both read it
