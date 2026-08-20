@@ -8,14 +8,6 @@ from typing import Optional, Tuple
 
 ADAPT_STYLES = ('normal', 'online', 'wonline')
 VAL_SOURCES = ('tail', 'rest')
-# The x-axis the depth->scale slope is regressed against - see AdaptConfig.coupling_axis.
-COUPLING_AXES = ('target', 'pred')
-# WHICH OBJECTIVE a run trains on. Stated, not implied: before this existed the objective was
-# implied by coupling_lambda > 0, which is how a placebo arm and a real one could look alike on
-# disk. See AdaptConfig.depth_loss.
-DEPTH_LOSSES = ('normal', 'coupled', 'jdsa')
-JDSA_NORMS = ('l1', 'l2')
-JDSA_LATTICES = ('full', 'ba')
 
 # VGGT trained with width pinned to exactly 518 and height a multiple of 14, landscape or square
 # (training/config/default.yaml:5, training/data/base_dataset.py:95-113).
@@ -83,7 +75,10 @@ class LoRAConfig:
 
 @dataclass(frozen=True)
 class AdaptConfig:
-    """One training run. The supervision target is not a knob - the export writes one directory."""
+    """One training run. Neither the target nor the objective is a knob: the export writes one
+    depth directory, and the loss is always losses.py's median-aligned masked depth L1 plus
+    lambda_pose * the pose loss.
+    """
     # ---------------------------------------------------------------- data
     stream_res: int          # tracking resolution budget the export was produced at
     p_single_view: float     # 0 = always multi-view, 1 = always monocular
@@ -128,78 +123,8 @@ class AdaptConfig:
     keep_best: bool          # True = save the best-val unit instead of the last
     checkpoint_every: int    # full adapter snapshot every N units; 0 = off. The CADENCE only -
                              # the location is LoRAVGGT.train(ckpt_dir=...)
-    # ---------------------------------------------------------------- depth->scale coupling (E3)
-    # depth_loss aligns scale PER SAMPLE, so L(c*p) = L(p) exactly for any c > 0: the per-frame
-    # output scale has identically zero gradient and the network is free to make s_i anything.
-    # The harmful part of that freedom is the DEPTH-COUPLED part - s_i varying as a function of
-    # how far the scene is, i.e. range compression - which correlates +0.95/+0.90 with ATE across
-    # matched offline sets. This term puts a gradient on exactly that, and on nothing else:
-    #
-    #   x_i = log(median target depth)   DETACHED      y_i = log(s_i)
-    #   b   = SUM(x~ y~) / SUM(x~^2)                   penalty = coupling_lambda * b^2
-    #
-    # b^2 rather than Var(y) because Var(y) = b^2 Var(x) + Var(resid) and the residual half is
-    # neutral-to-beneficial (-0.72). Fitted over the WHOLE WINDOW, not the batch: batch_size is 2
-    # and a slope through two points is exactly determined, so it carries no information.
-    coupling_lambda: float   # 0.0 = OFF, and the extra pass is skipped entirely, so a run is
-                             # byte-identical to one from before this field existed
-    coupling_axis: str       # 'target' = median TARGET depth (recommended: the network does not
-                             #            control the axis, so it cannot game the fit)
-                             # 'pred'   = median PREDICTED depth. Available for comparison, but it
-                             #            invites the degenerate escape of collapsing every
-                             #            predicted median to one value - which IS range collapse.
-    coupling_min_var: float  # skip the term when SUM(x~^2) is below this - the window has no
-                             # depth spread and b would be an ill-conditioned division
-    # ---------------------------------------------------------------- WHICH OBJECTIVE (the knob)
-    # 'normal'  masked L1 in DEPTH after a per-sample median scale. Every run before this field
-    #           existed, bit for bit, and what an absent depth_loss in a config.json means.
-    # 'coupled' 'normal' plus E3's lambda*b^2 slope penalty. MEASURED AND NULL: over three seeds
-    #           lambda=0 spans 23.680-26.958 (sd 1.75) against lambda=1's 23.782 - +1.18 +/- 1.43 m,
-    #           t=0.83 - and a placebo that reassigns the coefficients to random keyframes scores
-    #           the same as lambda=0. Live it is destructive (ATE 39-48 vs 24.7). Kept runnable, not
-    #           recommended.
-    # 'jdsa'    the residual the SOLVER'S own alignment cannot absorb. depth_loss aligns with one
-    #           median scalar in depth; JDSA aligns with a 4-DOF bilinear field in DISPARITY, refit
-    #           every BA iteration (geom/ba.py:161-196). This fits that same family and penalises
-    #           what survives it, so the objective stops paying for errors the solver discards.
-    depth_loss: str
-    jdsa_norm: str           # 'jdsa' ONLY: 'l1' | 'l2' residual norm
-    jdsa_ridge: float        # 'jdsa' ONLY: ridge on the 4x4 normal equations, RELATIVE to their
-                             # mean diagonal, so it is unit-free. Guards the case where the mask
-                             # sits in one image region and the four corners are not determined.
-    jdsa_lattice: str        # 'jdsa' ONLY: 'full' = fit at vggt_hw (more points, better
-                             # conditioned) | 'ba' = interpolate to the tracking resolution and take
-                             # [3::8, 3::8], the 1/64 point subsample BA actually reads
-    coupling_shuffle: bool   # PLACEBO CONTROL, not a training option. Reassigns the fitted
-                             # coefficients to the window's keyframes at RANDOM, so the perturbation
-                             # keeps its magnitude and its zero sum but loses every connection to
-                             # depth. The point is to find out whether the measured ATE gain comes
-                             # from the slope constraint or merely from the size of the per-sample
-                             # pull; an arm with this on is a control arm and nothing else.
 
     def __post_init__(self):
-        if self.depth_loss not in DEPTH_LOSSES:
-            raise ValueError(f'depth_loss={self.depth_loss!r} is not one of {DEPTH_LOSSES}')
-        if self.jdsa_norm not in JDSA_NORMS:
-            raise ValueError(f'jdsa_norm={self.jdsa_norm!r} is not one of {JDSA_NORMS}')
-        if self.jdsa_lattice not in JDSA_LATTICES:
-            raise ValueError(f'jdsa_lattice={self.jdsa_lattice!r} is not one of {JDSA_LATTICES}')
-        if self.jdsa_ridge < 0:
-            raise ValueError(f'jdsa_ridge={self.jdsa_ridge} must be >= 0')
-        # The objective is ONE choice, and the coupling knobs are subordinate to it. Refused rather
-        # than resolved by precedence: a run that silently mixed two objectives would be
-        # indistinguishable on disk from one that did not, which is the failure that made an
-        # earlier replicate pair unreadable.
-        if self.depth_loss == 'coupled' and self.coupling_lambda <= 0:
-            raise ValueError(
-                f"depth_loss='coupled' needs coupling_lambda > 0, not {self.coupling_lambda}: the "
-                f"coupling term IS what 'coupled' adds, so this would be 'normal' under another "
-                f"name. Set the lambda, or set depth_loss='normal'.")
-        if self.depth_loss != 'coupled' and self.coupling_lambda > 0:
-            raise ValueError(
-                f"coupling_lambda={self.coupling_lambda} only has meaning under "
-                f"depth_loss='coupled', not {self.depth_loss!r}. Two objectives at once is never "
-                f'what is wanted, and the run\'s config.json would not show it.')
         if self.adapt_style not in ADAPT_STYLES:
             raise ValueError(f'adapt_style={self.adapt_style!r} is not one of {ADAPT_STYLES}')
         # only where it is read; whether it fits the keyframe count is data, checked in the trainer
@@ -219,26 +144,3 @@ class AdaptConfig:
             raise ValueError(f'train_frac={self.train_frac} must be in (0, 1]')
         if self.checkpoint_every < 0:
             raise ValueError(f'checkpoint_every={self.checkpoint_every} must be >= 0 (0 = off)')
-        if self.coupling_lambda < 0:
-            raise ValueError(f'coupling_lambda={self.coupling_lambda} must be >= 0 (0 = off)')
-        if self.coupling_axis not in COUPLING_AXES:
-            raise ValueError(f'coupling_axis={self.coupling_axis!r} is not one of {COUPLING_AXES}')
-        if self.coupling_min_var < 0:
-            raise ValueError(f'coupling_min_var={self.coupling_min_var} must be >= 0')
-        # refused rather than ignored, like coupling_lambda below: a placebo flag that quietly did
-        # nothing would put a control arm on disk that is really an ordinary lambda=0 run
-        if self.coupling_shuffle and self.coupling_lambda <= 0:
-            raise ValueError(
-                f'coupling_shuffle=True needs coupling_lambda > 0, not {self.coupling_lambda}: it '
-                f'permutes the coefficients the coupling term produces, and with the term off '
-                f'there are none. The control for a shuffled arm is the UNSHUFFLED arm at the same '
-                f'lambda, not this.')
-        # the slope is fitted over a WINDOW, which only the wonline style has. Refused rather than
-        # ignored: a silently-inert lambda would look like "the term did nothing" in the results.
-        if self.coupling_lambda > 0 and self.adapt_style != 'wonline':
-            raise ValueError(
-                f"coupling_lambda={self.coupling_lambda} needs adapt_style='wonline', not "
-                f"{self.adapt_style!r}: the slope is fitted over the window, and 'online' has a "
-                f"window of 1 (no slope) while 'normal' has no window at all. Fitting it over a "
-                f"batch instead is not an option - batch_size is typically 2 and a line through "
-                f"two points is exactly determined.")

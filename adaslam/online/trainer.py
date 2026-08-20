@@ -13,8 +13,8 @@ import time
 import numpy as np
 import torch
 
-from ..adapt.losses import depth_loss, jdsa_loss, median_scale, pose_loss, relative_loss
-from ..adapt.trainer import batches_of, coupling_fit
+from ..adapt.losses import depth_loss, pose_loss, relative_loss
+from ..adapt.trainer import batches_of
 
 from .target import LiveSampler, unit_keyframes
 
@@ -112,9 +112,8 @@ class LiveTrainer:
             # grad and are correct to cache.
             with torch.amp.autocast('cuda', dtype=torch.bfloat16, cache_enabled=False):
                 pred_depth, _ = self.lora.forward(images)
-            # ALWAYS depth_loss, never the run's objective: gate_lo/gate_hi are calibrated
-            # against this quantity (online/config.py's reference distributions), so measuring the
-            # gate in JDSA-residual units would silently invalidate every threshold ever recorded.
+            # gate_lo/gate_hi are calibrated against THIS quantity (online/config.py's
+            # reference distributions), so the gate must keep measuring the training loss itself.
             l_d, _ = depth_loss(pred_depth.float(), gt, mask, self.cfg)
         return relative_loss(l_d, gt, mask), float(l_d)
 
@@ -185,30 +184,6 @@ class LiveTrainer:
         if not batches:
             return None
 
-        # E3: one statistics pass per WINDOW, before any of its batches - the live counterpart of
-        # adapt/trainer.py:249-263. Placed AFTER the gate so the slope is only ever fitted over
-        # windows that are actually going to be stepped on.
-        #
-        # No sample caching is needed here, unlike offline: LiveSampler.sample takes no rng and is
-        # a pure function of (video, t), so this pass leaves self.rng - and therefore self.batches'
-        # permutation - untouched. A lambda=0 run is byte-identical to one from before this term.
-        #
-        # The model is still in eval_mode (train_mode is entered below), where offline it is in
-        # train mode. coupling_fit runs under no_grad, so the only thing that differs is the
-        # aggregator's gradient checkpointing - a no-op without a backward - and the statistics
-        # come out the same. Measuring in the serving mode also matches gate_value's reasoning.
-        coup_coef = {}
-        if self.cfg.coupling_lambda > 0:
-            samples = {int(t): self.sampler.sample(video, t) for t in kfs}
-            samples = {t: tuple(v.cuda() if torch.is_tensor(v) else v for v in s)
-                       for t, s in samples.items()}
-            b_hat, coup_coef, sum_x2 = coupling_fit(self.lora, self.cfg, samples)
-            if self.units % self.cfg.log_every == 0:
-                print(f'  [adapt] kf{self.units} coupling: '
-                      f'b={"n/a" if b_hat is None else f"{b_hat:+.4f}"}  sum_x2={sum_x2:.4f}  '
-                      f'over {len(samples)} kf')
-            del samples                      # the cuda tensors are re-drawn per step below
-
         if self.first_kf is None:
             self.first_kf = int(tstamp)      # a FRAME index, like trained_kf and the log's 'kfs'
 
@@ -217,7 +192,7 @@ class LiveTrainer:
         try:
             with torch.amp.autocast('cuda', enabled=False):
                 for step, batch in enumerate(batches):
-                    self._step(video, unit, step, len(batches), batch, coup_coef)
+                    self._step(video, unit, step, len(batches), batch)
         finally:
             self.lora.eval_mode()       # the extractor predicts next
 
@@ -228,13 +203,8 @@ class LiveTrainer:
         self._checkpoint()
         return unit
 
-    def _step(self, video, unit, step, n_steps, batch, coup_coef=None):
-        """One optimiser step over `batch`, as adapt/trainer.py:199-243. Returns the mean loss.
-
-        `coup_coef` is {keyframe: coefficient} from the window's coupling_fit, empty when the term
-        is off.
-        """
-        coup_coef = coup_coef or {}
+    def _step(self, video, unit, step, n_steps, batch):
+        """One optimiser step over `batch`, the live twin of adapt/trainer.py's. Returns its loss."""
         cfg = self.cfg
         self.opt.zero_grad(set_to_none=True)
         acc = {'loss': [], 'l_depth': [], 'l_trans': [], 'l_rot': [], 'scale_ratio': []}
@@ -249,30 +219,9 @@ class LiveTrainer:
             pred_depth, pred_enc = pred_depth.float(), pred_enc.float()
 
             l_t, l_r, pose_scale = pose_loss(pred_enc, gt_enc)
-            if cfg.depth_loss == 'jdsa':
-                # the residual the solver's own 2x2 disparity grid cannot absorb; the grid subsumes
-                # any single scale, so pose_scale is deliberately not handed to it as well
-                l_d, depth_scale = jdsa_loss(pred_depth, gt, mask, cfg, self.sampler.stream_hw)
-                with torch.no_grad():   # keep the train log comparable across objectives
-                    acc.setdefault('l_depth_aligned', []).append(
-                        depth_loss(pred_depth, gt, mask, cfg)[0].item())
-            else:
-                l_d, depth_scale = depth_loss(pred_depth, gt, mask, cfg,
-                                              scale=pose_scale if cfg.coupled_scale else None)
+            l_d, depth_scale = depth_loss(pred_depth, gt, mask, cfg,
+                                          scale=pose_scale if cfg.coupled_scale else None)
             loss = l_d + cfg.lambda_pose * (l_t + l_r)
-
-            # E3: the window's slope penalty, entered as its exact per-sample gradient. coef is a
-            # constant from the statistics pass, so this is linear in log s_i and the window's
-            # backward passes sum to grad(coupling_lambda * b^2) - PROVIDED they all land in one
-            # optimiser step, which is why batch_size should equal window_size (online/config.py).
-            # Recomputed rather than reused from depth_loss because `scale` may have come from
-            # pose_loss.
-            coef = coup_coef.get(int(t))
-            if coef:
-                l_coup = coef * median_scale(pred_depth.clamp(min=1e-3),
-                                             gt.clamp(min=1e-3), mask).log()
-                loss = loss + l_coup
-                acc.setdefault('l_coup', []).append(l_coup.item())
 
             # the MEAN over the batch, so grad magnitude is independent of batch_size
             (loss / len(batch)).backward()
@@ -283,8 +232,7 @@ class LiveTrainer:
             acc['l_depth'].append(l_d.item())
             acc['l_trans'].append(l_t.item())
             acc['l_rot'].append(l_r.item())
-            if (pose_scale is not None and depth_scale is not None
-                    and cfg.depth_loss != 'jdsa'):     # jdsa returns the 4-vector, not a scale
+            if pose_scale is not None and depth_scale is not None:
                 acc['scale_ratio'].append((depth_scale / pose_scale).item())
 
         torch.nn.utils.clip_grad_norm_(self.trainable, cfg.grad_clip)
@@ -339,14 +287,6 @@ class LiveTrainer:
                 'steps': len(self.log), 'lr': cfg.lr,
                 'weight_decay': cfg.weight_decay, 'grad_clip': cfg.grad_clip,
                 'lambda_pose': cfg.lambda_pose, 'coupled_scale': cfg.coupled_scale,
-                # E3. Recorded always, so an adapter says which objective produced it - a run made
-                # before these fields existed reads back as absent, which is the same as 0.0.
-                # WHICH OBJECTIVE produced this adapter - stated, so two arms cannot look alike
-                'depth_loss': cfg.depth_loss, 'jdsa_norm': cfg.jdsa_norm,
-                'jdsa_ridge': cfg.jdsa_ridge, 'jdsa_lattice': cfg.jdsa_lattice,
-                'coupling_lambda': cfg.coupling_lambda, 'coupling_axis': cfg.coupling_axis,
-                'coupling_min_var': cfg.coupling_min_var,
-                'coupling_shuffle': cfg.coupling_shuffle,
                 'context_kf': cfg.context_kf, 'lag': cfg.lag, 'seed': cfg.seed,
                 'stream_res': cfg.stream_res,
                 # SlamConfig.start, i.e. the frame every index above is offset by. Recorded so a

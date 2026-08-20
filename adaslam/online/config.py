@@ -7,10 +7,6 @@ the same; no field carries a default (9.5).
 """
 from dataclasses import dataclass
 
-# imported, not redeclared: adapt/trainer.py:coupling_fit reads cfg.coupling_axis against THIS
-# vocabulary, so a second copy could drift out of agreement with the code that consumes it
-from ..adapt.config import COUPLING_AXES, DEPTH_LOSSES, JDSA_LATTICES, JDSA_NORMS
-
 # The two adapt/trainer.py:schedule styles that are meaningful live. 'normal' is not: an epoch over
 # a fixed train set does not exist while the set is still arriving.
 ONLINE_STYLES = ('online', 'wonline')
@@ -100,41 +96,6 @@ class OnlineConfig:
     gate_lo: float               # 0 = off; skip below this. Already-fit frames.
     gate_hi: float               # 0 = off; skip above this. Broken/degenerate targets.
 
-    # ---------------------------------------------------------------- depth->scale coupling (E3)
-    # The same term adapt/config.py documents, ported live. depth_loss aligns scale PER SAMPLE, so
-    # L(c*p) = L(p) exactly and the per-frame output scale has identically zero gradient; this puts
-    # a gradient on its DEPTH-COUPLED part - s_i varying with how far the scene is - and on nothing
-    # else. Fitted over the arrival's WINDOW by adapt/trainer.py:coupling_fit, which is called
-    # unchanged: it reads only the four field names below plus min_mask_pixels.
-    #
-    # 0.0 IS THE OLD LOSS, bit for bit - the statistics pass is skipped entirely.
-    #
-    # Offline this term is measured, and the measurement carries a warning worth repeating here:
-    # its per-sample coefficients sum to zero only over the WHOLE window, so at batch_size <<
-    # window_size each optimiser step applies a large uncancelled fragment (30x the depth term at
-    # lambda=1, batch_size=2) which grad_clip then renormalises - the depth signal is effectively
-    # erased and the scale is pushed around at random. Set batch_size = window_size here.
-    coupling_lambda: float   # 0.0 = OFF
-    coupling_axis: str       # 'target' = median TARGET depth (recommended: the network does not
-                             #            control the axis, so it cannot game the fit)
-                             # 'pred'   = median PREDICTED depth; invites range collapse
-    coupling_min_var: float  # skip the term when the window has no depth spread (SUM(x~^2) below
-                             # this), where the slope would be an ill-conditioned division
-    # ---------------------------------------------------------------- WHICH OBJECTIVE (the knob)
-    # The same three AdaptConfig documents, with the same meanings: 'normal' is every run before
-    # this field existed, 'coupled' adds E3's slope penalty (measured null offline and destructive
-    # live), 'jdsa' penalises the residual the solver's own 2x2 disparity grid cannot absorb.
-    # The jdsa_* fields are unread outside 'jdsa', exactly as window_size is unread outside
-    # 'wonline'.
-    depth_loss: str
-    jdsa_norm: str           # 'l1' | 'l2'
-    jdsa_ridge: float        # ridge on the 4x4 normal equations, relative to their mean diagonal
-    jdsa_lattice: str        # 'full' = fit at vggt_hw | 'ba' = the [3::8,3::8] grid BA reads
-    coupling_shuffle: bool   # PLACEBO CONTROL, as AdaptConfig documents. Present here because
-                             # coupling_fit is duck-typed on the config and reads this field, so a
-                             # live run without it would fail inside the training loop rather than
-                             # at construction. Leave False unless the run IS a control arm.
-
     # ---------------------------------------------------------------- output
     checkpoint_every_kf: int     # 0 = off; N = a full loadable adapter dir every N adapted units
 
@@ -171,59 +132,6 @@ class OnlineConfig:
         for name in ('gate_lo', 'gate_hi'):
             if getattr(self, name) < 0:
                 raise ValueError(f'{name}={getattr(self, name)} must be >= 0 (0 = off)')
-        if self.depth_loss not in DEPTH_LOSSES:
-            raise ValueError(f'depth_loss={self.depth_loss!r} is not one of {DEPTH_LOSSES}')
-        if self.jdsa_norm not in JDSA_NORMS:
-            raise ValueError(f'jdsa_norm={self.jdsa_norm!r} is not one of {JDSA_NORMS}')
-        if self.jdsa_lattice not in JDSA_LATTICES:
-            raise ValueError(f'jdsa_lattice={self.jdsa_lattice!r} is not one of {JDSA_LATTICES}')
-        if self.jdsa_ridge < 0:
-            raise ValueError(f'jdsa_ridge={self.jdsa_ridge} must be >= 0')
-        # the objective is ONE choice; the coupling knobs are subordinate to it (adapt/config.py)
-        if self.depth_loss == 'coupled' and self.coupling_lambda <= 0:
-            raise ValueError(f"depth_loss='coupled' needs coupling_lambda > 0, not "
-                             f'{self.coupling_lambda}')
-        if self.depth_loss != 'coupled' and self.coupling_lambda > 0:
-            raise ValueError(f'coupling_lambda={self.coupling_lambda} only has meaning under '
-                             f"depth_loss='coupled', not {self.depth_loss!r}")
-        if self.coupling_lambda < 0:
-            raise ValueError(f'coupling_lambda={self.coupling_lambda} must be >= 0 (0 = off)')
-        if self.coupling_axis not in COUPLING_AXES:
-            raise ValueError(f'coupling_axis={self.coupling_axis!r} is not one of {COUPLING_AXES}')
-        if self.coupling_min_var < 0:
-            raise ValueError(f'coupling_min_var={self.coupling_min_var} must be >= 0')
-        if self.coupling_shuffle and self.coupling_lambda <= 0:
-            raise ValueError(
-                f'coupling_shuffle=True needs coupling_lambda > 0, not {self.coupling_lambda}: it '
-                f'permutes the coefficients the coupling term produces, and with the term off '
-                f'there are none.')
-        # Refused rather than ignored, for the reason adapt/config.py gives: a silently-inert lambda
-        # would look like "the term did nothing" in the results instead of like a misconfiguration.
-        if self.coupling_lambda > 0 and self.adapt_style != 'wonline':
-            raise ValueError(
-                f"coupling_lambda={self.coupling_lambda} needs adapt_style='wonline', not "
-                f"{self.adapt_style!r}: the slope is fitted over the arrival's window, and 'online' "
-                f'trains on the arrival alone - one point carries no slope.')
-        # coupling_fit needs three points to return anything, so a shorter window is inert as well.
-        # Note the window is CLIPPED at the start of the sequence (target.py:unit_keyframes), so
-        # the first arrivals are short regardless; those units simply get no coupling term.
-        if self.coupling_lambda > 0 and self.window_size < 3:
-            raise ValueError(
-                f'coupling_lambda={self.coupling_lambda} needs window_size >= 3, not '
-                f'{self.window_size}: adapt/trainer.py:coupling_fit returns no coefficients below '
-                f'three points, so the term would never fire.')
-        # WARNED, not refused: batch_size < window_size is a legitimate thing to measure, and the
-        # offline sweep did exactly that. But it is also the configuration that broke the term
-        # there, and the failure is silent - the run trains, the loss looks plausible, and only the
-        # prior's scale statistics show the damage. Printing costs nothing and a config is built
-        # once per run.
-        if self.coupling_lambda > 0 and self.batch_size < self.window_size:
-            print(f'note: coupling_lambda={self.coupling_lambda} with batch_size='
-                  f'{self.batch_size} < window_size={self.window_size}. The per-sample '
-                  f'coefficients sum to zero only over the WHOLE window, so each step applies an '
-                  f'uncancelled ~{self.window_size // max(self.batch_size, 1)}x fragment that '
-                  f'grad_clip then renormalises. Set batch_size={self.window_size} unless the '
-                  f'point of the run IS this ratio.')
         if 0 < self.gate_hi <= self.gate_lo:
             raise ValueError(f'gate_hi={self.gate_hi} must exceed gate_lo={self.gate_lo}: with '
                              f'both set the gate keeps the BAND between them, so this would skip '

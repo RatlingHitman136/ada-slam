@@ -134,55 +134,7 @@ ADAPT = AdaptConfig(
     eval_every_epoch=False,    # False = only before training and after the last unit
     eval_max_kf=100,           # subsample each eval subset to at most this many; 0 = no cap
     keep_best=False,           # False = save the last epoch; True = snapshot on val improvement
-    checkpoint_every=0,        # 0 = off; N = a loadable adapter dir in ADAPT_CKPT every N epochs
-    # ---- WHICH OBJECTIVE (the knob) ----
-    # 'normal'  masked L1 in DEPTH after a per-sample median scale. Every run before this knob
-    #           existed, bit for bit.
-    # 'coupled' 'normal' + E3's lambda*b^2 slope penalty. MEASURED AND NULL: three seeds put
-    #           lambda=0 at 24.96 +/- 1.75 against lambda=1's 23.78 (t=0.83), and the placebo that
-    #           reassigns the coefficients at random scored the same as lambda=0. Needs
-    #           coupling_lambda > 0.
-    # 'jdsa'    the residual the SOLVER cannot absorb. depth_loss aligns with one median scalar in
-    #           depth; JDSA aligns with a 4-DOF bilinear field in DISPARITY, refit every BA
-    #           iteration (geom/ba.py:161-196). This fits that same family and penalises what
-    #           survives it, so the objective stops paying for what the solver discards.
-    depth_loss='jdsa',
-    jdsa_norm='l2',            # 'jdsa' ONLY: L2 weights far pixels and outliers hard, and the
-                               # targets are masked tracker depth. L2 only once L1 works.
-    jdsa_ridge=1e-6,           # 'jdsa' ONLY: ridge on the 4x4 normal equations, RELATIVE to their
-                               # mean diagonal. Guards a mask confined to one image region, where
-                               # the four corners are not determined.
-    jdsa_lattice='full',       # 'jdsa' ONLY: 'full' = fit at vggt_hw (more points, better
-                               # conditioned) | 'ba' = the [3::8,3::8] 1/64 subsample BA reads
-
-    # ---- E3: penalise the depth->scale coupling (the objective change) ----
-    # depth_loss aligns scale per sample, so L(c*p) = L(p) exactly and the per-frame output scale
-    # has ZERO gradient. This adds lambda * b^2, where b is the slope of log(s_i) on log(median
-    # depth) fitted over the window, to put a gradient on its depth-coupled part.
-    #
-    # 0.0 IS THE OLD LOSS, bit for bit: the statistics pass is skipped entirely.
-    # Requires adapt_style='wonline' (the slope needs a window; batch_size 2 cannot carry a fit).
-    #
-    # MEASURED, and it does NOT mean what it was built to mean. lambda in [0.3, 3] is worth 3-4 m
-    # of ATE, but: batch_size = window_size, which applies the derived gradient exactly, is WORSE
-    # than the fragmented batches that apply it wrong (23.7-28.3 vs 22.7-24.0); and CV_depth, the
-    # quantity the term minimises, correlates +0.02 with ATE over 17 p10 arms. The gain looks like
-    # the SIZE of the per-sample pull, not its direction - which is what coupling_shuffle tests.
-    coupling_lambda=0.0,
-    coupling_axis='target',    # 'target' = median TARGET depth. Prefer it: the network does not
-                               # control the axis. 'pred' lets it satisfy the penalty by
-                               # collapsing every predicted median to one value = range collapse.
-    coupling_min_var=1e-4,     # skip the term when the window has no depth spread (sum x~^2 below
-                               # this), where b would be an ill-conditioned division
-    # ---- the placebo control (N1) ----
-    # True reassigns the fitted coefficients to the window's keyframes at RANDOM: same magnitudes,
-    # same zero sum, same lambda, no connection to depth. An arm with this on is a CONTROL, and its
-    # comparison is the unshuffled arm at the same lambda and seed, not the lambda=0 baseline.
-    #   placebo ~= lambda=1 (23.8)  -> the depth pairing is incidental; the gain is the perturbation
-    #   placebo ~= lambda=0 (27.0)  -> the slope constraint really is what pays
-    # Run at alpha=16, where the lambda effect (3.2 m) clears the ~2 m run-to-run floor; at alpha=8
-    # it is only ~1.1 m and a placebo could not be read against it.
-    coupling_shuffle=False)
+    checkpoint_every=0)        # 0 = off; N = a loadable adapter dir in ADAPT_CKPT every N epochs
 
 # ---------------------------------------------------------------- end2end test (stage 3)
 

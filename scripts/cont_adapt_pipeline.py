@@ -141,33 +141,7 @@ ADAPT = AdaptConfig(
     eval_every_epoch=False,    # False = only before training and after the last unit
     eval_max_kf=200,           # subsample each eval subset evenly to at most this many; 0 = no cap
     keep_best=False,           # False = save the last epoch; True = snapshot on val improvement
-    checkpoint_every=0,        # 0 = off; N = a loadable adapter dir in ADAPT_CKPT every N epochs
-    # ---- WHICH OBJECTIVE (the knob) ----
-    # 'normal'  masked L1 in DEPTH after a per-sample median scale. Every run before this knob
-    #           existed, bit for bit.
-    # 'coupled' 'normal' + E3's lambda*b^2 slope penalty. MEASURED AND NULL: three seeds put
-    #           lambda=0 at 24.96 +/- 1.75 against lambda=1's 23.78 (t=0.83), and the placebo that
-    #           reassigns the coefficients at random scored the same as lambda=0. Needs
-    #           coupling_lambda > 0.
-    # 'jdsa'    the residual the SOLVER cannot absorb. depth_loss aligns with one median scalar in
-    #           depth; JDSA aligns with a 4-DOF bilinear field in DISPARITY, refit every BA
-    #           iteration (geom/ba.py:161-196). This fits that same family and penalises what
-    #           survives it, so the objective stops paying for what the solver discards.
-    depth_loss='normal',
-    jdsa_norm='l1',            # 'jdsa' ONLY: L2 weights far pixels and outliers hard, and the
-                               # targets are masked tracker depth. L2 only once L1 works.
-    jdsa_ridge=1e-6,           # 'jdsa' ONLY: ridge on the 4x4 normal equations, RELATIVE to their
-                               # mean diagonal. Guards a mask confined to one image region, where
-                               # the four corners are not determined.
-    jdsa_lattice='full',       # 'jdsa' ONLY: 'full' = fit at vggt_hw (more points, better
-                               # conditioned) | 'ba' = the [3::8,3::8] 1/64 subsample BA reads
-
-    # ---- E3: depth->scale coupling penalty. 0.0 = the old loss, bit for bit (see
-    # init_adapt_pipeline.py for the full note). Requires adapt_style='wonline'. ----
-    coupling_lambda=0.0,
-    coupling_axis='target',
-    coupling_min_var=1e-4,
-    coupling_shuffle=False)    # placebo control; only ever True for a control arm, needs lambda > 0
+    checkpoint_every=0)        # 0 = off; N = a loadable adapter dir in ADAPT_CKPT every N epochs
 
 # ---------------------------------------------------------------- end2end test (stage 3)
 # one entry per DEPTH-PRIOR GENERATOR; its arm directory is INFERRED from it, never typed (7.1)
