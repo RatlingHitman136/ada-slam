@@ -43,8 +43,7 @@ from adaslam.slam import SlamConfig, SlamRunner
 # ==============================================================================
 
 # ---------------------------------------------------------------- data (preprocessing is NOT here)
-# TUM:    SCENE 'rgbd_dataset_freiburg1_room', DATA f'data/TUM/{SCENE}', config/tum_config.yaml,
-#         DEPTH_PNG_SCALE 6553.5
+# TUM: SCENE 'rgbd_dataset_freiburg1_room', config/tum_config.yaml, DEPTH_PNG_SCALE 6553.5
 SCENE   = 'rellis_00000'               # names the outputs/ tree
 DATA    = 'data/RELLIS/00000'          # preprocess_rellis3d.py's output layout
 COLORS  = f'{DATA}/colors'
@@ -75,7 +74,10 @@ RENDER_EVAL      = False               # hi2.py's eval_rendering -> renders/ + p
 # ---------------------------------------------------------------- experiment names
 # REQUIRED, unique within its scene only; lineage is recorded in the adapter's config.json
 OUT_ROOT    = 'outputs'
-ONLINE_NAME = 'live_e12_w10_a16_w12_lag3_hi2_low045_rel_base'
+# the E3 coupling term live, against live_e8_w10_a16_w12_lag3_hi2_low035_raw_base (ATE 24.722,
+# 2690 s): IDENTICAL in every field, coupling_lambda 0 -> 1. That arm is the best raw-gated live
+# run on this scene, and the pair is the only comparison this run supports.
+ONLINE_NAME = 'live_e1_w10_a16_w12_lag3_jdsa_l2_lr3__lo10_base'
 
 # ---------------------------------------------------------------- stage I/O
 # a stage RECEIVES these and reads no path global; pure string joins, no disk access in this block
@@ -103,7 +105,7 @@ SLAM = SlamConfig(
     render_eval=RENDER_EVAL)
 
 # ---------------------------------------------------------------- the adapter structure
-# Recorded into the adapter's config.json, so an arm always runs the model it was trained in.
+# recorded into the adapter's config.json, so an arm always runs the model it was trained in
 LORA = LoRAConfig(
     weights='pretrained_models/vggt',
     vggt_hw=VGGT_HW,           # None -> derived in main()
@@ -120,7 +122,7 @@ ONLINE = OnlineConfig(
 
     # ---- schedule: the vocabulary of adapt/trainer.py:schedule, live ----
     adapt_style='wonline',      # 'online' = the arrival alone | 'wonline' = a sliding window
-    steps_per_kf=12,            # steps ('online') / shuffled passes ('wonline') per arrival
+    steps_per_kf=1,             # steps ('online') / shuffled passes ('wonline') per arrival
     window_size=10,             # 'wonline' ONLY
     batch_size=2,              # 'wonline' ONLY - a keyframe arrives alone in 'online'
     lag=3,                     # keyframes back from the end the target is taken
@@ -130,7 +132,7 @@ ONLINE = OnlineConfig(
     stream_res=STREAM_RES,     # must equal SLAM.stream_res
 
     # ---- optimisation ----
-    lr=1.2e-4,
+    lr=1.0e-4,
     weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
     coupled_scale=True, min_mask_pixels=16, seed=0,
     log_every=5,               # every step: there are only steps_per_kf of them per keyframe
@@ -143,11 +145,62 @@ ONLINE = OnlineConfig(
     # ---- the loss gate: skip an arrival whose newest keyframe is not worth training on ----
     # both quantities are always measured into gate_log.json; this only picks the deciding one
     gate_metric='raw',         # 'rel' = relative loss, flat across a run | 'raw' = drifts with it
-    gate_lo=0.045,             # 0 = off; skip BELOW this - the target already fits
-    gate_hi=0.2,               # 0 = off; skip ABOVE this - the target is broken, not hard
+    gate_lo=0.001,             # 0 = off; skip BELOW this - the target already fits
+    gate_hi=0,               # 0 = off; skip ABOVE this - the target is broken, not hard
+
+    # ---- WHICH OBJECTIVE (the knob) ----
+    # 'normal'  masked L1 in DEPTH after a per-sample median scale. Every run before this knob
+    #           existed, bit for bit.
+    # 'coupled' 'normal' + E3's lambda*b^2 slope penalty. MEASURED AND NULL: three seeds put
+    #           lambda=0 at 24.96 +/- 1.75 against lambda=1's 23.78 (t=0.83), and the placebo that
+    #           reassigns the coefficients at random scored the same as lambda=0. Needs
+    #           coupling_lambda > 0.
+    # 'jdsa'    the residual the SOLVER cannot absorb. depth_loss aligns with one median scalar in
+    #           depth; JDSA aligns with a 4-DOF bilinear field in DISPARITY, refit every BA
+    #           iteration (geom/ba.py:161-196). This fits that same family and penalises what
+    #           survives it, so the objective stops paying for what the solver discards.
+    depth_loss='jdsa',
+    jdsa_norm='l2',            # 'jdsa' ONLY: L2 weights far pixels and outliers hard, and the
+                               # targets are masked tracker depth. L2 only once L1 works.
+    jdsa_ridge=1e-6,           # 'jdsa' ONLY: ridge on the 4x4 normal equations, RELATIVE to their
+                               # mean diagonal. Guards a mask confined to one image region, where
+                               # the four corners are not determined.
+    jdsa_lattice='full',       # 'jdsa' ONLY: 'full' = fit at vggt_hw (more points, better
+                               # conditioned) | 'ba' = the [3::8,3::8] 1/64 subsample BA reads
+
+    # ---- E3: penalise the depth->scale coupling (the objective change) ----
+    # depth_loss aligns scale per sample, so L(c*p) = L(p) exactly and the per-frame output scale
+    # has ZERO gradient. Its depth-coupled part - scale varying with how far the scene is, i.e.
+    # range compression - is what correlates with ATE offline. This adds lambda * b^2 where b is
+    # the slope of log(s_i) on log(median depth), fitted over the arrival's window.
+    #
+    # 0.0 IS THE OLD LOSS, bit for bit: the statistics pass is skipped entirely.
+    #
+    # WHAT THE OFFLINE RESULT SAYS, so this run is read honestly. On p10 the term is a NULL: over
+    # three seeds lambda=0 spans 23.680-26.958 (sd 1.75) and lambda=1 sits at 23.782, i.e.
+    # +1.18 +/- 1.43 m, t=0.83. A placebo that keeps the coefficients but reassigns them to random
+    # keyframes scores 25.006, statistically identical to lambda=0. Offline, nothing here works.
+    # This run exists because the LIVE setting is genuinely different - the window is short and its
+    # targets are still moving under local BA - not because the offline evidence is encouraging.
+    # Expect no effect; a single live pair cannot establish one either way.
+    #
+    # batch_size(2) < window_size(10) is DELIBERATE: it matches the reference arm, and changing two
+    # knobs at once would make the comparison meaningless. The config will print a note about the
+    # uncancelled per-step fragment (~5x here) - that is the honest description of this setting,
+    # not a misconfiguration to fix. Offline, batch_size = window_size was not better.
+    # Requires adapt_style='wonline' and window_size >= 3.
+    coupling_lambda=0,
+    coupling_axis='target',    # 'target' = median TARGET depth. Prefer it: the network does not
+                               # control the axis. 'pred' lets it satisfy the penalty by collapsing
+                               # every predicted median to one value = range collapse.
+    coupling_min_var=1e-4,     # skip the term when the window has no depth spread (sum x~^2 below
+                               # this), where b would be an ill-conditioned division
+    coupling_shuffle=False,    # PLACEBO CONTROL - reassigns the coefficients to keyframes at random,
+                               # keeping their magnitude and zero sum but destroying the link to
+                               # depth. Only ever True for a control arm; needs coupling_lambda > 0.
 
     # ---- output ----
-    checkpoint_every_kf=50)    # 0 = off; N = a loadable adapter dir every N adapted keyframes
+    checkpoint_every_kf=0)    # 0 = off; N = a loadable adapter dir every N adapted keyframes
 
 # ---------------------------------------------------------------- reference arms (stage 2)
 # ordinary frozen arms, reused from disk so a scene pays for them once; [0] is the baseline column

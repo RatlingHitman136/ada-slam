@@ -37,8 +37,7 @@ from adaslam.slam import SlamConfig, SlamRunner
 # ==============================================================================
 
 # ---------------------------------------------------------------- data (preprocessing is NOT here)
-# TUM:    SCENE 'rgbd_dataset_freiburg1_room', DATA f'data/TUM/{SCENE}', config/tum_config.yaml,
-#         DEPTH_PNG_SCALE 6553.5, PRIOR eval 0.1-10 m
+# TUM: SCENE 'rgbd_dataset_freiburg1_room', tum_config.yaml, scale 6553.5, PRIOR eval 0.1-10 m
 SCENE   = 'rellis_00000'               # names the outputs/ tree
 DATA    = 'data/RELLIS/00000'          # preprocess_rellis3d.py's output layout
 COLORS  = f'{DATA}/colors'
@@ -48,13 +47,12 @@ CALIB   = f'{DATA}/calib.txt'
 CONFIG  = 'config/rellis_config.yaml'
 DROID_WEIGHTS = 'pretrained_models/droid.pth'
 
-# undistort offline in preprocess_tum.py instead - consumers re-derive a frame with stream_resize
-# alone, so doing it here misaligns predictions and GT (10.1)
+# undistort offline in the preprocess script instead, or predictions and GT misalign (10.1)
 UNDISTORT   = False
 CROP_BORDER = 0
 
 # ---------------------------------------------------------------- run control
-STAGES           = ('prior',)          # any subset; run in pipeline order
+STAGES           = ('adapt', 'end2end')          # any subset; run in pipeline order
 SKIP_EXISTING    = True                # reuse a stage's output if it is already on disk
 MIN_FREE_VRAM_MB = 7000                # shared GPU: checked once at the start of main()
 FRACTION         = 7                   # % of the window the adapter trains on; also SPLIT_AT
@@ -70,8 +68,8 @@ RENDER_EVAL      = False               # hi2.py's eval_rendering -> renders/ + p
 # ---------------------------------------------------------------- experiment names
 # both REQUIRED, unique within their scene only; lineage is recorded in the adapter's config.json
 OUT_ROOT     = 'outputs'
-EXTRACT_NAME = 'low_dense_kf'
-ADAPT_NAME   = 'live_e3_w10_a16_w12_lag3_more_chkp_base'
+EXTRACT_NAME = 'dense_kf_p10'
+ADAPT_NAME   = 'wonline_a16_e5_w10_jdsa_l2_lr5_p10'
 
 # ---------------------------------------------------------------- stage I/O
 # a stage RECEIVES these and reads no path global; pure string joins, no disk access in this block
@@ -122,10 +120,10 @@ LORA = LoRAConfig(
 ADAPT = AdaptConfig(
     stream_res=STREAM_RES,
     p_single_view=1, max_left=4, max_right=4, radius=8,
-    adapt_style='normal',      # 'normal' epochs | 'online' per arrival | 'wonline' sliding window
-    epochs=10, batch_size=2,
+    adapt_style='wonline',     # 'normal' epochs | 'online' per arrival | 'wonline' sliding window
+    epochs=5, batch_size=2,
     window_size=10,            # 'wonline' only
-    lr=0.5e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
+    lr=5.0e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
     coupled_scale=True, min_mask_pixels=16, seed=0, log_every=20,
     # ---- which exported keyframes are trained on, and what the rest are for ----
     kf_fraction=1.0,           # 1.0 = every exported keyframe; < 1 = equidistant sample of them
@@ -133,38 +131,70 @@ ADAPT = AdaptConfig(
     train_frac=1.0,            # 'tail' ONLY; 1.0 = train on every keyframe, no val set
     eval_on_val=True,          # depth L1 on held-out keyframes, base vs adapted
     eval_on_train=True,        # also on the train subset, so the train/val gap is visible
-    eval_every_epoch=False,     # False = only before training and after the last unit
+    eval_every_epoch=False,    # False = only before training and after the last unit
     eval_max_kf=100,           # subsample each eval subset to at most this many; 0 = no cap
     keep_best=False,           # False = save the last epoch; True = snapshot on val improvement
-    checkpoint_every=0)        # 0 = off; N = a loadable adapter dir in ADAPT_CKPT every N epochs
+    checkpoint_every=0,        # 0 = off; N = a loadable adapter dir in ADAPT_CKPT every N epochs
+    # ---- WHICH OBJECTIVE (the knob) ----
+    # 'normal'  masked L1 in DEPTH after a per-sample median scale. Every run before this knob
+    #           existed, bit for bit.
+    # 'coupled' 'normal' + E3's lambda*b^2 slope penalty. MEASURED AND NULL: three seeds put
+    #           lambda=0 at 24.96 +/- 1.75 against lambda=1's 23.78 (t=0.83), and the placebo that
+    #           reassigns the coefficients at random scored the same as lambda=0. Needs
+    #           coupling_lambda > 0.
+    # 'jdsa'    the residual the SOLVER cannot absorb. depth_loss aligns with one median scalar in
+    #           depth; JDSA aligns with a 4-DOF bilinear field in DISPARITY, refit every BA
+    #           iteration (geom/ba.py:161-196). This fits that same family and penalises what
+    #           survives it, so the objective stops paying for what the solver discards.
+    depth_loss='jdsa',
+    jdsa_norm='l2',            # 'jdsa' ONLY: L2 weights far pixels and outliers hard, and the
+                               # targets are masked tracker depth. L2 only once L1 works.
+    jdsa_ridge=1e-6,           # 'jdsa' ONLY: ridge on the 4x4 normal equations, RELATIVE to their
+                               # mean diagonal. Guards a mask confined to one image region, where
+                               # the four corners are not determined.
+    jdsa_lattice='full',       # 'jdsa' ONLY: 'full' = fit at vggt_hw (more points, better
+                               # conditioned) | 'ba' = the [3::8,3::8] 1/64 subsample BA reads
+
+    # ---- E3: penalise the depth->scale coupling (the objective change) ----
+    # depth_loss aligns scale per sample, so L(c*p) = L(p) exactly and the per-frame output scale
+    # has ZERO gradient. This adds lambda * b^2, where b is the slope of log(s_i) on log(median
+    # depth) fitted over the window, to put a gradient on its depth-coupled part.
+    #
+    # 0.0 IS THE OLD LOSS, bit for bit: the statistics pass is skipped entirely.
+    # Requires adapt_style='wonline' (the slope needs a window; batch_size 2 cannot carry a fit).
+    #
+    # MEASURED, and it does NOT mean what it was built to mean. lambda in [0.3, 3] is worth 3-4 m
+    # of ATE, but: batch_size = window_size, which applies the derived gradient exactly, is WORSE
+    # than the fragmented batches that apply it wrong (23.7-28.3 vs 22.7-24.0); and CV_depth, the
+    # quantity the term minimises, correlates +0.02 with ATE over 17 p10 arms. The gain looks like
+    # the SIZE of the per-sample pull, not its direction - which is what coupling_shuffle tests.
+    coupling_lambda=0.0,
+    coupling_axis='target',    # 'target' = median TARGET depth. Prefer it: the network does not
+                               # control the axis. 'pred' lets it satisfy the penalty by
+                               # collapsing every predicted median to one value = range collapse.
+    coupling_min_var=1e-4,     # skip the term when the window has no depth spread (sum x~^2 below
+                               # this), where b would be an ill-conditioned division
+    # ---- the placebo control (N1) ----
+    # True reassigns the fitted coefficients to the window's keyframes at RANDOM: same magnitudes,
+    # same zero sum, same lambda, no connection to depth. An arm with this on is a CONTROL, and its
+    # comparison is the unshuffled arm at the same lambda and seed, not the lambda=0 baseline.
+    #   placebo ~= lambda=1 (23.8)  -> the depth pairing is incidental; the gain is the perturbation
+    #   placebo ~= lambda=0 (27.0)  -> the slope constraint really is what pays
+    # Run at alpha=16, where the lambda effect (3.2 m) clears the ~2 m run-to-run floor; at alpha=8
+    # it is only ~1.1 m and a placebo could not be read against it.
+    coupling_shuffle=False)
 
 # ---------------------------------------------------------------- end2end test (stage 3)
-# one entry per DEPTH-PRIOR GENERATOR; its arm directory is INFERRED from it, never typed (7.1)
 
 
 # another adapt run's handoff directory; both prior lists below use it
 def _a(name):
     return experiment_dir(OUT_ROOT, 'adapt', SCENE_KEY, name)
 
-
-E8 = _a('live_e8_w10_a16_w12_lag3_base')
-
-# comments are unit, last TRAINING frame and share of the sequence - read off train_log.json
+# one entry per generator, arm directory INFERRED (7.1); comments are unit, frame, share of sequence
 END2END_PRIORS = (
     'omnidata', 'vggt_base',     # priors[0] is the baseline column
-    f'{ADAPT_CKPT}/epoch_004',   # unit   4, frame  190,  6.7%
-    f'{ADAPT_CKPT}/epoch_009',   # unit   9, frame  222,  7.8%
-    f'{ADAPT_CKPT}/epoch_014',   # unit  14, frame  299, 10.5%
-    f'{ADAPT_CKPT}/epoch_024',   # unit  24, frame  421, 14.8%
-    f'{ADAPT_CKPT}/epoch_039',   # unit  39, frame  559, 19.7%
-    f'{ADAPT_CKPT}/epoch_049',   # unit  49, frame  694, 24.4%
-    f'{ADAPT_CKPT}/epoch_079',   # unit  79, frame 1033, 36.3%
-    f'{ADAPT_CKPT}/epoch_124',   # unit 124, frame 1442, 50.7%
-    f'{ADAPT_CKPT}/epoch_179',   # unit 179, frame 2044, 71.8%
-    f'{ADAPT_CKPT}/epoch_229',   # unit 229, frame 2500, 87.8%
-    f'{E8}/{ADAPT_CKPT_SUBDIR}/epoch_049',        # the other run at unit 49, frame 694, 24.4%
     ADAPT_OUT,                   # this run's final adapter, frozen
-    E8,                          # the other run's final adapter, frozen
 )
 
 END2END = End2EndConfig(
@@ -178,15 +208,7 @@ END2END = End2EndConfig(
 
 # ---------------------------------------------------------------- prior test (stage 4)
 # the same generators vs GT depth, no SLAM run - it attributes an end2end null (9.2.2)
-PRIOR_PRIORS = (
-    _a('live_e1_w10_a16_w12_lag3_base'),           # priors[0] is the baseline column
-    _a('live_e5_w10_a16_w12_lag3_base'),
-    _a('live_e10_w10_a16_w12_lag3_base'),
-    _a('live_e12_w10_a16_w12_lag3_base'),
-    _a('live_e1_w10_lr1.2_a16_w12_lag3_base'),
-    _a('live_e3_w10_a16_w12_lag3_more_chkp_base'),
-    _a('live_e8_w10_a16_w12_lag3_base'),
-)
+PRIOR_PRIORS = END2END_PRIORS
 
 PRIOR = PriorTestConfig(
     priors=PRIOR_PRIORS,

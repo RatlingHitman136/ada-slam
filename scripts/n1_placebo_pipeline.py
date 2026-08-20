@@ -1,15 +1,47 @@
-"""CONTINUAL adaptation: extract the WHOLE sequence, adapt on a thin slice of it, test (9.7).
+"""N1, the PLACEBO experiment: is E3's ATE gain the slope constraint, or just the perturbation?
 
-    python scripts/cont_adapt_pipeline.py    # from the repo root, adaslam venv active
+    python scripts/n1_placebo_pipeline.py    # from the repo root, adaslam venv active
 
-  1 extract  HI-SLAM2 over the whole sequence at STOCK keyframe density, no kf_* overrides
-  2 adapt    LoRA-adapt VGGT on KF_FRACTION of those keyframes, taken EQUIDISTANT over the list,
-             continuing from ADAPT_INIT_NAME's adapter or from stock VGGT-1B
-  3 end2end  one full-sequence arm per generator in END2END_PRIORS, then ATE side by side
-  4 prior    the same generators vs GT depth directly, no SLAM run
+A copy of init_adapt_pipeline.py that differs ONLY in carrying the N1 arm matrix below. It is a
+separate file rather than an edit of that one because the config literals here are re-executed in
+every spawned reader child, so editing the driver of a RUNNING arm would reach into that run.
 
-Siblings: init_adapt_pipeline.py (9.1) adapts on a densified prefix; online_adapt_pipeline.py (13)
-adapts during the run itself. Run the preprocess script first.
+WHY THIS EXPERIMENT EXISTS. coupling_lambda in [0.3, 3] is worth 3-4 m of ATE, but two results say
+the stated mechanism is not what pays for it:
+
+  * batch_size = window_size applies the derived gradient EXACTLY, and is worse than the fragmented
+    batches that apply it wrong (23.7-28.3 vs 22.7-24.0);
+  * CV_depth, the quantity the term minimises, correlates +0.02 with ATE over 17 p10 arms, and the
+    best-consistency adapter ever trained is the worst arm.
+
+Both follow if the gain comes from the SIZE of the per-sample pull rather than from which keyframe
+it lands on. coupling_shuffle reassigns the fitted coefficients to keyframes at random - same
+magnitudes, same zero sum, same lambda, no connection to depth - so a shuffled arm and its
+unshuffled twin differ in exactly the thing the term claims to be doing.
+
+RESULT SO FAR (both placebo arms done): 25.035 and 24.978, against lambda=0's 26.958 and lambda=1's
+22.772/24.791. The placebo leaves b at +0.87/+0.81 - the UNADAPTED BASE MODEL's value, above
+lambda=0's +0.622 - so it does not reduce the slope at all, and gains 1.95 m anyway. Whatever the
+term is buying, it is not the slope constraint.
+
+It is not the perturbation's size either: across every arm the pull spans 39x inside a 2.2 m ATE
+band, and the two placebo seeds differ 5x in magnitude and 0.06 m in ATE. What lambda=0 uniquely
+lacks is ANY gradient on the per-frame scale channel - its d/d(log s_i) is identically zero.
+
+Caveat on the placebo as a control: mean|l_coup| came out 1.37 and 7.45 against the unshuffled arms'
+0.19 and 0.26, so it is NOT magnitude-matched. The real term self-limits (coef scales with b, and
+the term reduces b); the placebo never reduces b, so the brake is gone and the per-frame scales
+random-walk. Read its 1.2 m shortfall against lambda=1 with that in mind.
+
+Set ARM below, run, repeat. RefeWrence arms at this configuration (alpha=16, e3/w10/bs2, lr1e-4):
+lambda=0 seed 0 -> 26.958;  lambda=1 seed 0 -> 22.772 and 24.791 (a replicate pair).
+
+  1 adapt    LoRA-adapt VGGT on the extract's depth, from stock VGGT-1B
+  2 end2end  one full-sequence arm per generator in END2END_PRIORS, then ATE side by side
+  3 prior    the same generators vs GT depth directly, no SLAM run
+
+STAGES omits 'extract' on purpose: dense_kf_p10 is shared with init_adapt_pipeline.py and is
+already on disk, so every arm here reuses it and only stages 1-3 cost anything.
 
 The KNOB PANEL, not the implementation - every stage is a package under adaslam/. The config
 literals below are rebuilt in every spawned reader child: primitives only, no disk, no computation.
@@ -53,10 +85,10 @@ UNDISTORT   = False
 CROP_BORDER = 0
 
 # ---------------------------------------------------------------- run control
-STAGES           = ('extract', 'adapt', 'end2end')   # any subset; run in pipeline order
+STAGES           = ('adapt', 'end2end', 'prior')          # any subset; run in pipeline order
 SKIP_EXISTING    = True                # reuse a stage's output if it is already on disk
 MIN_FREE_VRAM_MB = 7000                # shared GPU: checked once at the start of main()
-EXTRACT_LENGTH   = 100000              # frames to extract over; 100000 = the WHOLE sequence
+FRACTION         = 7                   # % of the window the adapter trains on; also SPLIT_AT
 START            = 0
 STOP             = None                # exclusive: the window is [START, STOP); None = to the end
 
@@ -69,8 +101,43 @@ RENDER_EVAL      = False               # hi2.py's eval_rendering -> renders/ + p
 # ---------------------------------------------------------------- experiment names
 # both REQUIRED, unique within their scene only; lineage is recorded in the adapter's config.json
 OUT_ROOT     = 'outputs'
-EXTRACT_NAME = 'low_dense_kf'          # one expensive run, reused by every adapt run below it
-ADAPT_NAME   = 'cont_normal_e25_pre25_b_base'
+EXTRACT_NAME = 'dense_kf_p10'
+
+# ---------------------------------------------------------------- THE N1 ARM MATRIX
+# One line to change per run. Everything else below is identical across the five arms, so the only
+# thing separating a placebo from its control is what this table says.
+#
+# S0 was run from init_adapt_pipeline.py (same settings, same name) - it is listed here so the
+# matrix is complete and so a re-run lands in the same directory rather than a second one.
+#
+#   arm  lambda  shuffle  seed   status                     what it contributes
+#   S0     1      True      0    DONE, ATE 25.035           placebo draw 1
+#   S1     1      True      1    DONE, ATE 24.978           placebo draw 2
+#   S2     1      True      2    optional                   placebo draw 3
+#   C1     0      -         1    >>> RUN THIS <<<           lambda=0 draw 2
+#   C2     0      -         2    >>> THEN THIS <<<          lambda=0 draw 3
+#
+# C1/C2 ARE NOW THE BLOCKING ONES, not the placebos. lambda=0 has exactly ONE draw on disk (seed 0,
+# ATE 26.958), and every headline number is measured against it: the placebo's +1.95 m, lambda=1's
+# +3.2 m, "the term helps" at all. The placebo pair just showed that run-to-run spread is not a
+# single number - 0.057 m between two DIFFERENT-seed placebo draws, against 2.019 m between two
+# SAME-seed unshuffled ones - so a lone baseline draw cannot be assumed representative. If lambda=0
+# lands near 25 at seeds 1-2, most of the experiment evaporates and no further arm is worth running.
+#
+# `seed` reaches BOTH the LoRA init (torch.manual_seed, adapt/model.py:34) and the data order
+# (adapt/trainer.py:127), so these are genuinely independent draws rather than reruns.
+ARM = 'C2'
+
+_ARMS = {                          # arm: (adapt name, coupling_lambda, coupling_shuffle, seed)
+    'S0': ('wonline_a16_e3_w10_l1_shuf_s0_p10', 1.0, True,  0),
+    'S1': ('wonline_a16_e3_w10_l1_shuf_s1_p10', 1.0, True,  1),
+    'S2': ('wonline_a16_e3_w10_l1_shuf_s2_p10', 1.0, True,  2),
+    'C1': ('wonline_a16_e3_w10_l0_s1_p10',      0.0, False, 1),
+    'C2': ('wonline_a16_e3_w10_l0_s2_p10',      0.0, False, 2),
+}
+if ARM not in _ARMS:
+    raise SystemExit(f'ARM={ARM!r} is not one of {sorted(_ARMS)}')
+ADAPT_NAME, ARM_LAMBDA, ARM_SHUFFLE, ARM_SEED = _ARMS[ARM]
 
 # ---------------------------------------------------------------- stage I/O
 # a stage RECEIVES these and reads no path global; pure string joins, no disk access in this block
@@ -80,11 +147,7 @@ ADAPT_IN     = OUT_EXTRACT                              # an extract export
 ADAPT_IMAGES = COLORS                                   # keyframe RGB, indexed by frame number
 ADAPT_OUT    = experiment_dir(OUT_ROOT, 'adapt', SCENE_KEY, ADAPT_NAME)
 ADAPT_CKPT   = f'{ADAPT_OUT}/{ADAPT_CKPT_SUBDIR}'       # epoch_NNN/; cadence is checkpoint_every
-
-# the adapter this run CONTINUES from: an adapt experiment in this scene, or None for stock VGGT-1B
-ADAPT_INIT_NAME = None
-ADAPT_INIT = None if ADAPT_INIT_NAME is None else \
-    experiment_dir(OUT_ROOT, 'adapt', SCENE_KEY, ADAPT_INIT_NAME)
+ADAPT_INIT   = None                                     # adapter to CONTINUE from; None = stock
 
 OUT_END2END  = test_dir(OUT_ROOT, 'end2end', SCENE_KEY)     # one subdirectory per prior generator
 OUT_PRIOR    = test_dir(OUT_ROOT, 'prior', SCENE_KEY)       # same arm names, scored without SLAM
@@ -100,13 +163,13 @@ SLAM = SlamConfig(
     render_eval=RENDER_EVAL)
 
 # ---------------------------------------------------------------- extract (stage 1)
-# ALL FOUR kf_* ARE None ON PURPOSE: None = inherit CONFIG, i.e. stock HI-SLAM2 keyframing
+# the kf_* knobs are EXTRACT-ONLY: a generated config only this run is given, asserted in main()
 EXTRACT = ExtractConfig(
-    kf_motion_thresh=None,          # motion_filter.thresh
-    kf_init_thresh=None,            # the same gate before initialisation
-    kf_redundant_thresh=None,       # frontend.keyframe_thresh - the gate that binds
-    kf_covis_thresh=None,           # extras inserted in terminate(); LOWER -> more
-    buffer=900,                     # hard cap; MUST exceed the WHOLE sequence's keyframe count
+    kf_motion_thresh=1.2,           # motion_filter.thresh; any threshold may be None = inherit
+    kf_init_thresh=4.0,             # the same gate before initialisation
+    kf_redundant_thresh=2.0,        # the one that actually moves the keyframe count
+    kf_covis_thresh=0.1,            # extras inserted in terminate(); LOWER -> more
+    buffer=500,                     # hard cap; MUST exceed the count (no overflow guard)
     depth_png_scale=DEPTH_PNG_SCALE,
     mask_filter_thresh=0.005,       # depth_filter disparity agreement
     mask_min_count=2,               # min agreeing neighbours out of 6
@@ -122,59 +185,65 @@ LORA = LoRAConfig(
     targets=('attn.qkv', 'attn.proj', 'mlp.fc1', 'mlp.fc2'),
     patch_embed=False)         # False = adapt only the alternating-attention stack
 
-KF_FRACTION = 1.0             # THE knob here: share of the extract's keyframes trained on
-
 ADAPT = AdaptConfig(
     stream_res=STREAM_RES,
     p_single_view=1, max_left=4, max_right=4, radius=8,
-    adapt_style='normal',      # 'normal' epochs | 'online' per arrival | 'wonline' sliding window
-    epochs=25, batch_size=2,
+    adapt_style='wonline',     # 'normal' epochs | 'online' per arrival | 'wonline' sliding window
+    epochs=3, batch_size=2,
     window_size=10,            # 'wonline' only
-    lr=1e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
-    coupled_scale=True, min_mask_pixels=16, seed=0, log_every=20,
+    lr=1.0e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
+    coupled_scale=True, min_mask_pixels=16, seed=ARM_SEED, log_every=20,
     # ---- which exported keyframes are trained on, and what the rest are for ----
-    kf_fraction=KF_FRACTION,   # a THIN equidistant sample of the whole sequence
+    kf_fraction=1.0,           # 1.0 = every exported keyframe; < 1 = equidistant sample of them
     val_source='tail',         # 'tail' = the selection's tail | 'rest' = the keyframes it skipped
-    train_frac=0.25,           # 'tail' ONLY; unread under val_source='rest'
-    eval_on_val=True,          # depth L1 on the never-trained keyframes, base vs adapted
+    train_frac=1.0,            # 'tail' ONLY; 1.0 = train on every keyframe, no val set
+    eval_on_val=True,          # depth L1 on held-out keyframes, base vs adapted
     eval_on_train=True,        # also on the train subset, so the train/val gap is visible
     eval_every_epoch=False,    # False = only before training and after the last unit
-    eval_max_kf=200,           # subsample each eval subset evenly to at most this many; 0 = no cap
+    eval_max_kf=100,           # subsample each eval subset to at most this many; 0 = no cap
     keep_best=False,           # False = save the last epoch; True = snapshot on val improvement
     checkpoint_every=0,        # 0 = off; N = a loadable adapter dir in ADAPT_CKPT every N epochs
-    # ---- WHICH OBJECTIVE (the knob) ----
-    # 'normal'  masked L1 in DEPTH after a per-sample median scale. Every run before this knob
-    #           existed, bit for bit.
-    # 'coupled' 'normal' + E3's lambda*b^2 slope penalty. MEASURED AND NULL: three seeds put
-    #           lambda=0 at 24.96 +/- 1.75 against lambda=1's 23.78 (t=0.83), and the placebo that
-    #           reassigns the coefficients at random scored the same as lambda=0. Needs
-    #           coupling_lambda > 0.
-    # 'jdsa'    the residual the SOLVER cannot absorb. depth_loss aligns with one median scalar in
-    #           depth; JDSA aligns with a 4-DOF bilinear field in DISPARITY, refit every BA
-    #           iteration (geom/ba.py:161-196). This fits that same family and penalises what
-    #           survives it, so the objective stops paying for what the solver discards.
-    depth_loss='normal',
-    jdsa_norm='l1',            # 'jdsa' ONLY: L2 weights far pixels and outliers hard, and the
-                               # targets are masked tracker depth. L2 only once L1 works.
-    jdsa_ridge=1e-6,           # 'jdsa' ONLY: ridge on the 4x4 normal equations, RELATIVE to their
-                               # mean diagonal. Guards a mask confined to one image region, where
-                               # the four corners are not determined.
-    jdsa_lattice='full',       # 'jdsa' ONLY: 'full' = fit at vggt_hw (more points, better
-                               # conditioned) | 'ba' = the [3::8,3::8] 1/64 subsample BA reads
-
-    # ---- E3: depth->scale coupling penalty. 0.0 = the old loss, bit for bit (see
-    # init_adapt_pipeline.py for the full note). Requires adapt_style='wonline'. ----
-    coupling_lambda=0.0,
-    coupling_axis='target',
-    coupling_min_var=1e-4,
-    coupling_shuffle=False)    # placebo control; only ever True for a control arm, needs lambda > 0
+    # ---- E3: penalise the depth->scale coupling (the objective change) ----
+    # depth_loss aligns scale per sample, so L(c*p) = L(p) exactly and the per-frame output scale
+    # has ZERO gradient. This adds lambda * b^2, where b is the slope of log(s_i) on log(median
+    # depth) fitted over the window, to put a gradient on its depth-coupled part.
+    #
+    # 0.0 IS THE OLD LOSS, bit for bit: the statistics pass is skipped entirely.
+    # Requires adapt_style='wonline' (the slope needs a window; batch_size 2 cannot carry a fit).
+    #
+    # MEASURED, and it does NOT mean what it was built to mean. lambda in [0.3, 3] is worth 3-4 m
+    # of ATE, but: batch_size = window_size, which applies the derived gradient exactly, is WORSE
+    # than the fragmented batches that apply it wrong (23.7-28.3 vs 22.7-24.0); and CV_depth, the
+    # quantity the term minimises, correlates +0.02 with ATE over 17 p10 arms. The gain looks like
+    # the SIZE of the per-sample pull, not its direction - which is what coupling_shuffle tests.
+    coupling_lambda=ARM_LAMBDA,
+    coupling_axis='target',    # 'target' = median TARGET depth. Prefer it: the network does not
+                               # control the axis. 'pred' lets it satisfy the penalty by
+                               # collapsing every predicted median to one value = range collapse.
+    coupling_min_var=1e-4,     # skip the term when the window has no depth spread (sum x~^2 below
+                               # this), where b would be an ill-conditioned division
+    # ---- the placebo control (N1) ----
+    # True reassigns the fitted coefficients to the window's keyframes at RANDOM: same magnitudes,
+    # same zero sum, same lambda, no connection to depth. An arm with this on is a CONTROL, and its
+    # comparison is the unshuffled arm at the same lambda and seed, not the lambda=0 baseline.
+    #   placebo ~= lambda=1 (23.8)  -> the depth pairing is incidental; the gain is the perturbation
+    #   placebo ~= lambda=0 (27.0)  -> the slope constraint really is what pays
+    # Run at alpha=16, where the lambda effect (3.2 m) clears the ~2 m run-to-run floor; at alpha=8
+    # it is only ~1.1 m and a placebo could not be read against it.
+    coupling_shuffle=ARM_SHUFFLE)
 
 # ---------------------------------------------------------------- end2end test (stage 3)
-# one entry per DEPTH-PRIOR GENERATOR; its arm directory is INFERRED from it, never typed (7.1)
-END2END_PRIORS = ('omnidata', 'vggt_base', ADAPT_OUT, experiment_dir(OUT_ROOT, 'adapt', SCENE_KEY, 'live_e3_w10_a16_w12_lag3_base'))
 
-# the seen/unseen boundary; None = the whole run, so [unseen] is empty and ate_all is the row (12.2)
-SPLIT_AT = None
+
+# another adapt run's handoff directory; both prior lists below use it
+def _a(name):
+    return experiment_dir(OUT_ROOT, 'adapt', SCENE_KEY, name)
+
+# one entry per generator, arm directory INFERRED (7.1); comments are unit, frame, share of sequence
+END2END_PRIORS = (
+    'omnidata', 'vggt_base',     # priors[0] is the baseline column
+    ADAPT_OUT,                   # this run's final adapter, frozen
+)
 
 END2END = End2EndConfig(
     priors=END2END_PRIORS,
@@ -187,7 +256,7 @@ END2END = End2EndConfig(
 
 # ---------------------------------------------------------------- prior test (stage 4)
 # the same generators vs GT depth, no SLAM run - it attributes an end2end null (9.2.2)
-PRIOR_PRIORS = END2END_PRIORS          # same arms, so the two tests' directories line up
+PRIOR_PRIORS = END2END_PRIORS
 
 PRIOR = PriorTestConfig(
     priors=PRIOR_PRIORS,
@@ -225,11 +294,12 @@ def main():
     warn_runtime_undistort(UNDISTORT, CROP_BORDER)
 
     window = window_frames(n_frames, START, STOP)
-    extract_length = min(EXTRACT_LENGTH, window)
-    # None = the end of the RUN, not of the sequence: a split the run never reached is no boundary
-    split_at = (START + window) if SPLIT_AT is None else SPLIT_AT
+    extract_length = window * FRACTION // 100     # a share of the WINDOW, not the sequence
+    if extract_length < 20:
+        raise SystemExit(f'{n_frames} frames * {FRACTION}% = {extract_length}, too few to track')
+    split_at = START + extract_length     # ABSOLUTE: evo's timestamps are frame numbers
 
-    # the arms must be handed the base CONFIG, never the extract run's generated one
+    # the arms must run stock tracking, never the extract run's denser generated config
     assert os.path.abspath(CONFIG) != \
         os.path.abspath(f'{extract_run_dir(OUT_EXTRACT)}/extract_config.yaml'), \
         'the arms must use the base CONFIG, not the extract run derived config'
@@ -245,18 +315,13 @@ def main():
     PRIOR = replace(PRIOR, lora=LORA)        # and so does the prior test's, for the same reason
 
     print(f'sequence  : {SCENE}  ({n_frames} frames, {COLORS})')
-    print(f'config    : {CONFIG}  calib {CALIB}  (STOCK keyframing - no kf_* overrides)')
+    print(f'config    : {CONFIG}  calib {CALIB}')
     print(f'stream    : {stream_hw[1]}x{stream_hw[0]} (aspect '
           f'{stream_hw[1]/stream_hw[0]:.3f})   VGGT input: {LORA.vggt_hw[1]}x{LORA.vggt_hw[0]}'
           f'{" (derived)" if VGGT_HW is None else " (pinned by VGGT_HW)"}')
-    print(f'extract   : frames {START}..{START+extract_length-1} of {n_frames}'
-          + (f'   WINDOW -> outputs tree {SCENE_KEY}' if SCENE_KEY != SCENE else ''))
-    print(f'adapter   : trains on {KF_FRACTION:.0%} of those keyframes, equidistant; val is the '
-          f'rest')
-    print(f'            starts from '
-          f'{ADAPT_INIT if ADAPT_INIT else "stock VGGT-1B (no adapter)"}')
-    print(f'target    : {DEPTH_DIR}/   split at frame {split_at}'
-          f'{" (= the whole run, so [unseen] is empty)" if SPLIT_AT is None else ""}')
+    print(f'adapter   : trains on frames {START}..{split_at-1} ({FRACTION}% of the window), '
+          f'evaluated on 0..{n_frames-1}')
+    print(f'target    : {DEPTH_DIR}/   split at frame {split_at}')
     print(f'stages    : {" ".join(STAGES)}   render_eval {RENDER_EVAL}')
     print(f'outputs   : {OUT_EXTRACT}')
     print(f'            {ADAPT_OUT}')
@@ -288,9 +353,7 @@ def main():
     print(f'  {OUT_EXTRACT}/export.txt   per-frame vs global depth L1 columns. The gap on the')
     print('                             Omnidata row is the cross-frame scale inconsistency this')
     print('                             track targets - if it is small, there was no headroom.')
-    print("  the adapt log's val row    depth L1 on the keyframes the sample SKIPPED - the")
-    print('                             evidence a thin sample generalises between its samples')
-    print("  the table above            the [all] block; [unseen] is empty unless SPLIT_AT is set")
+    print("  the table above            'unseen' rows only; 'seen' is the adapter's training")
 
 
 if __name__ == '__main__':

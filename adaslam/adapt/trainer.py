@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from .data import SceneData, evenly
-from .losses import depth_loss, pose_loss
+from .losses import depth_loss, jdsa_loss, median_scale, pose_loss
 
 
 @torch.no_grad()
@@ -66,6 +66,65 @@ def schedule(data, cfg, rng):
     else:
         for epoch in range(cfg.epochs):
             yield epoch, batches_of(rng.permutation(data.train_kf), cfg.batch_size)
+
+
+def coupling_fit(lora, cfg, samples):
+    """(b_hat, {t: coef}, sum_x2) for one window - the depth->scale slope and its per-sample pull.
+
+    `samples` is {keyframe: the tensors data.sample() already returned}, so this NEVER re-draws
+    from the rng: sample() advances the stream even at p_single_view=1, and a second draw would
+    desynchronise the run from its coupling_lambda=0 baseline and make the comparison worthless.
+
+    The fit is over the window because batch_size is 2 and a line through two points is exactly
+    determined. Both axes are logs: s ~ d^b makes b a dimensionless elasticity, b = 0 IS
+    scale-consistency, and a 10% error counts the same at 6 m as at 18 m.
+
+    x is DETACHED, which is what makes the returned coefficients an EXACT gradient rather than an
+    approximation: with x constant, d(b^2)/dy_i = 2*b*x~_i / SUM(x~^2), so adding coef_i * log s_i
+    to sample i's own loss and letting the window's backward passes accumulate reproduces
+    grad(b^2) exactly - with no extra VRAM and no graphs held open across samples.
+    """
+    xs, ys, order = [], [], []
+    with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+        for t, (images, gt, mask, _, _) in samples.items():
+            if mask.sum() < cfg.min_mask_pixels:
+                continue                       # contributes no depth gradient either
+            # cache_enabled=False for the same reason online/trainer.py:gate_value needs it: a
+            # bf16 weight cast made under no_grad and CACHED would be handed to the training
+            # forward detached, and backward would die on "does not require grad"
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16, cache_enabled=False):
+                pred_depth, _ = lora.forward(images)
+            p = pred_depth.float().clamp(min=1e-3)
+            g = gt.clamp(min=1e-3)
+            s = float(median_scale(p, g, mask))
+            d = float(p[mask].median() if cfg.coupling_axis == 'pred' else g[mask].median())
+            if s <= 0 or d <= 0:
+                continue
+            xs.append(np.log(d)); ys.append(np.log(s)); order.append(t)
+    if len(xs) < 3:
+        return None, {}, 0.0                   # too few points for a slope to mean anything
+    x, y = np.asarray(xs), np.asarray(ys)
+    xc = x - x.mean()
+    sum_x2 = float((xc ** 2).sum())
+    if sum_x2 < cfg.coupling_min_var:
+        return None, {}, sum_x2                # no depth spread in this window; b is meaningless
+    b = float((xc * (y - y.mean())).sum() / sum_x2)
+
+    # THE PLACEBO (cfg.coupling_shuffle). Reassigning the coefficients to keyframes at random keeps
+    # the multiset of coefficients, their zero sum and their magnitude distribution, and destroys
+    # only the pairing with depth - so a shuffled arm differs from its unshuffled twin in exactly
+    # the thing this term claims to be doing. b and sum_x2 are computed ABOVE, so the slope this
+    # function reports is still the true one and the diagnostic stays honest.
+    #
+    # The rng is seeded off the WINDOW's own keyframe list rather than drawn from the trainer's:
+    # that makes it reproducible and different per window while touching no shared state, so the
+    # data order and the LoRA init are bit-identical to the unshuffled run.
+    idx = np.arange(len(order))
+    if cfg.coupling_shuffle:
+        idx = np.random.default_rng([cfg.seed, *order]).permutation(idx)
+    coef = {t: 2.0 * cfg.coupling_lambda * b * float(xc[idx[i]]) / sum_x2
+            for i, t in enumerate(order)}
+    return b, coef, sum_x2
 
 
 def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
@@ -165,6 +224,16 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
                'steps_per_epoch': steps_per_unit, 'samples_per_epoch': len(data.train_kf),
                'lr': cfg.lr, 'weight_decay': cfg.weight_decay, 'grad_clip': cfg.grad_clip,
                'lambda_pose': cfg.lambda_pose, 'coupled_scale': cfg.coupled_scale,
+               # E3. Recorded always, so an adapter says which objective produced it - a run made
+               # before this field existed reads back as absent, which is the same as 0.0.
+               # WHICH OBJECTIVE produced this adapter - stated, so two arms cannot look alike
+               'depth_loss': cfg.depth_loss, 'jdsa_norm': cfg.jdsa_norm,
+               'jdsa_ridge': cfg.jdsa_ridge, 'jdsa_lattice': cfg.jdsa_lattice,
+               'coupling_lambda': cfg.coupling_lambda, 'coupling_axis': cfg.coupling_axis,
+               'coupling_min_var': cfg.coupling_min_var,
+               # a placebo arm must be identifiable on disk, or it is indistinguishable from a real
+               # one and the whole control is worthless
+               'coupling_shuffle': cfg.coupling_shuffle,
                'p_single_view': cfg.p_single_view, 'max_left': cfg.max_left,
                'max_right': cfg.max_right, 'radius': cfg.radius, 'scene': scene_dir,
                # the END OF THE EXTRACT WINDOW, not of the training data: priortest reads it HERE,
@@ -196,23 +265,67 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
 
     for unit, batches in schedule(data, cfg, rng):
         run = []
+
+        # E3: one statistics pass per WINDOW, before any of its batches. The window is recovered
+        # from the batches rather than from schedule() - every keyframe of the window appears in
+        # them, and that keeps the coupling term out of the schedule's business entirely.
+        # Sampling happens HERE, once per keyframe, and the tensors are reused below, so the rng
+        # stream is identical to a coupling_lambda=0 run.
+        coup_coef, cached = {}, {}
+        if cfg.coupling_lambda > 0:
+            for t in sorted({int(t) for b in batches for t in b}):
+                cached[t] = data.sample(rng, t=t)
+            cached = {t: tuple(v.cuda() if torch.is_tensor(v) else v for v in s)
+                      for t, s in cached.items()}
+            b_hat, coup_coef, sum_x2 = coupling_fit(lora, cfg, cached)
+            if unit % cfg.log_every == 0:
+                print(f'  {unit_tag}{unit} coupling: b={"n/a" if b_hat is None else f"{b_hat:+.4f}"}'
+                      f'  sum_x2={sum_x2:.4f}  over {len(cached)} kf')
+
         for step, batch in enumerate(batches):
             opt.zero_grad(set_to_none=True)
             acc = {'loss': [], 'l_depth': [], 'l_trans': [], 'l_rot': [], 'scale_ratio': [],
                    'S': []}
 
             for t in batch:
-                images, gt, mask, gt_enc, seq = data.sample(rng, t=t)
-                images, gt, mask, gt_enc = images.cuda(), gt.cuda(), mask.cuda(), gt_enc.cuda()
+                if cached:
+                    images, gt, mask, gt_enc, seq = cached[int(t)]
+                else:
+                    images, gt, mask, gt_enc, seq = data.sample(rng, t=t)
+                    images, gt, mask, gt_enc = (images.cuda(), gt.cuda(), mask.cuda(),
+                                                gt_enc.cuda())
 
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                     pred_depth, pred_enc = lora.forward(images)
                 pred_depth, pred_enc = pred_depth.float(), pred_enc.float()
 
                 l_t, l_r, pose_scale = pose_loss(pred_enc, gt_enc)
-                l_d, depth_scale = depth_loss(pred_depth, gt, mask, cfg,
-                                              scale=pose_scale if cfg.coupled_scale else None)
+                if cfg.depth_loss == 'jdsa':
+                    # the residual the solver's own 2x2 disparity grid cannot absorb. pose_scale is
+                    # not passed: the grid subsumes any single scale, so handing it one as well
+                    # would be a second alignment of the same freedom.
+                    l_d, depth_scale = jdsa_loss(pred_depth, gt, mask, cfg, data.stream_hw)
+                    # the median-aligned depth L1 too, from the SAME prediction - l_d is now a
+                    # disparity residual and is not comparable with any earlier run, so without
+                    # this the train logs stop being readable across objectives
+                    with torch.no_grad():
+                        acc.setdefault('l_depth_aligned', []).append(
+                            depth_loss(pred_depth, gt, mask, cfg)[0].item())
+                else:
+                    l_d, depth_scale = depth_loss(pred_depth, gt, mask, cfg,
+                                                  scale=pose_scale if cfg.coupled_scale else None)
                 loss = l_d + cfg.lambda_pose * (l_t + l_r)
+
+                # E3: the window's slope penalty, entered as its exact per-sample gradient. coef
+                # is a constant from the statistics pass, so this is linear in log s_i and the
+                # window's backward passes sum to grad(coupling_lambda * b^2). Recomputed rather
+                # than reused from depth_loss because `scale` may have come from pose_loss.
+                coef = coup_coef.get(int(t))
+                if coef:
+                    l_coup = coef * median_scale(pred_depth.clamp(min=1e-3),
+                                                 gt.clamp(min=1e-3), mask).log()
+                    loss = loss + l_coup
+                    acc.setdefault('l_coup', []).append(l_coup.item())
 
                 # the MEAN over the batch, so grad magnitude is independent of batch_size
                 (loss / len(batch)).backward()
@@ -224,7 +337,8 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
                 acc['S'].append(len(seq))
                 # they agreed to 1% on the pretrained model; divergence = broken depth/pose
                 # consistency
-                if pose_scale is not None and depth_scale is not None:
+                if (pose_scale is not None and depth_scale is not None
+                        and cfg.depth_loss != 'jdsa'):
                     acc['scale_ratio'].append((depth_scale / pose_scale).item())
 
             torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
