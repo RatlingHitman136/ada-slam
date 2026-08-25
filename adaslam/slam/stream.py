@@ -4,13 +4,16 @@ mono_stream runs in a spawned child, so it is handed the SlamConfig itself - a f
 primitives pickles by value, so the child runs the exact object the parent built.
 """
 import os
-import time
 
 import cv2
 import numpy as np
 import torch
 
 from ..common import stream_resize
+
+# How long the reader waits for the consumer to say it has every frame. Not a drain estimate - the
+# consumer sets the Event the moment it does - only a ceiling for the case where it crashed first.
+DRAIN_TIMEOUT = 600
 
 
 def load_calib(cfg):
@@ -52,7 +55,7 @@ def window_files(cfg):
     return sorted(os.listdir(cfg.colors))[cfg.start:cfg.stop]
 
 
-def mono_stream(queue, cfg, length):
+def mono_stream(queue, cfg, length, drained):
     """Push (t, image, intrinsics, is_last) for the first `length` frames of cfg's window.
 
     `t` is the index within this run, not the frame number, and it is what Hi2 stores as the
@@ -61,6 +64,9 @@ def mono_stream(queue, cfg, length):
     Two slices, not one: [start:stop] is the experiment's WINDOW and `length` caps how much of it
     this particular call consumes (the extract stage runs a prefix, the arms run all of it). Doing
     it as [start : start + length] instead would make `length` silently override `stop`.
+
+    `drained` is the consumer's "I have every frame" Event, and this process MUST NOT return before
+    it is set - see below.
     """
     calib, K = load_calib(cfg)
     image_list = window_files(cfg)[:length]
@@ -70,4 +76,18 @@ def mono_stream(queue, cfg, length):
         queue.put((t, torch.as_tensor(image).permute(2, 0, 1)[None], intrinsics[None],
                    t == len(image_list) - 1))
 
-    time.sleep(10)      # keep the queue's feeder thread alive until the consumer has drained it
+    # THIS PROCESS MUST OUTLIVE THE LAST get(). Every queued tensor is rebuilt in the consumer
+    # from a file descriptor fetched over THIS process's resource_sharer socket, so whatever is
+    # still in flight when it exits dies with it - surfacing there, confusingly, as
+    # "FileNotFoundError: [Errno 2]" inside torch's rebuild_storage_fd rather than as anything
+    # about the reader.
+    #
+    # It used to be a 10 s sleep, and that is a guess at how long the consumer needs. Queue's
+    # maxsize means the last put returns with up to that many frames still unread, and ONE arriving
+    # keyframe holds the consumer for a full adaptation burst - 49 s at steps_per_kf=10 (13),
+    # measured 1.0 s/step. So the tail routinely outlasts any fixed sleep, and does so at the very
+    # end of a multi-hour run. Wait to be told instead.
+    #
+    # The timeout only bounds the wait if the consumer died before setting it; runner.py also marks
+    # this process daemonic, so a crashed parent kills it rather than blocking on it at exit.
+    drained.wait(timeout=DRAIN_TIMEOUT)

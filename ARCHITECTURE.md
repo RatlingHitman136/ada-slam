@@ -325,7 +325,7 @@ Vendored DPT/MiDaS code, used **only** for inference of the Omnidata checkpoints
 | `eval_recon.py` | Mesh evaluation: accuracy / completion / completion-ratio via KD-trees and `evaluate_3d_reconstruction`, plus an optional 2D depth-L1 metric that renders random in-room views of GT vs. reconstruction with Open3D. **Note:** its `trimesh` import was never satisfied before this fork installed it, so this script (and `run_replica.py`'s recon metrics) could not run at all. |
 | `init_adapt_pipeline.py` | **The VGGT track's initial-adaptation driver** — extract a densified *prefix*, adapt on all of it, compare arms. §9.1. |
 | `cont_adapt_pipeline.py` | **Its continual-adaptation sibling** — extract the *whole* sequence at stock keyframe density, adapt on a thin equidistant sample of it (optionally continuing from an earlier adapter), compare arms. §9.7. |
-| `online_adapt_pipeline.py` | **The single-stage driver** — §13. No extract and no frozen second pass: ONE SLAM run whose depth prior LoRA-adapts on each keyframe local BA settles, then the reference arms and one comparison table. Same PARAMETERS-block shape as the two above; the stage is `adaslam/online/`. |
+| `online_adapt_pipeline.py` | **The single-stage driver** — §13. No extract and no frozen second pass: ONE SLAM run whose depth prior LoRA-adapts on each keyframe local BA settles, then the reference arms and one comparison table. Same PARAMETERS-block shape as the two above; the stage is `adaslam/online/`. The only driver that also takes an argument: `-c live_NAME` reads its whole PARAMETERS block from `run_configs/live_NAME.yaml` instead of the literals, which is what a queued job needs (§13.7). |
 | `export_end2end_results.py` | **One scene's end2end arms as a CSV**, for a Notion database — §12. `-n <name> -s <scene> [--init\|--cont\|--live]` → `outputs/<name>.csv`. Read-only over `outputs/`: it joins each arm's `results.json` to the adapt `config.json` behind it and the extract that trained it, and decomposes the un-sortable experiment name into columns. One kind per run, `--init` by default; each driver gets its own column set and its own Notion database, and which arms belong to which is read off the experiment-name prefix (`live*`, `cont*`). Its computed numbers are `adapt_cost`, `train_pct` / `train_span_pct` and the `--cont` table's `regime`. |
 | `ate_over_time.py` | **Where in the sequence an arm's ATE lives** — §12.3. `-s <scene> <arm> [<arm> …]` prints the per-pose APE evo already saved, one row per frame (`--keyframes` / `--bins N` for the other two granularities, `--csv` to dump). Read-only, no GPU, nothing recomputed. Its docstring is the how-to-read-it, and it is needed: the value is a residual after one *global* Sim(3) fit, so it neither starts at zero nor rises monotonically. |
 | `plot_trajectories.py` | **Where in *space* it lives** — §12.4. `-s <scene> -o <name> <arm> …` draws the estimated paths from above into `outputs/plots/<name>.png`, every pose coloured green→red by its APE on one scale shared by the whole image. Read-only, no GPU: it applies the Sim(3) evo already saved (`evo/alignment_transformation_sim3.npy`) to `traj_full.txt` and colours by `evo/error_array.npy`. `--align start` refits that transform on the first N poses through evo's own aligner instead, which is how scale drift is read — see §12.4. |
@@ -679,18 +679,31 @@ training boundary differs from the table's are warned about and carry a `*`.
 - VGGT's aggregator returns `None` for uncached layers (only 4/11/17/23 are kept, deliberately,
   so layer indices stay stable — `aggregator.py:196`). Any per-frame slicing of the token list
   must preserve those `None`s.
-- **`vggt_hw` must match the tracking stream's aspect ratio — so it is derived, not typed.**
+- **`vggt_hw` must keep the image inside VGGT's training distribution — so it is derived, not typed.**
   Nothing letterboxes anywhere (`SceneData.frame()` and `VggtPrior` both resize straight to it),
   so a mismatched aspect squashes the image off VGGT's training distribution: `(294, 518)` suits
   Replica's 344×616, `(378, 518)` suits TUM's 400×544, and each distorts the other by ~30 %.
   `VGGT_HW = None` (the default) makes `main()` derive it from the stream via
-  `LoRAConfig.resolved` → `adapt/config.py:vggt_hw_for`, which pins W to 518 and rounds H to a
-  multiple of 14 — exactly VGGT's trained shape (§9.6). **Precedence, highest first:** an
-  adapter's recorded `vggt_hw` (`LoRAVGGT.from_adapter`, so an adapter always runs in the shape
-  it was trained in) → an explicitly pinned `VGGT_HW` → the derived value. On both paths a >5 %
-  skew still prints a warning — `SceneData.aspect_report()` when adapting, `VggtPrior` when
-  running an arm — which after derivation means only two things, both worth hearing: someone
-  pinned a value, or an adapter trained on a different stream is being reused here.
+  `LoRAConfig.resolved` → `adapt/config.py:vggt_hw_for`, which pins W to 518, rounds H to a
+  multiple of 14, and **clamps H into VGGT's trained band, [168, 518]** — exactly VGGT's trained
+  shape (§9.6). **Precedence, highest first:** an adapter's recorded `vggt_hw`
+  (`LoRAVGGT.from_adapter`, so an adapter always runs in the shape it was trained in) → an
+  explicitly pinned `VGGT_HW` → the derived value.
+  **Matching the aspect is the rule, not the goal — staying in distribution is.** For a stream
+  *wider* than the band the two disagree, and the clamp wins: KITTI's 848×256 (H/W 0.302) would
+  match at `(154, 518)`, one patch row below anything VGGT ever saw, so it derives `(168, 518)`
+  instead and the image is stretched **1.074× vertically**. That is deliberate and it costs
+  nothing else — every VGGT input path rescales intrinsics with two independent ratios
+  (`adapt/data.py:102-103`, `online/target.py:74-77`) and resizes the prediction straight back
+  (`end2end/prior.py:65`), and `losses.py:pose_loss` reads only `pred_enc[:, :7]`, never the FoV
+  components. Cropping the stream's sides instead would have been undistorted but would spend the
+  tracker's peripheral parallax — under KITTI's forward motion, most of the parallax there is —
+  on the prior's comfort, and would invalidate every arm already scored on that stream.
+  On both paths a >5 % skew still prints — `SceneData.aspect_report()` when adapting, `VggtPrior`
+  when running an arm. It is a **`note`** when the shape in use *is* the derived one (the clamp
+  working, nothing to do) and a **`WARNING`** otherwise, which after derivation means only two
+  things, both worth hearing: someone pinned a value, or an adapter trained on a different stream
+  is being reused here.
   The `vggt_base` arm, which has no adapter to read a shape back from, is the case that was
   silently unguarded before and is now covered by both the derivation and the `VggtPrior` check.
 - **The depth prior reaches BA at 1/8 resolution, through a point subsample.**
@@ -782,6 +795,7 @@ exactly the directories it is given and nothing implicit.
 | `paths.py` | `ROOT` / `ADA_SLAM` / `HISLAM2` / `VGGT` and `bootstrap()`, whose one caller is the `__init__` above. Stdlib-only and side-effect-free beyond the `sys.path` inserts — every `adaslam.*` import goes through it, so it must cost nothing. Note what it is *not* needed for: **a spawned child inherits the parent's `sys.path` verbatim** (`multiprocessing/spawn.py:173` copies it, `:228-229` installs it, both before `__main__` is re-imported and before the target is unpickled), so nothing here has to run again in the reader process. |
 | `common.py` | `stream_resize` — ONE definition, used by the reader, the LoRA data loader and the prior probe; they must agree or predictions and GT stop lining up pixel for pixel. Also `DEPTH_DIR` / `MASK_DIR`, because `extract` writes them and `adapt` reads them, and the §7.1 layout vocabulary (`EXTRACT_RUN_SUBDIR`, `ADAPT_CKPT_SUBDIR`, `TEST_KINDS`, `HANDOFF_UP`, `extract_run_dir`, `experiment_dir`, `test_dir`, `require_name`, `ADAPTER_FILE`) for the same reason: more than one stage — and both drivers — have to agree on it. `ADAPTER_FILE` lives here rather than in `end2end/config.py` because `adapt/stage.py` needs the same name to warm-start from an adapter and **cannot import `end2end`** — `end2end` imports `adapt`, so that would be a cycle. |
 | `pipeline.py` | What a driver does **around** the stages, so the second one did not restate it: `enter` (spawn start-method + `chdir`, once per process), `check_sequence` (every required path exists, returns the frame count, and asserts `colors`/`depths`/`traj` are 1:1 by index — §10.1), `warn_runtime_undistort`, `resolve_lora` (`probe_stream_hw` + `LoRAConfig.resolved`, which must run after `chdir` and before any spawn), and `print_arm_dirs`. Not a stage and not a config; `torch` is imported inside `enter` so a report-only consumer does not pay for it. |
+| `runconfig.py` | `run_config` + `RunConfig` — §13.7's `-c live_NAME` reader, and **only** a reader: it knows no parameter's meaning, it replaces literals by name. `P('KEY', <literal>)` for a scalar, `P.over('section', <config literal>, fixed=…)` for a dataclass (`dataclasses.replace`, the same mechanism `adapt/model.py:recorded_config` uses to let an adapter's `config.json` win), `P.done()` for the both-ways check. Stdlib plus a function-local `import yaml`; `hislam2/util/utils.py:load_config` is **not** reused — that is the *tracking* config loader, `full_load` with a cwd-relative `inherit_from`. |
 | `runtime.py` | `sh`, `free_vram`, `gpu_gate`, `raise_fd_limit`, `ensure_venv_on_path` — shared-workstation hygiene, nothing stage-specific. Its module docstring is where the pgba CUDA-IPC measurement in §8 is written down. `free_vram` and `gpu_gate` print, but they do work and report on it; anything that only *formats* lives next door. |
 | `print_utils.py` | `banner`, `tee` (+`_Tee`), and the two comparison formatters — formatting output for a human, and nothing else. **Stdlib only**, no torch or cv2, so a finished comparison can be reprinted on a machine with neither. They are **transposes of each other**, and which one a report wants follows from its shape: `delta_header`/`delta_row` put an *entity per column* and a metric per row, which suits `priortest` (seven metrics, a handful of arms); `delta_table` puts an **entity per row** with `value` / `vs <baseline>` / `%` columns, which suits `end2end` (one metric, as many arms as a scene has accumulated — an arm per column runs off the terminal well before eighty of them). Both read `values[0]` as the baseline, mark a later value `+` when it beats it and `-` when it loses, print `n/a` for `None`, and leave the mark blank on an exact tie. The table *layouts* around them stay separate — the prior test can star an arm whose split is not its own, which `end2end`'s `compare()` has no notion of. |
 | `slam/` | `SlamConfig` (whose `render_eval` is §11's toggle); `mono_stream` (the reader `Process` target) and the `load_frame` it is built on — ONE definition of what the tracker is shown, because `PriorProbe` scores priors on exactly those pixels; `write_tracking_config`; `SlamRunner`, **the single interface to HI-SLAM2** (§9.2.1); and `PriorProbe`, which runs a prior over frames with no SLAM run. `PriorProbe` lives here rather than in `priortest/` because the stock prior **is** a `MotionFilter` method and this is the only package allowed to import it. |
@@ -813,7 +827,10 @@ Five rules hold across all of it — the fourth still being rolled out:
   `os.chdir(_ROOT)`, so a relative path checked there would resolve against whatever directory the
   script was invoked from. `End2EndConfig.check_priors_exist` is a method the stage calls for
   exactly this reason (and because the adapters it names may not exist yet when the full pipeline
-  runs — the adapt stage is about to create them).
+  runs — the adapt stage is about to create them). The **one deliberate exception** is §13.7's run
+  config, which is read at module scope and therefore in every child: `multiprocessing/spawn.py`
+  copies `sys.argv` into the child and `chdir`s it to the parent's cwd *before* re-importing the
+  driver, so the child reads the same file and rebuilds the same values the parent holds.
 - **A stage receives its input and output paths; it reads no path global.** Configs still arrive
   as globals — they are knobs, not locations. This is what lets one stage be pointed at another
   run's results (adapt on one extract's export, write the adapter elsewhere) without moving
@@ -858,13 +875,19 @@ Two things are easy to get wrong and are worth stating:
 
 Every resize between a raw frame and the number BA actually sees. Measured, not nominal.
 
-| stage | TUM fr1 | Replica | code |
-|---|---|---|---|
-| raw (H, W) | (444, 604) a=1.360 | (680, 1200) a=1.765 | `preprocess_*.py` output |
-| → tracking stream | **(400, 544)** a=1.360 | **(344, 616)** a=1.791 | `common.py:stream_resize` |
-| → depth-prior model in | (378, 518) VGGT · (512, 512) Omnidata | (294, 518) · (512, 512) | `VggtPrior` · `motion_filter.py:62` |
-| → back to stream | (400, 544) | (344, 616) | `F.interpolate(..., input_size)` |
-| → **into BA** | **(50, 68) = 3400** | **(43, 77) = 3311** | `depth_video.py:72`, `[3::8, 3::8]` |
+| stage | TUM fr1 | Replica | KITTI 00 | code |
+|---|---|---|---|---|
+| raw (H, W) | (444, 604) a=1.360 | (680, 1200) a=1.765 | (376, 1241) a=3.301 | `preprocess_*.py` output |
+| → tracking stream | **(400, 544)** a=1.360 | **(344, 616)** a=1.791 | **(256, 848)** a=3.313 | `common.py:stream_resize` |
+| → depth-prior model in | (378, 518) VGGT · (512, 512) Omnidata | (294, 518) · (512, 512) | (168, 518) · (512, 512) | `VggtPrior` · `motion_filter.py:62` |
+| → back to stream | (400, 544) | (344, 616) | (256, 848) | `F.interpolate(..., input_size)` |
+| → **into BA** | **(50, 68) = 3400** | **(43, 77) = 3311** | **(32, 106) = 3392** | `depth_video.py:72`, `[3::8, 3::8]` |
+
+KITTI is the column to read twice: it is the only stream here **wider than VGGT's trained band**,
+so its prior-model row is the one place the derivation stops matching the aspect (§9.3). Note also
+what its Omnidata cell means — 848×256 into a 512×512 square is a **3.31× horizontal squash**,
+against 26 % on TUM and 44 % on Replica. On this scene the upstream baseline is by far the most
+distorted input in the comparison, which the last trap in §9.3 is about.
 
 Three things this table is here to make unmissable:
 
@@ -873,11 +896,19 @@ Three things this table is here to make unmissable:
   aspect-preserving — Replica drifts 1.765 → 1.791 (+1.5 %) — but `slam/stream.py:40-41` rescales
   the intrinsics with the *actual* ratios, so that is image shear, not a calibration error.
 - **The last row is 1/64 of the row above it**, taken by point subsample with no averaging. That
-  is the §9.3 trap, and it is why `vggt_hw` is chosen for aspect and nothing else.
-- **518 is not arbitrary.** VGGT trained with width pinned to exactly 518 and height a multiple
-  of 14 in [168, 518], aspect 0.33–1.0 (`thirdparty/vggt/training/config/default.yaml:5`,
-  `training/data/base_dataset.py:95-113`) — landscape-or-square only, never above 518 on any
-  axis. `vggt_hw_for` reproduces exactly that shape. Going above 518 does not crash: DINOv2's
+  is the §9.3 trap, and it is why `vggt_hw` is chosen for aspect and distribution and nothing else.
+- **518 is not arbitrary, and neither is 168.** VGGT trained with width pinned to exactly 518 and
+  height a multiple of 14 in [168, 518], aspect 0.33–1.0
+  (`thirdparty/vggt/training/config/default.yaml:5`,
+  `training/config/default_dataset.yaml:37`, `training/data/base_dataset.py:95-113`) —
+  landscape-or-square only, never above 518 on any axis and never below `int(518·0.33)//14·14 =
+  168` on the short one. `vggt_hw_for` reproduces exactly that shape, **clamp included**: a stream
+  outside the band is squashed into it rather than matched. Squashed rather than letterboxed
+  because that is what VGGT's own training does *not* do either — `dataset_util.py:222` resizes
+  with a single isotropic `max_resize_scale` and then **crops** to the target aspect, so every
+  training frame has square pixels and none has padding. Both alternatives are therefore off
+  distribution in some way; the stretch is the one that costs the tracker nothing (§9.3).
+  Going above 518 does not crash: DINOv2's
   `pos_embed` interpolates bicubically (`vision_transformer.py:180-212`), but the aggregator's
   48 alternating-attention blocks use 2D RoPE with `scaling_factor` unused, so they extrapolate
   to relative offsets never trained on, at ~1.85× tokens and up to ~3.4× global-attention cost
@@ -1565,3 +1596,60 @@ Two things worth knowing before reading any result:
 
 Not yet run: a full-sequence comparison against `omni` / `base`, which is what the driver's default
 `STAGES` produces.
+
+### 13.7 Run configs — `-c live_*.yaml`
+
+A queued job cannot edit the driver between launch and execution, and several queued runs share one
+working tree, so editing the PARAMETERS block is a race. A bigger card is not one knob either — it
+is `BUFFER`, `MIN_FREE_VRAM_MB`, `STOP` and `STREAM_RES` moving together. So this driver's whole
+knob panel can come from a file instead:
+
+```
+python scripts/online_adapt_pipeline.py                  # the PARAMETERS block, as before
+python scripts/online_adapt_pipeline.py -c live_default  # every parameter from run_configs/
+```
+
+| | |
+|---|---|
+| `adaslam/runconfig.py` | the reader (§9.5) |
+| `run_configs/live_default.yaml` | **every** parameter at the values the driver's own literals carry — the file to copy, not to edit |
+| `run_configs/live_*.yaml` | one file per queued run |
+
+Four things it does on purpose:
+
+- **All or nothing.** With `-c`, the file is the *whole* parameter set: a key the driver never asks
+  for and a parameter the file omits are both hard errors, reported together by `P.done()` before
+  any GPU work. Partial overrides are exactly the failure a queue cannot see — a run that silently
+  kept one default is a wasted run, and it is indistinguishable afterwards from one that meant to.
+- **Without `-c` nothing changes.** The literals are still the defaults and still the documentation,
+  because the same driver is still used for hand-edited experiments. That is what `-c live_default`
+  being *identical* to no `-c` guarantees, and it is checkable in one command (below).
+- **One spelling per knob.** Fields a top-level key already feeds — `ONLINE.stream_res` from
+  `STREAM_RES`, `LORA.vggt_hw` from `VGGT_HW`, all of `END2END`'s paths — are passed as
+  `fixed=` and refused inside a section. `SLAM` has no section at all: every field of it is a
+  top-level key. Derived values (`SCENE_KEY`, `ADAPT_OUT`, `ONLINE_ARM`, `ADAPT_INIT`) are not keys
+  either; they follow whatever the file set.
+- **The name is checked.** This driver reads `live_*.yaml` only, so a queue cannot hand it an
+  `init_*` or `cont_*` config. `run_config(prefix=…)` is the same one-line adoption for those two
+  drivers when they want it.
+
+The run that produced a result records it: `main()` copies the file to
+`outputs/adapt/<scene>/<NAME>/run_config.yaml`, beside the adapter.
+
+**The check that the default file is faithful** (`run_path` executes the module body but not
+`main()`, so it costs nothing but imports):
+
+```python
+import runpy, sys
+def g(argv):
+    sys.argv = ['online_adapt_pipeline.py'] + argv
+    m = runpy.run_path('scripts/online_adapt_pipeline.py')
+    return {k: v for k, v in m.items() if k.isupper() and k != 'P'}
+a, b = g([]), g(['-c', 'live_default'])
+print({k: (a[k], b[k]) for k in a if a[k] != b[k]} or 'identical')
+```
+
+Two YAML traps the reader turns into errors rather than into a run: `lr: 1e-4` is a **string** in
+YAML 1.1 (PyYAML's float resolver wants the dot — write `1.0e-4`), and unquoted `yes`/`no`/`on`/`off`
+are booleans. Every value is type-checked against the literal it replaces, so both fail at parse
+time instead of a thousand optimiser steps later, in a child.

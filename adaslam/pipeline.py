@@ -5,6 +5,7 @@ after chdir and before any Process is spawned or any GPU work starts. `scripts/*
 the parameters and the dispatch; this holds what would otherwise be copied between them.
 """
 import os
+import re
 
 import numpy as np
 
@@ -36,6 +37,24 @@ def scene_key(scene, start, stop):
     which run before main()'s chdir and again in every spawned child (9.5 rule 3).
     """
     return scene if (start == 0 and stop is None) else f'{scene}_f{start}-{stop}'
+
+
+def scene_window(key):
+    """The [start, stop) a scene_key encodes, or None when the name says the run was whole.
+
+    The INVERSE of scene_key, and here beside it because the two are one convention: a windowed
+    run's START/STOP live in a driver's PARAMETERS block, which nothing writes to disk, so the
+    outputs/ directory name is the ONLY surviving record of which frames a scored arm covers.
+    Read-only consumers recover the window from it (scripts/plot_trajectories.py crops GT by it).
+
+    `stop` comes back None exactly as scene_key received it - a window running to the end of the
+    sequence. The pattern is anchored and digits-only so a scene whose own name contains _f
+    (rgbd_dataset_freiburg1_room) is not read as a window.
+    """
+    m = re.search(r'_f(\d+)-(\d+|None)$', key)
+    if not m:
+        return None
+    return int(m.group(1)), None if m.group(2) == 'None' else int(m.group(2))
 
 
 def window_frames(n_frames, start, stop):

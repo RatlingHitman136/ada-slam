@@ -49,6 +49,15 @@ library - so the paths leave the same point together and the drift reads as dive
 than as a global offset. That view RECOMPUTES the colour: the APE under a different alignment is
 a different number, and every label on the figure says which alignment it belongs to.
 
+HOW MUCH GT IS DRAWN. A windowed run's arms cover [start, stop) while the GT file covers the
+whole sequence - on kitti_00_f0-1000 that is 4541 GT poses behind a 1000-pose estimate, and the
+grey path, the plane pick and the shared axis limits would all be sized by frames no arm ever
+saw. So the reference is CROPPED to what was actually run: the window read back out of the scene
+directory name (the only place it survives - a driver's START/STOP are not written to disk), or
+for a scene that ran whole, the span of the frames evo scored. --gt-full draws the file as it is
+and labels the legend so. Neither touches what is MEASURED: the alignment and the APE come from
+the scored frames paired 1:1 with GT, and that pairing is the same either way.
+
 The plane is chosen by dropping the GT axis with the least spread, which is the vertical one
 for a ground vehicle (rellis_00000: x 154 m, y 202 m, z 1.5 m -> x/y). --plane overrides it.
 
@@ -70,6 +79,7 @@ sys.path.insert(0, _ROOT)          # repo root, so `adaslam` imports
 from adaslam.common import test_dir                                      # noqa: E402
 from adaslam.end2end.metrics import (RESULTS, arm_dir, gt_traj_of,       # noqa: E402
                                      load_alignment, load_ape)
+from adaslam.pipeline import scene_window                                # noqa: E402
 
 PLOT_SUBDIR = 'plots'              # outputs/plots/<name>.png, unless -o names a path itself
 OVERLAY_MAX = 3                    # more arms than this and one panel is spaghetti - facet
@@ -174,6 +184,10 @@ def load_arm(root, scene, arm, gt_xyz, keyframes, mode, n_align):
     err, ts, _ = load_ape(out)
     frames = ts.astype(int)
 
+    # the extent of the RUN, taken before --keyframes thins `frames` to a fraction of it - it is
+    # what says how much of the GT file this arm ever saw, which is what gt_to_draw crops by
+    span = (int(frames.min()), int(frames.max()))
+
     est = np.loadtxt(f'{out}/traj_full.txt')
     row_of = {f: i for i, f in enumerate(est[:, 0].astype(int).tolist())}
     missing = [f for f in frames.tolist() if f not in row_of]
@@ -225,8 +239,45 @@ def load_arm(root, scene, arm, gt_xyz, keyframes, mode, n_align):
     # not the tracker's own optimisation, and a refitted alignment is a different measurement
     # entirely; labelling either picture with ate_all would misreport it
     return {'arm': arm, 'out': out, 'xyz': xyz, 'err': err, 'frames': frames, 'n_align': n,
-            'scale': scale, 's_first': s_first, 's_last': s_last, 'drift': drift,
+            'span': span, 'scale': scale, 's_first': s_first, 's_last': s_last, 'drift': drift,
             'ate_all': res.get('ate_all', rmse(err)), 'shown': rmse(err)}
+
+
+def gt_to_draw(gt_xyz, gt_path, scene, arms, full):
+    """(the GT positions to DRAW, the phrase describing them) - the run's window, or the whole file.
+
+    The reference array is not only the grey line: pick_plane chooses the axes from its spread and
+    limits()/figure_size() size every panel by it. Handed the whole of a 4541-pose KITTI GT for a
+    run over frames 0..999, all three describe a sequence the arms never drove.
+
+    Two sources, in that order. The scene directory name carries the window pipeline.scene_key put
+    there, and it is authoritative about what the experiment WAS - including the tail of a window
+    a run stopped short of. It is used only if the scored frames actually fall inside it: a GT file
+    that was re-indexed to its own window would otherwise be cropped a second time, by frame
+    numbers it does not use. Otherwise the scored frames are the honest span, and for a scene that
+    ran whole they are the whole file.
+
+    Cropping is by frame RANGE, not by membership in the scored frames, so the reference stays one
+    continuous path under --keyframes instead of a polyline between the keyframes.
+    """
+    frames = sorted(gt_xyz)
+    if full:
+        return np.array([gt_xyz[f] for f in frames]), f'{len(frames)} poses, whole file'
+
+    lo = min(a['span'][0] for a in arms)
+    hi = max(a['span'][1] for a in arms)
+    window = scene_window(scene)
+    if window and window[0] <= lo and (window[1] is None or hi < window[1]):
+        start, stop, why = window[0], window[1], 'the window in the scene name'
+    else:
+        start, stop, why = lo, hi + 1, 'the frames the arms were scored over'
+
+    keep = [f for f in frames if start <= f and (stop is None or f < stop)]
+    if not keep:
+        raise SystemExit(f'{gt_path} holds no pose in frames {start}..{stop}, which is {why}, so '
+                         f'there is no reference path to draw. Pass --gt-full to draw it whole.')
+    return (np.array([gt_xyz[f] for f in keep]),
+            f'{len(keep)} of {len(frames)} poses, frames {keep[0]}..{keep[-1]} ({why})')
 
 
 def pick_plane(gt_pts, requested):
@@ -338,7 +389,7 @@ def align_caption(arms, mode):
             f'Sim(3) on the first {which}')
 
 
-def render(arms, gt_pts, ij, plane, cmap, norm, scene, path, dpi, keyframes, mode):
+def render(arms, gt_pts, ij, plane, cmap, norm, scene, path, dpi, keyframes, mode, gt_full):
     import matplotlib
     matplotlib.use('Agg')                       # the venv backend is headless; savefig only
     import matplotlib.pyplot as plt
@@ -356,7 +407,10 @@ def render(arms, gt_pts, ij, plane, cmap, norm, scene, path, dpi, keyframes, mod
     fig.patch.set_facecolor(SURFACE)
     flat = axes.ravel()
 
-    handles = [Line2D([], [], color=GT_INK, lw=1.1, label='ground truth')]
+    # under --gt-full the grey path runs past every arm, which looks like an arm that stopped
+    # early unless the legend says otherwise; cropped is the default, so it needs no qualifier
+    gt_label = 'ground truth (whole sequence)' if gt_full else 'ground truth'
+    handles = [Line2D([], [], color=GT_INK, lw=1.1, label=gt_label)]
     cb_label, title_align = align_caption(arms, mode)
 
     def score(a):
@@ -382,7 +436,7 @@ def render(arms, gt_pts, ij, plane, cmap, norm, scene, path, dpi, keyframes, mod
                               mec=TEXT_INK, mew=1.3, label='start (filled marker = end)'))
     else:
         ax = flat[0]
-        draw_gt(ax, gt_pts, ij, 'ground truth')
+        draw_gt(ax, gt_pts, ij, gt_label)
         for a, mk in zip(arms, MARKERS):
             draw_arm(ax, a, ij, cmap, norm, mk, WAYPOINTS)
             # an ink proxy: the legend must never imply that an arm owns a colour
@@ -444,6 +498,9 @@ def main():
     ap.add_argument('--gt', metavar='PATH',
                     help="the reference trajectory; default is the one evo recorded in the "
                          "first arm's evo/info.json")
+    ap.add_argument('--gt-full', '--gt_full', action='store_true',
+                    help='draw the WHOLE reference trajectory; the default crops it to the frames '
+                         'the arms ran (the scene name\'s window, or the scored frames)')
     ap.add_argument('--keyframes', action='store_true',
                     help="only the frames in each arm's own traj_kf.txt")
     ap.add_argument('--align', default=ALIGN_EVO, choices=[ALIGN_EVO, ALIGN_START],
@@ -496,7 +553,7 @@ def main():
 
     arms = [load_arm(args.root, args.scene, a, gt_xyz, args.keyframes, args.align, args.n_to_align)
             for a in args.arms]
-    gt_pts = np.array([gt_xyz[f] for f in sorted(gt_xyz)])
+    gt_pts, gt_note = gt_to_draw(gt_xyz, gt_path, args.scene, arms, args.gt_full)
 
     plane, ij, why = pick_plane(gt_pts, args.plane)
     allerr = np.concatenate([a['err'] for a in arms])
@@ -508,10 +565,10 @@ def main():
     from matplotlib.colors import Normalize
     path = out_path(args.root, args.out)
     render(arms, gt_pts, ij, plane, ramp(args.cmap), Normalize(vmin, vmax),
-           args.scene, path, args.dpi, args.keyframes, args.align)
+           args.scene, path, args.dpi, args.keyframes, args.align, args.gt_full)
 
     print(f'\n  {args.scene}  —  top view {plane[0]}/{plane[1]} ({why})')
-    print(f'  GT {gt_path}  ({len(gt_pts)} poses)')
+    print(f'  GT {gt_path}  ({gt_note})')
     drawn = 'keyframes' if args.keyframes else 'poses'
     print(f'  {"arm":<32}{drawn:>8}{"ATE(m)":>10}{"drawn(m)":>10}{"APE min":>9}{"max":>9}'
           f'{"scale":>10}{"drift":>8}')

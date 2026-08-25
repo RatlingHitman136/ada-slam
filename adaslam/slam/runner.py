@@ -13,7 +13,7 @@ import types
 from dataclasses import dataclass
 
 import numpy as np
-from torch.multiprocessing import Process, Queue
+from torch.multiprocessing import Event, Process, Queue
 from tqdm import tqdm
 
 from ..runtime import free_vram
@@ -85,9 +85,12 @@ class SlamRunner:
             MotionFilter.prior_extractor = prior.extractor()
 
         try:
-            queue = reader = None
+            queue = reader = drained = None
             queue = Queue(maxsize=8)
-            reader = Process(target=mono_stream, args=(queue, cfg, length))
+            # the reader may not exit while frames are still queued (stream.py); daemon=True so a
+            # crashed consumer terminates it instead of joining it at interpreter exit
+            drained = Event()
+            reader = Process(target=mono_stream, args=(queue, cfg, length, drained), daemon=True)
             reader.start()
 
             # the WINDOW, not the directory: len(os.listdir(colors)) over-reports the moment start
@@ -112,6 +115,7 @@ class SlamRunner:
                 pbar.set_description(f'keyframe {hi2.video.counter.value} '
                                      f'gs {hi2.gs.gaussians._xyz.shape[0]}')
                 if is_last:
+                    drained.set()      # every frame is in THIS process now; the reader may exit
                     pbar.close()
                     break
             reader.join()
@@ -125,6 +129,6 @@ class SlamRunner:
             # keyframes terminate() inserts into low-covisibility gaps
             MotionFilter.prior_extractor = stock_prior
 
-        del queue, reader
+        del queue, reader, drained
         free_vram()
         return SlamResult(out=out, n_kf=n_kf, n_frames=n_frames)

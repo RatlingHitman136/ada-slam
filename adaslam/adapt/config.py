@@ -13,14 +13,27 @@ VAL_SOURCES = ('tail', 'rest')
 # (training/config/default.yaml:5, training/data/base_dataset.py:95-113).
 VGGT_PATCH = 14
 VGGT_LONG_SIDE = 518
+# ...and never narrower than this. `aspects: [0.33, 1.0]` is H/W and get_target_shape floors
+# int(518 * 0.33) = 170 to a multiple of 14, so (168, 518) is the SMALLEST shape VGGT ever saw
+# (training/config/default_dataset.yaml:37, training/data/base_dataset.py:105-108).
+VGGT_MIN_ASPECT = 0.33
+VGGT_MIN_SIDE = VGGT_PATCH * (int(VGGT_LONG_SIDE * VGGT_MIN_ASPECT) // VGGT_PATCH)   # 168
 
 
 def vggt_hw_for(stream_hw):
-    """The VGGT input size matching a stream's aspect ratio - THE single definition (9.6).
+    """The VGGT input size for a stream: its aspect, CLAMPED to VGGT's trained band (9.6).
 
-    Nothing letterboxes anywhere, so matching the aspect here is the only thing keeping the image
-    on VGGT's training distribution. It is an aspect knob, not a quality one: the prior reaches BA
-    at 1/8 of the tracking resolution through a point subsample.
+    Nothing letterboxes anywhere, so the size chosen here is the only thing keeping the image on
+    VGGT's training distribution. For a stream inside the band that means matching its aspect
+    exactly. For one WIDER than the band - KITTI's 848x256 is 0.302, below the 0.324 floor -
+    matching it would keep the model out of distribution in the one way it cannot recover from, so
+    the height is clamped and the image is squashed INTO the band instead: 1.074x vertically on
+    KITTI, with the field of view kept whole. The alternative, cropping the stream's sides, would
+    spend the tracker's peripheral parallax - which under forward motion is most of the parallax
+    there is - on the prior's comfort.
+
+    It is an aspect knob, not a quality one: the prior reaches BA at 1/8 of the tracking resolution
+    through a point subsample.
     """
     h, w = stream_hw
     if h <= 0 or w <= 0:
@@ -28,10 +41,10 @@ def vggt_hw_for(stream_hw):
     if h > w:
         raise ValueError(
             f'stream_hw {stream_hw} is portrait (aspect {w/h:.3f}). VGGT trained only on '
-            f'landscape-or-square inputs (aspect 0.33-1.0 with width pinned at '
+            f'landscape-or-square inputs (aspect {VGGT_MIN_ASPECT}-1.0 with width pinned at '
             f'{VGGT_LONG_SIDE}); there is no in-distribution size for this stream.')
     vh = VGGT_PATCH * round(VGGT_LONG_SIDE * h / w / VGGT_PATCH)
-    return (min(max(vh, VGGT_PATCH), VGGT_LONG_SIDE), VGGT_LONG_SIDE)
+    return (min(max(vh, VGGT_MIN_SIDE), VGGT_LONG_SIDE), VGGT_LONG_SIDE)
 
 
 def aspect_lines(stream_hw, vggt_hw, who):
@@ -41,7 +54,15 @@ def aspect_lines(stream_hw, vggt_hw, who):
     skew = (vw / vh) / (w / h)
     lines = [f'stream {w}x{h} (aspect {w/h:.3f}) -> VGGT {vw}x{vh} '
              f'(aspect {vw/vh:.3f}), squash {skew:.3f}x']
-    if not 0.95 < skew < 1.05:
+    if 0.95 < skew < 1.05:
+        return lines
+    if tuple(vggt_hw) == vggt_hw_for(stream_hw):
+        # the clamp fired: this stream is wider than VGGT's trained band, so the squash is
+        # DELIBERATE and there is no less-distorted size that is still in distribution
+        lines.append(f'  note: stream aspect {h/w:.3f} is outside VGGT\'s trained '
+                     f'{VGGT_MIN_ASPECT}-1.0, so {vh} is the clamp, not a mismatch. The image is '
+                     f'stretched {1/skew:.3f}x vertically; the FoV is kept whole.')
+    else:
         lines.append(f'  WARNING: aspect ratios differ by {abs(1-skew)*100:.0f}%. '
                      f'{who} resizes without letterboxing, so VGGT sees a distorted image. '
                      f'The matching size for this stream is {vggt_hw_for(stream_hw)}')

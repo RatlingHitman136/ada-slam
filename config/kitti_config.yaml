@@ -1,0 +1,26 @@
+inherit_from: config/tum_config.yaml   # the real-sensor preset: mono_depth_alpha 0.01, pgba
+
+# KITTI odometry, colour (cam2). 10 Hz forward automotive motion at 1241x376 -> 848x256 tracking.
+# The regime differs from every other scene here: sky, depth to 100 m+, and almost pure forward
+# translation, which is the weakest case for flow-based tracking (little parallax at the focus of
+# expansion). Treat the thresholds below as a starting point measured against a short pilot run,
+# not as tuned values.
+
+Tracking:
+  motion_filter:
+    skip_blur: False      # TUM sets this for handheld motion blur; KITTI is a global-shutter
+                          # automotive camera, so the 5-frame Laplacian cache would substitute
+                          # frames for no reason
+  frontend:
+    mono_depth_alpha: 0.1  # inherited from TUM, and deliberately: at Replica's 0.001 the depth
+                            # prior barely enters BA, which would make the prior A/B a null by
+                            # construction
+  pgba:
+    active: True          # sequence 00 is the canonical large KITTI loop, which is what PGBA is for
+
+opt_params:
+  position_lr_max_steps: 5000   # colour-refinement iterations. Kept ONLY because the refinement
+                                # also refines the keyframe poses (11.2) - the map is not a
+                                # deliverable. Scaling TUM's 7000-for-1400-frames schedule to 4541
+                                # frames would ask for ~22000; 5000 is the deliberate cap. The one
+                                # property this number must have is being IDENTICAL across arms.

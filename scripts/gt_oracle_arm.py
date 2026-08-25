@@ -83,8 +83,8 @@ from adaslam.slam import SlamConfig, SlamRunner, stock_prior_extractor
 # ==============================================================================
 
 # ---------------------------------------------------------------- data
-SCENE   = 'rellis_00000'
-DATA    = 'data/RELLIS/00000'
+SCENE   = 'kitti_00'
+DATA    = 'data/KITTI/00'
 COLORS  = f'{DATA}/colors'
 DEPTHS  = f'{DATA}/depths'             # THE PRIOR, here - not just the accuracy table
 GT_TRAJ = f'{DATA}/traj_tum.txt'
@@ -109,7 +109,7 @@ CROP_BORDER = 0
 SKIP_EXISTING    = False                # reuse the arm if traj_full.txt is already there
 MIN_FREE_VRAM_MB = 7000
 START            = 0
-STOP             = None                # exclusive; None = to the end
+STOP             = 1000                # exclusive; None = to the end
 LENGTH           = 100000              # 100000 = the whole window
 BUFFER           = 500                 # hard cap on keyframes; MUST exceed the count
 STREAM_RES       = 341 * 640           # MUST equal the other arms' tracking budget
