@@ -44,6 +44,17 @@ class DepthVideo:
         self.poses_sim3[:] = torch.as_tensor([0, 0, 0, 0, 0, 0, 1, 1], dtype=torch.float, device="cuda")
 
         # depth prior scale
+        # JDSA's per-keyframe prior-scale grid. TRIED AND REVERTED: 4x4 instead of this 2x2.
+        # A 2x2 grid can only express a scale bilinear in IMAGE POSITION while the prior's error
+        # is a function of RANGE, and least-squares grids fitted to Omnidata vs KITTI lidar said
+        # 4x4 should absorb far more of it (AbsRel at 30-50 m 0.222 -> 0.162, 0.099 -> 0.073
+        # overall). End to end on kitti_00 f0-1000 it bought -0.02 m ATE on the omni arm and
+        # -0.30 m on vggt_base, against a ~0.15 m noise floor - not worth 16x the block size in
+        # schur_solve_mono_prior. What DID pay was weighting alpha by range instead
+        # (mono_depth_far_gain, geom/ba.py): -0.80 m on omni, -0.85 m on base.
+        # Nothing downstream hardcodes the size - geom/ba.py:186 reads dscales.shape[-2:] and
+        # bi_inter's kernel takes hs/ws off the tensor - so this allocation is the only edit
+        # needed to try it again.
         self.dscales = torch.ones(buffer, 2, 2, device='cuda', dtype=torch.float).share_memory_()
         self.doffset = torch.zeros(buffer, 1, 1, device='cuda', dtype=torch.float).share_memory_()
 
@@ -235,7 +246,10 @@ class DepthVideo:
                 poses = lietorch.SE3(self.poses[:t1][None])
                 disps = self.disps[:t1][None]
                 dscales = self.dscales[:t1]
-                disps, dscales, _ = JDSA(target, weight, eta, poses, disps, self.intrinsics[None], self.disps_prior, dscales, ii, jj, self.mono_depth_alpha)
+                disps, dscales, _ = JDSA(
+                    target, weight, eta, poses, disps, self.intrinsics[None], self.disps_prior,
+                    dscales, ii, jj, self.mono_depth_alpha,
+                    getattr(self, 'mono_depth_far_gain', 1.0))
                 self.disps[:t1] = disps[0]
                 self.dscales[:t1] = dscales
 

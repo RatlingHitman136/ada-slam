@@ -1,0 +1,22 @@
+inherit_from: config/kitti_config.yaml   # everything else identical - this file changes ONE knob
+
+# KITTI 00, with JDSA's prior weight scaled by RANGE instead of flat.
+#
+# geom/ba.py:206 has mono_depth_alpha REPLACE the network's per-pixel damping eta wherever the
+# prior is valid, and eta reaching there is 0.2 * 0.01 * Softplus(.) ~ 1.4e-3 - so alpha=0.01 is
+# already ~7x the damping it displaces. Raising it FLAT to 0.05 would buy the far field at the
+# near field's expense, and the measurement says only the far field wants it:
+#
+#   AbsRel vs KITTI lidar     0-15 m    30-50 m
+#   SLAM depth (what BA makes) 0.031      0.430
+#   Omnidata prior             0.091      0.254
+#   adapted VGGT prior         0.051      0.099
+#
+# At 30-50 m - the band that sets scale drift - the prior is 4.3x better than BA's own depth; in
+# the near field BA is the better of the two. far_gain scales alpha from 1x at the frame's median
+# disparity to 5x on its farthest pixels, so this run trusts the prior where it is right and
+# leaves the near field at upstream's weight.
+
+Tracking:
+  frontend:
+    mono_depth_far_gain: 5.0   # 1.0 = upstream's flat alpha (the default when the key is absent)

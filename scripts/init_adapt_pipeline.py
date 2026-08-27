@@ -57,16 +57,16 @@ UNDISTORT   = False
 CROP_BORDER = 0
 
 # ---------------------------------------------------------------- run control
-STAGES           = ('prior',)           # any subset; run in pipeline order. 'prior' scores the
+STAGES           = ('extract',)           # any subset; run in pipeline order. 'prior' scores the
                                        # generators against GT depth with NO SLAM run - about a
                                        # minute an arm against forty for an end2end one, so it is
                                        # the cheap way to ask whether an adapter's DEPTH improved
                                        # ('extract', 'adapt', 'end2end') is the full pipeline
 SKIP_EXISTING    = True                # reuse a stage's output if it is already on disk
-MIN_FREE_VRAM_MB = 15000               # shared GPU: checked once at the start of main(). High:
+MIN_FREE_VRAM_MB = 10000               # shared GPU: checked once at the start of main(). High:
                                        # the arms hold END2END.buffer=1500 (~3.7 GiB) on top of
                                        # VGGT-1B and its optimiser
-FRACTION         = 10                  # % of the WINDOW the adapter trains on - NOT of the
+FRACTION         = 100                 # % of the WINDOW the adapter trains on - NOT of the
                                        # sequence: extract_length = window * FRACTION // 100, so
                                        # at STOP=2000 this is 120 frames (it was 272 when the
                                        # window was the whole 4541). Changing STOP silently
@@ -94,7 +94,7 @@ RENDER_EVAL      = False               # hi2.py's eval_rendering -> renders/ + p
 # ---------------------------------------------------------------- experiment names
 # both REQUIRED, unique within their scene only; lineage is recorded in the adapter's config.json
 OUT_ROOT     = 'outputs'
-EXTRACT_NAME = 'dense_kf_p10'
+EXTRACT_NAME = 'normal'
 # RELLIS's wonline_r8_e3_w10_p10 with p10 -> p6 and a16 spelled out: alpha is the ONE field
 # that differs from that arm, so the name must not claim a parity this run does not have
 ADAPT_NAME   = 'wonline_a16_e12_w10_p10'
@@ -125,11 +125,11 @@ SLAM = SlamConfig(
 # ---------------------------------------------------------------- extract (stage 1)
 # the kf_* knobs are EXTRACT-ONLY: a generated config only this run is given, asserted in main()
 EXTRACT = ExtractConfig(
-    kf_motion_thresh=1.2,           # motion_filter.thresh; any threshold may be None = inherit
+    kf_motion_thresh=2.4,           # motion_filter.thresh; any threshold may be None = inherit
     kf_init_thresh=4.0,             # the same gate before initialisation
-    kf_redundant_thresh=2.0,        # the one that actually moves the keyframe count
-    kf_covis_thresh=0.1,            # extras inserted in terminate(); LOWER -> more
-    buffer=500,                     # hard cap; MUST exceed the count (no overflow guard)
+    kf_redundant_thresh=4.0,        # the one that actually moves the keyframe count
+    kf_covis_thresh=0.2,            # extras inserted in terminate(); LOWER -> more
+    buffer=1500,                     # hard cap; MUST exceed the count (no overflow guard)
     depth_png_scale=DEPTH_PNG_SCALE,
     mask_filter_thresh=0.005,       # depth_filter disparity agreement
     mask_min_count=2,               # min agreeing neighbours out of 6

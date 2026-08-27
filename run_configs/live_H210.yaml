@@ -41,9 +41,9 @@ RENDER_EVAL: false                    # hi2.py's eval_rendering -> renders/ + ps
 
 # ---------------------------------------------------------------- names and lineage
 OUT_ROOT: outputs
-ONLINE_NAME: live_fg2a05_e5_w10_a16_w12_lag5_raw_base   # unique within its scene only
+ONLINE_NAME: live_fg2a05_e5_w10_a16_w12_lag5_base   # unique within its scene only
 ADAPT_INIT_NAME: null                 # an adapt experiment in this scene to CONTINUE from
-VGGT_HW: null                   # null = derive | [378, 518] TUM | [294, 518] Replica
+VGGT_HW: [210, 518]                   # null = derive | [378, 518] TUM | [294, 518] Replica
 
 # ---------------------------------------------------------------- reference arms (stage 2)
 END2END_PRIORS: [omnidata, vggt_base]   # [0] is the baseline column

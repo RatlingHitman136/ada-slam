@@ -45,11 +45,56 @@ def free_vram(tag=''):
               f'{torch.cuda.memory_reserved()/2**30:.2f} GiB reserved{note}')
 
 
-def gpu_gate(min_free_mb):
-    """Refuse to start when someone else's job already holds the card."""
+def vram_free_mb():
+    """(free, total) MiB off nvidia-smi, or None when it cannot be read."""
     r = sh('nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits')
-    used, total = (int(x) for x in r.stdout.splitlines()[0].replace(',', '').split())
-    if total - used < min_free_mb:
-        raise SystemExit(f'only {total - used} MiB VRAM free (need {min_free_mb}); another '
-                         f'job is running. Lower MIN_FREE_VRAM_MB to override.')
-    print(f'GPU free  : {total - used} / {total} MiB')
+    try:
+        used, total = (int(x) for x in r.stdout.splitlines()[0].replace(',', '').split())
+    except (IndexError, ValueError):
+        return None
+    return total - used, total
+
+
+def gpu_gate(min_free_mb, wait_min=0, poll_s=60):
+    """Refuse to start when someone else's job already holds the card.
+
+    `wait_min` > 0 WAITS for the card instead of refusing, polling every `poll_s` until enough is
+    free or the budget runs out. On a shared box the card is usually free again within the hour,
+    and a queued run that dies on arrival wastes the slot it was queued for - but a run that waits
+    silently forever is worse, so the budget is finite and stated. 0 keeps the original behaviour.
+
+    Only a STARTING gate. Nothing re-checks mid-run, so a neighbour that allocates after this
+    returns will still OOM the run; the budget buys a clean start, not a reservation.
+    """
+    import time
+    deadline = time.time() + wait_min * 60
+    waited, polls = 0.0, 0
+    while True:
+        got = vram_free_mb()
+        if got is None:
+            # a transient nvidia-smi failure must not kill a long wait; a persistent one will
+            # still fall out of the loop when the budget expires
+            print('  [gpu] nvidia-smi unreadable, retrying')
+        else:
+            free, total = got
+            if free >= min_free_mb:
+                note = f'  (waited {waited/60:.1f} min)' if waited else ''
+                print(f'GPU free  : {free} / {total} MiB{note}')
+                return
+            if time.time() >= deadline:
+                # wait_min=0 never waited, so it keeps the original wording the other four
+                # drivers' users know
+                waited_note = ('' if not wait_min else
+                               f' after waiting {waited/60:.1f} of {wait_min} min')
+                raise SystemExit(
+                    f'only {free} MiB VRAM free (need {min_free_mb}){waited_note}; another job '
+                    f'is holding the card. '
+                    + ('Lower MIN_FREE_VRAM_MB to override.' if not wait_min else
+                       'Raise GPU_WAIT_MIN, or lower MIN_FREE_VRAM_MB to override.'))
+            # every poll while waiting is noise in a multi-hour log; say it once, then every ~5 min
+            if polls == 0 or (polls * poll_s) % 300 == 0:
+                print(f'  [gpu] {free} / {total} MiB free, need {min_free_mb} - waiting '
+                      f'(budget {wait_min} min, {waited/60:.1f} used)', flush=True)
+        polls += 1
+        time.sleep(poll_s)
+        waited += poll_s

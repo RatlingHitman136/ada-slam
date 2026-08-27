@@ -73,6 +73,11 @@ CROP_BORDER = P('CROP_BORDER', 0)
 STAGES           = P('STAGES', ('online', 'end2end'))
 SKIP_EXISTING    = P('SKIP_EXISTING', True)
 MIN_FREE_VRAM_MB = P('MIN_FREE_VRAM_MB', 15000)
+GPU_WAIT_MIN     = P('GPU_WAIT_MIN', 120)   # minutes to WAIT for MIN_FREE_VRAM_MB rather
+                                       # than refuse. 0 = refuse immediately, which is what
+                                       # every other driver does. A STARTING gate only:
+                                       # nothing re-checks mid-run, so a neighbour that
+                                       # allocates later still OOMs this. Polls every 60 s
 LENGTH           = P('LENGTH', 100000)
 
 START            = P('START', 0)
@@ -257,7 +262,7 @@ def main():
     print_arm_dirs(STAGES, (('end2end', END2END, OUT_END2END),))
 
     # one VRAM check up front, before any GPU work or spawned Process
-    gpu_gate(MIN_FREE_VRAM_MB)
+    gpu_gate(MIN_FREE_VRAM_MB, wait_min=GPU_WAIT_MIN)
 
     # ONE runner for every HI-SLAM2 invocation: the online run and every reference arm
     runner = SlamRunner(SLAM)

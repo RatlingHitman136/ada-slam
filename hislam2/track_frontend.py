@@ -27,6 +27,8 @@ class TrackFrontend:
         self.frontend_thresh = config["frontend_thresh"]
         self.frontend_radius = config["frontend_radius"]
         self.video.mono_depth_alpha = config["mono_depth_alpha"]
+        # optional, .get so every config that predates it keeps upstream's flat alpha
+        self.video.mono_depth_far_gain = config.get("mono_depth_far_gain", 1.0)
 
     def __update(self, is_last):
         """ add edges, perform update """
@@ -40,6 +42,9 @@ class TrackFrontend:
             rad=self.frontend_radius, nms=self.frontend_nms, thresh=self.frontend_thresh, remove=True)
 
         self.video.dscales[self.t1-1] = self.video.disps[self.t1-1].median() / self.video.disps_prior[self.t1-1].median()
+        # TRIED AND REVERTED with the 4x4 grid: use_mono=itr>0 here (JDSA in 3 of 4 rather than
+        # 2), plus use_mono=True on the iters2 loop below, which upstream leaves prior-free. The
+        # pair measured -0.02 m ATE on omni and -0.30 m on vggt_base - see depth_video.py.
         for itr in range(self.iters1):
             self.graph.update(None, None, use_inactive=True, use_mono=itr>1)
 
@@ -56,6 +61,9 @@ class TrackFrontend:
                 self.t1 -= 1
             update_idx = []
         else:
+            # NOTE these last iterations a keyframe's depth sees are prior-free (update()'s
+            # use_mono defaults to False), so they can undo the JDSA correction iters1 applied.
+            # That is upstream's behaviour and reverting to it was measured, not assumed.
             for itr in range(self.iters2):
                 self.graph.update(None, None, use_inactive=True)
 

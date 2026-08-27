@@ -169,7 +169,30 @@ def get_prior_depth_aligned(depth_prior, scales):
     return depth_prior_aligned, Jbi
 
 
-def JDSA(target, weight, eta, poses, disps, intrinsics, disps_prior, dscales, ii, jj, alpha):
+_ALPHA_REPORTS = 0
+
+
+def _report_alpha(C, m, alpha, eta, far_gain, n=3):
+    """Print the first few JDSA solves' Hessian balance, then go quiet.
+
+    The question a mono_depth_alpha sweep turns on and that cannot be answered from the code: is
+    alpha a perturbation on the photometric diagonal, or does it govern it? C is that diagonal
+    from droid_backends.proj_trans; alpha REPLACES eta wherever the prior is valid (below), and
+    eta reaching here is 0.2 * 0.01 * Softplus(.) ~ 1.4e-3, so alpha=0.01 is already ~7x it.
+    """
+    global _ALPHA_REPORTS
+    if _ALPHA_REPORTS >= n:
+        return
+    _ALPHA_REPORTS += 1
+    a = (m * alpha)
+    print(f'  [JDSA {_ALPHA_REPORTS}/{n}] photometric C mean {C.mean():.3e} median '
+          f'{C.median():.3e} | alpha on valid px mean {a[m > 0].mean():.3e} '
+          f'max {a.max():.3e} | eta mean {eta.mean():.3e} | far_gain {far_gain} | '
+          f'alpha/C {a[m > 0].mean() / C.mean().clamp(min=1e-12):.2f}')
+
+
+def JDSA(target, weight, eta, poses, disps, intrinsics, disps_prior, dscales, ii, jj, alpha,
+         far_gain=1.0):
 
     B, P, ht, wd = disps.shape
     N = ii.shape[0]
@@ -191,7 +214,18 @@ def JDSA(target, weight, eta, poses, disps, intrinsics, disps_prior, dscales, ii
     # Jd = (-1. / (disps[0,kx] ** 2)).view(1, -1, 1, ht*wd)
     Jso = -m.unsqueeze(-1) * disps_prior.view(-1, ht*wd).unsqueeze(-1) * Jbi.view(M, ht*wd, -1)[None]
 
-    alpha = torch.ones(M,ht*wd,1).float().cuda() * alpha
+    # Trust the prior in proportion to RANGE. At the focus of expansion there is no parallax, and
+    # BA's own depth there is measurably WORSE than the prior it was handed - on KITTI 00, AbsRel
+    # 0.430 against 0.254 for Omnidata and 0.099 for an adapted VGGT at 30-50 m - while in the
+    # near field BA is the better of the two. A constant alpha therefore trusts the prior most
+    # exactly where it is least needed. far_gain scales alpha from 1x at the frame's median
+    # disparity up to far_gain x on its farthest pixels; far_gain=1.0 is upstream's flat alpha
+    # exactly, so this is off unless a tracking config asks for it.
+    far = torch.ones(M, ht*wd, device='cuda')
+    if far_gain > 1.0:
+        dpv = disps_prior.view(M, ht*wd)
+        far = (dpv.median(dim=1, keepdim=True).values / dpv.clamp(min=1e-6)).clamp(1.0, far_gain)
+    alpha = (alpha * far).unsqueeze(-1).float()
 
     D = hs*ws
     fixedp = kx[0]
@@ -203,6 +237,7 @@ def JDSA(target, weight, eta, poses, disps, intrinsics, disps_prior, dscales, ii
     kx += fixedp
 
     alpha = alpha.squeeze()
+    _report_alpha(C, m, alpha, eta.view(*C.shape), far_gain)
     C = C[None] + m * alpha * (Jd * Jd).squeeze() + (1-m) * eta.view(*C.shape)
     w = w[None] - m * alpha * rd * Jd.squeeze()
 

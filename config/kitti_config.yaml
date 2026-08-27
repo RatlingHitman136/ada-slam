@@ -12,7 +12,7 @@ Tracking:
                           # automotive camera, so the 5-frame Laplacian cache would substitute
                           # frames for no reason
   frontend:
-    mono_depth_alpha: 0.1  # inherited from TUM, and deliberately: at Replica's 0.001 the depth
+    mono_depth_alpha: 0.01  # inherited from TUM, and deliberately: at Replica's 0.001 the depth
                             # prior barely enters BA, which would make the prior A/B a null by
                             # construction
   pgba:
