@@ -1,0 +1,113 @@
+# The CROPPED-DATASET arm. Every part of HI-SLAM2 consumes cropped frames here - the tracker, the
+# Omnidata prior, VGGT and the GT depth alike - because the crop is baked into the DATA by
+#
+#   python scripts/preprocess_kitti.py --seq 00 --crop-w 976 --with-depth --jobs 8
+#
+# and nothing under adaslam/ or hislam2/ changed. 1241x376 -> 976x376 (132 px off each side,
+# 21.4%), so the tracking stream becomes 752x288 and vggt_hw DERIVES to (196, 518) with skew
+# 1.012x instead of the 1.074x vertical STRETCH the full-frame dataset needs. The residual 1.2% is
+# stream_resize's /8 floor, not the crop.
+#
+#   python scripts/online_adapt_pipeline.py -c live_crop976
+#
+# WHY ITS OWN SCENE. The crop changes the tracking stream, so this tree's omni and base are
+# different runs from every other tree's. end2end/config.py:arm_name maps 'omnidata' to `omni`
+# whatever the data, so sharing a tree would silently score this against a baseline from the
+# uncropped stream. All three arms are built here and paid for once.
+#
+# READ IT AGAINST live_H196: both end at vggt_hw (196, 518) - that one stretches 1.253x to get
+# there, this one crops. Compare each arm to ITS OWN tree's omni and base, never across trees.
+#
+# One thing this arm deliberately also changes: Omnidata's 512x512 squash drops 3.31x -> 2.61x.
+# That follows from "the whole scenario consumes cropped images" and makes the run a two-sided
+# test - if JDSA-absorbability is the mechanism behind omni's lead, omni should give some of it
+# back at the same time VGGT gains.
+
+# ---------------------------------------------------------------- data (preprocessing is NOT here)
+SCENE: kitti_00_crop976               # names the outputs/ tree - NOT the data
+DATA: data/KITTI/00_crop976           # preprocess_kitti.py --crop-w 976
+COLORS: data/KITTI/00_crop976/colors  # cropped png, not a symlink
+DEPTHS: data/KITTI/00_crop976/depths  # written by --with-depth, cropped to match the
+                                      # colours. Unread by THIS driver, but it makes
+                                      # check_sequence assert they are 1:1 by index
+GT_TRAJ: data/KITTI/00_crop976/traj_tum.txt
+CALIB: data/KITTI/00_crop976/calib.txt   # cx shifted 607.193 -> 475.193
+CONFIG: config/kitti_fg2_a05_config.yaml   # alpha 0.05 * far_gain 2 ->
+                                      # 0.05 near .. 0.10 far
+                                      # config/kitti_config.yaml is upstream's flat 0.01
+DROID_WEIGHTS: pretrained_models/droid.pth
+UNDISTORT: false                      # undistort offline in the preprocess script instead (10.1)
+CROP_BORDER: 0
+
+# ---------------------------------------------------------------- run control
+STAGES: [online, end2end]
+SKIP_EXISTING: true
+MIN_FREE_VRAM_MB: 15000               # raise with BUFFER on a bigger card
+GPU_WAIT_MIN: 120                     # minutes to WAIT for that much VRAM instead of
+                                      # refusing; 0 = refuse immediately. Polls every 60 s
+LENGTH: 100000
+START: 0
+STOP: 1000                            # exclusive; null = to the end of the sequence
+STREAM_RES: 218240                    # 341 * 640 - a pixel budget, not a shape (9.6)
+BUFFER: 1500                          # keyframe buffer; a HARD CAP with no overflow guard. At
+                                      # ~2.5 MiB GPU + 4.8 MiB CPU per slot this is 6.1 + 11.6 GiB
+RENDER_EVAL: false                    # hi2.py's eval_rendering -> renders/ + psnr/ (11)
+
+# ---------------------------------------------------------------- names and lineage
+OUT_ROOT: outputs
+ONLINE_NAME: live_e40_a16_w12_lag5_base   # unique within its scene only
+ADAPT_INIT_NAME: null                 # an adapt experiment in this scene to CONTINUE from
+VGGT_HW: null                         # derives to (196, 518) from the CROPPED
+                                      # stream - no clamp, no stretch
+
+# ---------------------------------------------------------------- reference arms (stage 2)
+END2END_PRIORS: [omnidata, vggt_base]   # [0] is the baseline column
+SPLIT_AT: null                          # null = the whole run, so [unseen] is empty (12.2)
+
+# ---------------------------------------------------------------- the adapter structure
+lora:
+  weights: pretrained_models/vggt
+  rank: 8
+  alpha: 16
+  targets: [attn.qkv, attn.proj, mlp.fc1, mlp.fc2]
+  patch_embed: false                  # false = adapt only the alternating-attention stack
+
+# ---------------------------------------------------------------- online adaptation (stage 1)
+online:
+  # warm-up: TWO gates - when the adapter starts LEARNING, and when it starts SERVING
+  warmup_kf: 12                       # keyframes before the first optimiser step, which lands at +1
+  handover_kf: 12                     # keyframes served by the FALLBACK prior; must be >= warmup_kf
+  warmup_prior: omnidata              # 'omnidata' = upstream's prior | 'self' = the adapting VGGT
+  # schedule
+  adapt_style: online                # 'online' = the arrival alone | 'wonline' = a sliding window
+  steps_per_kf: 40
+  window_size: 10                     # 'wonline' ONLY
+  batch_size: 2                       # 'wonline' ONLY
+  lag: 5                              # keyframes back from the end the target is taken
+  # sample construction
+  context_kf: 0                       # previous KEYFRAMES appended after the target; 0 = monocular
+  # optimisation
+  lr: 1.0e-4                          # NOT 1e-4 - YAML reads that as a string
+  weight_decay: 0.0
+  grad_clip: 1.0
+  lambda_pose: 1.0
+  coupled_scale: true
+  min_mask_pixels: 16
+  seed: 0
+  log_every: 5
+  # supervision mask (the same knobs ExtractConfig uses for depth_slam/)
+  mask_filter_thresh: 0.005
+  mask_min_count: 2
+  mask_min_disp_ratio: 0.5
+  # the loss gate: skip an arrival whose newest keyframe is not worth training on
+  gate_metric: raw                    # 'rel' = flat across a run | 'raw' = drifts with it
+  gate_lo: 0.0                      # 0 = off; skip BELOW this - the target already fits
+  gate_hi: 0.0                        # 0 = off; skip ABOVE this - the target is broken, not hard
+  # output
+  checkpoint_every_kf: 0              # 0 = off; N = a loadable adapter dir every N
+                                      # adapted keyframes
+
+# ---------------------------------------------------------------- what scores the arms
+end2end:
+  omni_normal_ckpt: pretrained_models/omnidata_dpt_normal_v2.ckpt
+  omni_normal_hw: [512, 512]

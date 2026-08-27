@@ -4,7 +4,8 @@
 
 Produces preprocess_rellis3d.py's shape, minus the depth:
 
-    colors -> SYMLINK to the mirror's sequences/<seq>/image_2   (0 bytes; --copy to duplicate)
+    colors -> SYMLINK to the mirror's sequences/<seq>/image_2   (0 bytes; --copy to duplicate,
+                      or %06d.png files when --crop-w materialises a cropped copy)
     traj_tum.txt      "<index> tx ty tz qx qy qz qw", camera-to-world
     calib.txt         "fx fy cx cy"   (KITTI's colour images are RECTIFIED - no distortion, so do
                       NOT pass --undistort / --cropborder)
@@ -30,6 +31,26 @@ and carries the usual occlusion artifact: the lidar sits above and behind the ca
 points it can see past an occluder still project into the image. And the HDL-64E's upper FoV ends
 about a quarter of the way down the frame, so the sky and the tops of buildings have no GT at all
 and every metric is over the lower ~75 %.
+
+`--crop-w W` centre-crops every frame to W px wide and writes the result as a NEW DATASET, so the
+whole of HI-SLAM2 consumes cropped images: the tracker, the Omnidata prior, VGGT and the GT depth
+alike. It exists because VGGT is trained on aspect H/W in [0.33, 1.0] and KITTI's 848x256 stream is
+0.302, which today is fixed by STRETCHING the image 1.074x vertically (adapt/config.py clamps the
+derived height up to 168). Cropping fixes the same aspect with no distortion.
+
+Doing it HERE rather than at load time is deliberate, and it is the same argument 10.1 makes for
+undistorting offline: common.py:stream_resize is how every consumer re-derives a frame, and
+priortest/predict.py and extract/accuracy.py resize GT depth to the stream size. A crop applied
+only in slam/stream.py:load_frame would misalign both. Cropping the data keeps that invariant, and
+nothing under adaslam/ or hislam2/ needs to change.
+
+    --crop-w 976   1241x376 -> 976x376, 132 px off each side (21.4%), hFoV 81.6 -> 68.3 deg
+                   tracking stream 848x256 -> 752x288, vggt_hw (168,518) -> (196,518)
+                   VGGT skew 1.074x -> 1.012x (the remainder is stream_resize's /8 floor)
+
+Note the stream gets TALLER: stream_res is a pixel BUDGET, so cropping spends it on what is kept.
+Omnidata's 512x512 squash also drops 3.31x -> 2.61x, which is intended - "the whole scenario
+consumes cropped images" - but it does mean this dataset's omni arm is a different run.
 
 Two conventions are worth stating, because both are silent when wrong:
 
@@ -123,13 +144,17 @@ def depth_job(job, cfg):
     d = (sparse_image(u, v, z, cfg['hw']) if cfg['fill'] == 'none'
          else densify(u, v, z, cfg['hw'], cfg['max_edge'], cfg['max_ratio']))
     raw = np.clip(d * cfg['png_scale'], 0, 65535).astype(np.uint16)
+    # the SAME columns the colours were cropped to, or depth and image stop lining up
+    x0 = crop_x0(raw.shape[1], cfg['crop_w'])
+    if cfg['crop_w']:
+        raw = raw[:, x0:x0 + cfg['crop_w']]
     cv2.imwrite(f'{cfg["dst"]}/depths/{n:06d}.png', raw)
     valid = d > 0
     return (len(z), float(valid.mean()), float(d[valid].min()) if valid.any() else 0.0,
             float(d[valid].max()) if valid.any() else 0.0, int(raw.max()))
 
 
-def write_depths(args, seq, K, c2, n_images):
+def write_depths(args, seq, K, c2, n_images):    # K here is the UNCROPPED intrinsics
     """depths/ for the whole sequence, 1:1 by index with colors/. Returns the summary line."""
     seq_dir = f'{args.velodyne}/sequences/{seq}'
     velo_dir = f'{seq_dir}/velodyne'
@@ -144,9 +169,11 @@ def write_depths(args, seq, K, c2, n_images):
 
     E = velo_to_cam2(f'{seq_dir}/calib.txt', f'{args.src}/sequences/{seq}/calib.txt', c2)
     h0, w0 = cv2.imread(f'{args.src}/sequences/{seq}/{IMAGE_DIR}/{scans[0][:-4]}.jpg').shape[:2]
+    # projected at FULL width with the UNCROPPED K, then sliced - so the beam geometry is
+    # untouched and only the framing changes
     cfg = {'dst': args.dst, 'hw': (h0, w0), 'K': K, 'E': E, 'fill': args.fill,
            'max_edge': args.max_edge, 'max_ratio': args.max_ratio,
-           'png_scale': args.depth_png_scale}
+           'png_scale': args.depth_png_scale, 'crop_w': args.crop_w}
 
     os.makedirs(f'{args.dst}/depths', exist_ok=True)
     jobs = [(n, f'{velo_dir}/{f}') for n, f in enumerate(scans)]
@@ -163,6 +190,44 @@ def write_depths(args, seq, K, c2, n_images):
     return (f'depths {len(jobs)} frames, fill {args.fill}, max_edge {args.max_edge}, '
             f'max_ratio {args.max_ratio}, scale {args.depth_png_scale}, '
             f'{100*stats[:, 1].mean():.1f}% valid\nvelodyne {velo_dir}\n')
+
+
+def crop_x0(width, crop_w):
+    """Left edge of the centre crop. THE single definition - colours, depths and calib share it."""
+    if not crop_w:
+        return 0
+    if crop_w > width:
+        raise SystemExit(f'--crop-w {crop_w} exceeds the image width {width}')
+    return (width - crop_w) // 2
+
+
+def crop_job(job, cfg):
+    """One frame: read the mirror's jpg, centre-crop, write %06d.png.
+
+    PNG, not a re-encoded JPEG: the source is already lossy and a second generation is avoidable,
+    and preprocess_tum.py / preprocess_rellis3d.py both write PNG colours.
+    """
+    cv2.setNumThreads(1)
+    n, src = job
+    img = cv2.imread(src)
+    if img is None:
+        raise SystemExit(f'could not read {src}')
+    x0 = crop_x0(img.shape[1], cfg['crop_w'])
+    cv2.imwrite(f'{cfg["dst"]}/colors/{n:06d}.png', img[:, x0:x0 + cfg['crop_w']])
+
+
+def write_cropped_colors(image_dir, images, dst, crop_w, jobs, force):
+    """colors/ as cropped PNGs. Replaces link_colors when --crop-w is set."""
+    out = f'{dst}/colors'
+    if os.path.islink(out) or os.path.exists(out):
+        if not force:
+            raise SystemExit(f'{out} already exists; pass --force to replace it')
+        os.unlink(out) if os.path.islink(out) else shutil.rmtree(out)
+    os.makedirs(out, exist_ok=True)
+    cfg = {'dst': dst, 'crop_w': crop_w}
+    with Pool(jobs) as pool:
+        pool.map(partial(crop_job, cfg=cfg), list(enumerate(f'{image_dir}/{f}' for f in images)),
+                 chunksize=16)
 
 
 def load_poses(path):
@@ -223,11 +288,17 @@ def main():
     ap.add_argument('--depth_png_scale', type=float, default=256.0,
                     help='metres = px / this. 256 is the KITTI convention and saturates at 256 m; '
                          "the repo's 6553.5 would clip at 10 m")
+    ap.add_argument('--crop-w', type=int, default=None, dest='crop_w',
+                    help='centre-crop every frame to this width and write a cropped DATASET '
+                         '(colours as png, depths sliced to match, cx shifted). None = no crop. '
+                         '976 gives KITTI an aspect VGGT can take without stretching')
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 8) // 2))
     args = ap.parse_args()
 
     seq = args.seq.zfill(2)            # the mirror's directories are two-digit
-    dst = args.dst or f'data/KITTI/{seq}'
+    # a cropped dataset is a DIFFERENT dataset - never the same directory as the full-frame one
+    dst = args.dst or (f'data/KITTI/{seq}' if not args.crop_w
+                       else f'data/KITTI/{seq}_crop{args.crop_w}')
     seq_dir = f'{args.src}/sequences/{seq}'
     pose_file = f'{args.src}/poses/{seq}.txt'
     image_dir = f'{seq_dir}/{IMAGE_DIR}'
@@ -259,7 +330,11 @@ def main():
     T_wc = T_wc @ T_02
 
     h0, w0 = cv2.imread(f'{image_dir}/{images[0]}').shape[:2]
-    fov = (2 * np.degrees(np.arctan(w0 / 2 / fx)), 2 * np.degrees(np.arctan(h0 / 2 / fy)))
+    x0 = crop_x0(w0, args.crop_w)
+    out_w = args.crop_w or w0
+    # a crop moves ONLY the principal point; fx, fy and cy are framing-independent
+    cx_out = cx - x0
+    fov = (2 * np.degrees(np.arctan(out_w / 2 / fx)), 2 * np.degrees(np.arctan(h0 / 2 / fy)))
     step = np.linalg.norm(np.diff(T_wc[:, :3, 3], axis=0), axis=1)
     net = np.linalg.norm(T_wc[-1, :3, 3] - T_wc[0, :3, 3])
 
@@ -268,28 +343,42 @@ def main():
           f'FoV {fov[0]:.1f} x {fov[1]:.1f} deg   (rectified, no distortion)')
     print(f'cam0->cam2: {100*np.linalg.norm(c2):.1f} cm applied to every GT pose')
     print(f'images   : {len(images)} at {w0}x{h0}')
+    if args.crop_w:
+        print(f'crop     : {w0} -> {out_w} px wide, {x0} off each side '
+              f'({100*(w0-out_w)/w0:.1f}%), cx {cx:.3f} -> {cx_out:.3f}')
+        print(f'           hFoV {2*np.degrees(np.arctan(w0/2/fx)):.1f} -> {fov[0]:.1f} deg; '
+              f'colours are written as png, not symlinked')
     print(f'motion   : {step.sum():.0f} m path, {net:.0f} m net, median '
           f'{100*np.median(step):.1f} cm/frame, {(step < 0.01).sum()} near-static frames')
 
     args.dst = dst          # write_depths writes beside the rest of the layout
     os.makedirs(dst, exist_ok=True)
-    link_colors(image_dir, f'{dst}/colors', args.copy, args.force)
+    if args.crop_w:
+        write_cropped_colors(image_dir, images, dst, args.crop_w, args.jobs, args.force)
+    else:
+        link_colors(image_dir, f'{dst}/colors', args.copy, args.force)
     np.savetxt(f'{dst}/traj_tum.txt',
                [np.hstack(([n], to_tum(T))) for n, T in enumerate(T_wc)])
     with open(f'{dst}/calib.txt', 'w') as f:
-        f.write(f'{fx} {fy} {cx} {cy}')
+        f.write(f'{fx} {fy} {cx_out} {cy}')
 
+    # UNCROPPED K: write_depths projects at full width and slices afterwards
     K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
     depth_note = (write_depths(args, seq, K, c2, len(images)) if args.with_depth
                   else 'no depths: --with-depth not passed\n')
     with open(f'{dst}/preprocess_info.txt', 'w') as f:
+        how = ('cropped png' if args.crop_w else 'copied' if args.copy else 'symlinked')
         f.write(f'source {seq_dir}\nsequence {seq}\nframes {len(images)}\n'
-                f'resolution {w0}x{h0}\ncolors {"copied" if args.copy else "symlinked"}\n'
+                f'resolution {out_w}x{h0}\ncolors {how}\n'
+                f'crop_w {args.crop_w}\ncrop_x0 {x0}\nraw_resolution {w0}x{h0}\n'
+                f'cx_full {cx}\ncx_cropped {cx_out}\n'
                 f'cam0_to_cam2 {c2.tolist()}\n{depth_note}')
 
     print(f'\nwrote {dst}')
-    print(f'  colors     : {"copy" if args.copy else "symlink"} -> {image_dir}')
-    print(f'  calib.txt  : {fx} {fy} {cx} {cy}   (do NOT pass --undistort/--cropborder)')
+    print(f'  colors     : '
+          + (f'{len(images)} cropped png at {out_w}x{h0}' if args.crop_w
+             else f'{"copy" if args.copy else "symlink"} -> {image_dir}'))
+    print(f'  calib.txt  : {fx} {fy} {cx_out} {cy}   (do NOT pass --undistort/--cropborder)')
     print(f'  traj_tum.txt: {len(T_wc)} poses, camera-to-world, indexed by frame number')
     print("\nin the driver PARAMETERS block: CONFIG = 'config/kitti_config.yaml', and")
     if args.with_depth:
