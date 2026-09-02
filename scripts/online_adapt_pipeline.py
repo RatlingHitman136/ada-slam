@@ -151,6 +151,20 @@ ONLINE = P.over('online', OnlineConfig(
     batch_size=2,              # 'wonline' ONLY - a keyframe arrives alone in 'online'
     lag=5,                     # keyframes back from the end the target is taken
 
+    # ---- serving ----
+    ceil_ratio=1.0,            # far-field ceiling on the SERVED depth (14): clamp at this x the
+                               # frame median, warm-up branch included; 1.0 = off, the pre-knob
+                               # behaviour exactly.
+    ped_ratio=None,            # far-field PEDESTAL on the SERVED depth (14.9): served depth
+                               # saturates at this x the frame's PRE-shift median, applied AFTER
+                               # the ceiling. None = OFF - note that is NOT 1.0, which is a real
+                               # (very strong) pedestal. Sub-1 ratios are legal and are the
+                               # useful ones; see OnlineConfig.ped_ratio.
+    ceil_target=False,         # False = the TRAINING target is never clamped (the original
+                               # behaviour); True = clamp it at ceil_ratio too, so the adapter is
+                               # taught the ceiling instead of only served through it (14.6).
+                               # Refused at ceil_ratio 1.0, where it would silently do nothing.
+
     # ---- sample construction ----
     context_kf=0,              # previous KEYFRAMES appended after the target; 0 = monocular
     stream_res=STREAM_RES,     # must equal SLAM.stream_res
@@ -182,6 +196,9 @@ ONLINE = P.over('online', OnlineConfig(
 
 # ---------------------------------------------------------------- reference arms (stage 2)
 # ordinary frozen arms, reused from disk so a scene pays for them once; [0] is the baseline column
+# any entry may carry a far-field ceiling as an '@ceil<tag>' spec modifier (14), e.g.
+# 'omnidata@ceil2' or 'vggt_base@ceil1p5' - a modified spec names its own arm directory
+# (omni_ceil2), so clamped and unclamped references coexist and SKIP_EXISTING reuses either
 END2END_PRIORS = P('END2END_PRIORS', ('omnidata', 'vggt_base'))
 
 # the seen/unseen boundary; None = the whole run, so [unseen] is empty and ate_all is the row (12.2).
@@ -252,6 +269,14 @@ def main():
     print(f'schedule  : {ONLINE.adapt_style}, {ONLINE.steps_per_kf} steps per arriving keyframe'
           + (f', window {ONLINE.window_size} batch {ONLINE.batch_size}'
              if ONLINE.adapt_style == 'wonline' else ''))
+    if ONLINE.ped_ratio is not None:
+        print(f"serving   : depth carries a pedestal at {ONLINE.ped_ratio:g}x the frame's "
+              f'pre-shift median (14.9), warm-up branch included; the training target never does')
+    if ONLINE.ceil_ratio > 1.0:
+        print(f'serving   : depth clamped at {ONLINE.ceil_ratio:g}x the frame median (14), '
+              f'warm-up branch included; the training target is '
+              + ('clamped at the same ratio (ceil_target, 14.6)' if ONLINE.ceil_target
+                 else 'never clamped'))
     print(f'            starts from '
           f'{ADAPT_INIT if ADAPT_INIT else "stock VGGT-1B (no adapter)"}')
     print(f'split     : frame {split_at}'

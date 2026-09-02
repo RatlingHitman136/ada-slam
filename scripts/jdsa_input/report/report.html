@@ -1,0 +1,824 @@
+<title>Disparity In, Wobble Out</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:ital,wght@0,400;0,500;1,400&display=swap">
+<style>
+:root{
+  color-scheme: light;
+  --bg:#f5f7f8; --panel:#ffffff; --panel-2:#eef1f3;
+  --ink:#0f1418; --ink-2:#4a5560; --ink-3:#77828d;
+  --rule:#dde2e6; --rule-2:#c8d0d6;
+  --accent:#a8511d; --accent-soft:#f2e4da;
+  --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a;
+  --good:#1b7f4b; --bad:#b3261e;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,Segoe UI,sans-serif;
+  --serif:"IBM Plex Serif",Georgia,"Times New Roman",serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme: dark;
+    --bg:#101519; --panel:#171d22; --panel-2:#1e252b;
+    --ink:#e9eef2; --ink-2:#a7b3bd; --ink-3:#7d8994;
+    --rule:#262e35; --rule-2:#39434b;
+    --accent:#e08347; --accent-soft:#2a2119;
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70;
+    --good:#4bb37b; --bad:#e66767;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme: dark;
+  --bg:#101519; --panel:#171d22; --panel-2:#1e252b;
+  --ink:#e9eef2; --ink-2:#a7b3bd; --ink-3:#7d8994;
+  --rule:#262e35; --rule-2:#39434b;
+  --accent:#e08347; --accent-soft:#2a2119;
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70;
+  --good:#4bb37b; --bad:#e66767;
+}
+*{box-sizing:border-box}
+body{background:var(--bg); color:var(--ink); font-family:var(--serif); font-size:16.5px; line-height:1.62;}
+.wrap{max-width:1000px; margin:0 auto; padding:0 24px 96px;}
+.col{max-width:70ch;}
+header{padding:56px 0 28px; border-bottom:1px solid var(--rule);}
+.eyebrow{font-family:var(--mono); font-size:11.5px; letter-spacing:.14em; text-transform:uppercase;
+  color:var(--accent); margin:0 0 14px;}
+h1{font-family:var(--sans); font-weight:600; font-size:clamp(30px,4.4vw,46px); line-height:1.08;
+  letter-spacing:-.02em; margin:0 0 16px; text-wrap:balance;}
+.standfirst{font-size:19px; color:var(--ink-2); margin:0 0 22px; max-width:64ch;}
+.meta{display:flex; flex-wrap:wrap; gap:8px 26px; font-family:var(--mono); font-size:12px;
+  color:var(--ink-3); padding-top:6px;}
+.meta b{color:var(--ink-2); font-weight:500;}
+section{padding:40px 0 8px; border-bottom:1px solid var(--rule);}
+section:last-of-type{border-bottom:0}
+h2{font-family:var(--sans); font-weight:600; font-size:25px; letter-spacing:-.015em;
+  margin:0 0 6px; text-wrap:balance;}
+h2 .n{font-family:var(--mono); font-size:12px; color:var(--accent); display:block;
+  letter-spacing:.14em; margin-bottom:9px; text-transform:uppercase;}
+h3{font-family:var(--sans); font-weight:600; font-size:16px; margin:30px 0 6px; letter-spacing:-.005em;}
+p{margin:0 0 15px;}
+.col p:last-child{margin-bottom:0}
+code,.m{font-family:var(--mono); font-size:.88em;}
+code{background:var(--panel-2); padding:1px 5px; border-radius:3px;}
+.finding{margin:22px 0; padding:16px 20px; background:var(--panel); border:1px solid var(--rule);
+  border-left:3px solid var(--accent); border-radius:2px;}
+.finding p{margin:0; font-family:var(--sans); font-size:15.5px; line-height:1.55;}
+.figure{margin:26px 0 8px;}
+.figure .cap{font-family:var(--sans); font-size:13px; color:var(--ink-3); margin-top:10px;
+  max-width:78ch; line-height:1.5;}
+.tablewrap{overflow-x:auto; border:1px solid var(--rule); border-radius:3px; background:var(--panel);}
+table{border-collapse:collapse; width:100%; font-family:var(--mono); font-size:12.5px;
+  font-variant-numeric:tabular-nums;}
+th,td{padding:7px 12px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--rule);}
+th{font-family:var(--sans); font-size:11px; font-weight:600; letter-spacing:.03em; color:var(--ink-2);
+  text-transform:uppercase; background:var(--panel-2); position:sticky; top:0;}
+td:first-child,th:first-child{text-align:left;}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover td{background:var(--panel-2)}
+.win{color:var(--good); font-weight:500}
+.lose{color:var(--bad)}
+.dim{color:var(--ink-3)}
+.chart{background:var(--panel); border:1px solid var(--rule); border-radius:3px; padding:14px 12px 6px;}
+svg{display:block; width:100%; height:auto; overflow:visible;}
+.legend{display:flex; gap:18px; flex-wrap:wrap; font-family:var(--sans); font-size:12.5px;
+  color:var(--ink-2); padding:2px 6px 10px;}
+.legend span{display:inline-flex; align-items:center; gap:7px;}
+.sw{width:11px; height:11px; border-radius:2px; display:inline-block;}
+.tip{position:fixed; pointer-events:none; opacity:0; transition:opacity .1s; z-index:9;
+  background:var(--panel); border:1px solid var(--rule-2); border-radius:3px; padding:7px 10px;
+  font-family:var(--mono); font-size:11.5px; color:var(--ink); box-shadow:0 6px 20px rgba(0,0,0,.16);
+  line-height:1.45; white-space:nowrap;}
+ul{margin:0 0 15px; padding-left:20px;} li{margin-bottom:7px;}
+.arms{display:grid; gap:10px; margin:20px 0 6px;}
+.arm{display:grid; grid-template-columns:170px 1fr; gap:16px; align-items:start;
+  padding:12px 14px; background:var(--panel); border:1px solid var(--rule); border-radius:3px;}
+.arm .spec{font-family:var(--mono); font-size:12.5px; color:var(--accent); font-weight:500;}
+.arm .what{font-family:var(--sans); font-size:14px; color:var(--ink-2); line-height:1.5;}
+.cmd{font-family:var(--mono); font-size:13px; background:var(--panel); border:1px solid var(--rule);
+  border-left:3px solid var(--ink-3); padding:12px 14px; border-radius:2px; overflow-x:auto;
+  margin:18px 0;}
+.foot{font-family:var(--sans); font-size:13.5px; color:var(--ink-3); line-height:1.55;}
+@media (max-width:640px){ .arm{grid-template-columns:1fr; gap:4px} body{font-size:16px} }
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+<header>
+  <p class="eyebrow">ada-slam &middot; depth prior &rarr; JDSA &rarr; BA</p>
+  <h1>Disparity In, Wobble Out</h1>
+  <p class="standfirst">What the joint depth&ndash;scale adjustment can and cannot hear from a depth
+  prior, measured from the raw dumps &mdash; why the served depth that tracks best on KITTI is the
+  one furthest from the lidar, and how far the ratio that gets it there can be computed instead of
+  swept.</p>
+  <div class="meta">
+    <span><b>Scenes</b> kitti_00 f0&ndash;1000, rellis_00000</span>
+    <span><b>Arms re-measured</b> 311</span>
+    <span><b>Depth dumps</b> 8</span>
+    <span><b>GT</b> velodyne + odometry poses</span>
+    <span><b>Date</b> 2026-09-01</span>
+  </div>
+</header>
+
+<section>
+  <div class="col">
+    <h2><span class="n">The interface</span>What JDSA actually receives</h2>
+    <p>One residual, per pixel, in <em>disparity</em>:
+    <code>rd = disps &minus; s(x,y)&middot;disps_prior</code>, weighted by a flat <code>alpha</code>
+    (times <code>far_gain</code>), gated by <code>m = disps_prior &gt; 0</code>, with
+    <code>s</code> a 2&times;2 bilinear grid solved jointly with the depths
+    (<span class="m">geom/ba.py:194</span>). That interface has exactly four free parameters per
+    keyframe, and they determine what the prior is allowed to say.</p>
+    <p>Scaling every prior disparity by a constant is absorbed exactly &mdash; <code>s &rarr; s/c</code>
+    leaves <code>rd</code> unchanged &mdash; and so is any scale field bilinear in image position.
+    The units a prior arrives in are therefore not a knob at all. The dumps confirm it: two priors
+    whose raw disparities differ by 1.44&times; produce fitted grids that differ by the reciprocal,
+    and the product lands on the tracker's own median.</p>
+  </div>
+
+  <div class="figure">
+    <div class="tablewrap"><table>
+      <thead><tr><th>extract run</th><th>median disps_prior</th><th>mean dscales</th>
+        <th>product</th><th>tracker median disps</th></tr></thead>
+      <tbody>
+        <tr><td>omni, &alpha;=0.01</td><td>0.8404</td><td>0.4655</td><td>0.3815</td><td>0.3773</td></tr>
+        <tr><td>omni, &alpha;=0.05 fg2</td><td>0.8405</td><td>0.4880</td><td>0.3990</td><td>0.4091</td></tr>
+        <tr><td>VGGT base, &alpha;=0.01</td><td>1.2090</td><td>0.2887</td><td>0.3459</td><td>0.3408</td></tr>
+        <tr><td>VGGT base, &alpha;=0.05 fg2</td><td>1.2097</td><td>0.2906</td><td>0.3484</td><td>0.3465</td></tr>
+        <tr><td>VGGT adapted, &alpha;=0.05 fg2</td><td>1.2004</td><td>0.2989</td><td>0.3601</td><td>0.3700</td></tr>
+        <tr><td>omni@ceil1.5, &alpha;=0.05 fg2</td><td>0.8406</td><td>0.5023</td><td>0.4099</td><td>0.4570</td></tr>
+      </tbody></table></div>
+    <p class="cap">Mean over every keyframe of each <span class="m">slam_depth.npz</span>. The prior's
+    own scale cancels against the grid it is fitted with: a &ldquo;rescale the served depth&rdquo;
+    experiment cannot move anything, and never needs to be run.</p>
+  </div>
+
+  <div class="finding col"><p>Only two things about a served depth can reach the solver: its
+  disparity <em>shape</em> modulo a bilinear scale field, and where that shape sits relative to zero
+  disparity. An additive disparity offset is the one affine degree of freedom the alignment cannot
+  absorb &mdash; which is why the pedestal knob is the only affine knob that does anything.</p></div>
+</section>
+
+<section>
+  <div class="col">
+    <h2><span class="n">The anchor</span>Where the alignment is fitted, and where it is merely asserted</h2>
+    <p>The scale parameter's Jacobian is <code>Jso = &minus;m&middot;disps_prior&middot;Jbi</code>, so a
+    pixel's leverage on the grid goes as its disparity <em>squared</em>. Binning every pixel of every
+    keyframe by the depth the prior gives it, in multiples of that frame's median:</p>
+  </div>
+
+  <div class="figure">
+    <div class="tablewrap"><table>
+      <thead><tr><th>served depth (&times; frame median)</th><th>&lt;0.5</th><th>0.5&ndash;1</th>
+        <th>1&ndash;1.5</th><th>1.5&ndash;2</th><th>2&ndash;3</th><th>3&ndash;5</th><th>5&ndash;10</th></tr></thead>
+      <tbody>
+        <tr><td>omni &mdash; share of pixels</td><td>4.1%</td><td>45.9%</td><td>25.4%</td><td>10.0%</td>
+          <td>6.9%</td><td>4.4%</td><td>3.2%</td></tr>
+        <tr><td>omni &mdash; share of the scale fit</td><td>13.3%</td><td>68.6%</td><td>14.0%</td>
+          <td>2.7%</td><td>1.0%</td><td>0.2%</td><td>0.1%</td></tr>
+        <tr><td>VGGT base &mdash; share of the scale fit</td><td>27.7%</td><td>56.4%</td><td>12.1%</td>
+          <td>2.4%</td><td>1.2%</td><td>0.2%</td><td>0.0%</td></tr>
+      </tbody></table></div>
+    <p class="cap">On the lidar-covered pixels the same weighting reads 77% under 10&nbsp;m, 20% at
+    10&ndash;20&nbsp;m, 2.3% at 20&ndash;40&nbsp;m, 0.2% at 40&ndash;80&nbsp;m. Turning
+    <span class="m">far_gain</span> from 1 to 2 moves the 20&ndash;40&nbsp;m share from 2.3% to 3.9% &mdash;
+    it tilts the weighting, it does not relocate it.</p>
+  </div>
+
+  <div class="finding col"><p>82% of what fits the alignment sits nearer than the frame's own median
+  depth; 96% nearer than 1.5&times; it. Everything the prior says past that is an
+  <em>assertion</em>, carried into the solve at full <code>alpha</code> and never checked by the fit
+  that scaled it.</p></div>
+</section>
+
+<section>
+  <div class="col">
+    <h2><span class="n">The error</span>The trajectory error is one number, and it is not accuracy</h2>
+    <p>Every arm on disk was re-measured from its raw <span class="m">traj_full.txt</span> against
+    the odometry poses: Sim(3) ATE, and the standard deviation of the <em>local</em> Sim(3) scale in
+    a sliding 31-frame window &mdash; the map and trajectory breathing together. The two are the same
+    number up to a constant.</p>
+  </div>
+
+  <div class="figure">
+    <div class="chart">
+      <div class="legend">
+        <span><i class="sw" style="background:var(--s1)"></i>&alpha;=0.05, far_gain 2 &mdash; 54 arms</span>
+        <span><i class="sw" style="background:var(--s2)"></i>&alpha;=0.01 flat &mdash; 18 arms</span>
+        <span class="dim">line: ATE = 66 &times; wobble</span>
+      </div>
+      <svg id="sc" viewBox="0 0 900 430" role="img"
+        aria-label="Scatter of absolute trajectory error against local scale wobble for 72 arms; the points lie on a straight line through the origin."></svg>
+    </div>
+    <p class="cap">Hover a point for the arm. Excluding one blown-up arm (wobble 1.92, ATE 45.8, off
+    scale) the correlation over the remaining 71 arms is <b>+0.988</b> and the median ratio is
+    <b>66&nbsp;m per unit of wobble</b>; within the &alpha;=0.01 group alone, +0.990. The wobble is a
+    real gauge motion, not a pose artefact: per keyframe it tracks the map's own depth ratio to lidar
+    in a fixed 8&ndash;20&nbsp;m band at &minus;0.97.</p>
+  </div>
+
+  <div class="col">
+    <p>The same thing in KITTI's own terms: the mean 100&nbsp;m chord ratio is 0.98&ndash;0.99 for
+    every arm, good and bad alike. What separates them is its spread &mdash; &plusmn;0.056 for the best
+    arm against &plusmn;0.186 for the worst. Nothing here is a bias that a better global scale would
+    fix.</p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <h2><span class="n">The paradox</span>The prior that tracks best is the one furthest from the lidar</h2>
+    <p>For each served depth, JDSA's own weighted scale fit was solved against GT disparity and the
+    result read back as metres: what the prior <em>asserts</em> a thing at range 
+    <em>r</em> is at, once aligned the way the solver aligns it.</p>
+  </div>
+
+  <div class="figure">
+    <div class="tablewrap"><table>
+      <thead><tr><th>served depth</th><th>5&ndash;10 m</th><th>10&ndash;20 m</th><th>20&ndash;40 m</th>
+        <th>40&ndash;80 m</th><th>p99 asserted</th><th>ATE</th></tr></thead>
+      <tbody>
+        <tr><td>omni raw</td><td>1.006</td><td>0.888</td><td>0.719</td><td>0.549</td><td>29.5 m</td><td class="lose">11.40</td></tr>
+        <tr><td>omni@ceil1.45</td><td>1.027</td><td>0.891</td><td class="win">0.526</td><td class="win">0.268</td><td>13.6 m</td><td class="win">3.83</td></tr>
+        <tr><td>omni@ped1.8</td><td>1.055</td><td>0.797</td><td>0.516</td><td>0.310</td><td>16.2 m</td><td class="win">3.94</td></tr>
+        <tr><td>omni@ped1</td><td>1.084</td><td>0.771</td><td>0.466</td><td>0.265</td><td>13.8 m</td><td class="lose">11.01</td></tr>
+        <tr><td>omni@ped0.6</td><td>1.114</td><td>0.752</td><td>0.431</td><td>0.237</td><td>12.2 m</td><td class="lose">25.95</td></tr>
+        <tr><td>VGGT base raw</td><td>1.014</td><td>0.962</td><td>0.874</td><td>0.687</td><td>35.7 m</td><td class="lose">15.63</td></tr>
+        <tr><td>VGGT base@ped1</td><td>1.075</td><td>0.787</td><td>0.488</td><td>0.279</td><td>14.0 m</td><td class="win">3.79</td></tr>
+        <tr><td>VGGT base@ceil1.5</td><td>1.036</td><td>0.965</td><td>0.565</td><td>0.289</td><td>14.6 m</td><td>9.56</td></tr>
+        <tr><td>VGGT adapted <span class="dim">(extract run)</span></td><td>1.007</td><td>0.989</td><td>0.927</td><td>0.592</td><td>&mdash;</td><td class="lose">14.18</td></tr>
+      </tbody></table></div>
+    <p class="cap">Ratios are aligned-prior depth over lidar depth, median over keyframes. ATE in
+    metres, Sim(3), whole 1000-frame window. The adapted row comes from its extract dump rather than
+    an end2end arm, so read it against the other extract runs (omni 12.09, VGGT base 16.03,
+    omni@ceil1.5 4.43), not against the end2end column.</p>
+  </div>
+
+  <div class="finding col"><p>The most accurate prior on record &mdash; the LoRA-adapted VGGT, within
+  7% of lidar out to 40&nbsp;m &mdash; tracks at 14.2&nbsp;m. The least accurate, a clamped Omnidata
+  that puts 40&ndash;80&nbsp;m structure at a third of its true depth, tracks at 3.8&nbsp;m. Fitting
+  an affine relation to the lidar agrees: every prior wants a <em>negative</em> disparity offset
+  (&minus;0.21 median disparity for omni, &minus;0.085 for VGGT base, &minus;0.024 adapted). Every
+  knob that helps the trajectory pushes the other way.</p></div>
+</section>
+
+<section>
+  <div class="col">
+    <h2><span class="n">The family</span>One transform, three sharpnesses &mdash; and one that says nothing</h2>
+    <p>The two knobs in the tree are not two ideas. Served disparity
+    <code>q' = (q<sup>k</sup> + b<sup>k</sup>)<sup>1/k</sup></code> with
+    <code>b = median(q)/tag</code> is a clamp at <em>k</em>&nbsp;=&nbsp;&infin;, a pedestal at
+    <em>k</em>&nbsp;=&nbsp;1, and nothing has been run in between. All three bound the served depth at
+    <code>tag &times;</code> the frame median; they differ only in what they charge the near field for
+    that bound.</p>
+  </div>
+
+  <div class="figure">
+    <div class="chart">
+      <div class="legend">
+        <span><i class="sw" style="background:var(--s1)"></i>@ceil1.45 &mdash; k = &infin;</span>
+        <span><i class="sw" style="background:var(--s3)"></i>@soft1.45 &mdash; k = 2 <b>(untried)</b></span>
+        <span><i class="sw" style="background:var(--s2)"></i>@ped1.45 &mdash; k = 1</span>
+      </div>
+      <svg id="rc" viewBox="0 0 900 400" role="img"
+        aria-label="Response curves: served depth over true depth against true depth in frame-median units, for the clamp, the quadrature bound and the pedestal."></svg>
+    </div>
+    <p class="cap">Everything left of 1.0 is the half of the frame that carries the parallax and 82%
+    of the alignment's leverage. The clamp leaves it untouched and truncates; the pedestal pays 26% of
+    it at half the median depth; the quadrature member pays 5.5% and still saturates.</p>
+  </div>
+
+  <div class="figure">
+    <div class="tablewrap"><table>
+      <thead><tr><th>served depth</th><th>20&ndash;40 m assertion</th><th>40&ndash;80 m</th>
+        <th>p99 asserted</th><th>near-half cost</th><th>ATE</th></tr></thead>
+      <tbody>
+        <tr><td>omni@ceil1.45</td><td>0.526</td><td>0.268</td><td>13.6 m</td><td>0.0%</td><td class="win">3.83</td></tr>
+        <tr><td>omni@soft1.7</td><td>0.530</td><td>0.307</td><td>15.9 m</td><td>9.4%</td><td class="dim">unrun</td></tr>
+        <tr><td>omni@ped1.8</td><td>0.516</td><td>0.310</td><td>16.2 m</td><td>30.4%</td><td>3.94</td></tr>
+        <tr><td>base@soft1</td><td>0.464</td><td>0.248</td><td>12.6 m</td><td>20.9%</td><td class="dim">unrun</td></tr>
+        <tr><td>base@ped1</td><td>0.488</td><td>0.279</td><td>14.0 m</td><td>43.4%</td><td class="win">3.79</td></tr>
+      </tbody></table></div>
+    <p class="cap">Rows are matched on what they assert about the far field; the near-half cost is the
+    mean shrink applied to pixels nearer than the frame median. The pedestal sweep is what makes that
+    column a cost and not a curiosity: on omni, @ped2&nbsp;&rarr;&nbsp;@ped1 moves the
+    20&ndash;40&nbsp;m assertion by 5% and the near-half cost from 28% to 44%, and the ATE from 4.14
+    to 11.01.</p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <h2><span class="n">Inference</span>Can the tag be computed instead of swept?</h2>
+    <p>Every ratio above is a value someone tried. The question is whether one could have been
+    <em>derived</em> — from the prior and the tracker alone, with no lidar and no sweep. Each
+    tag-vs-ATE curve on disk that brackets its own optimum was located by a parabola through its
+    best three points, and nine statistics of the served distribution were read at that optimum. A
+    statistic that lands on the same value at every curve's optimum is a rule; one that does not,
+    is not.</p>
+  </div>
+
+  <div class="figure">
+    <div class="tablewrap"><table>
+      <thead><tr><th>statistic of the served field</th><th>omni @ceil 1.44</th>
+        <th>omni @ped 1.86</th><th>base @ped 0.99</th><th>spread</th></tr></thead>
+      <tbody>
+        <tr><td><b>push</b> — aligned prior / tracker disparity, far pixels</td><td>1.887</td>
+          <td>1.890</td><td>1.954</td><td class="win">3%</td></tr>
+        <tr><td>the tracker-disparity percentile the floor sits at</td><td>26.9</td><td>26.4</td>
+          <td>28.5</td><td class="win">8%</td></tr>
+        <tr><td>served p95 / median depth</td><td>1.435</td><td>1.983</td><td>1.450</td><td>34%</td></tr>
+        <tr><td>served p99 / median depth</td><td>1.435</td><td>2.144</td><td>1.533</td><td>42%</td></tr>
+        <tr><td>served disparity floor</td><td>0.697</td><td>0.444</td><td>0.636</td><td>43%</td></tr>
+        <tr><td>pixels the transform moved</td><td>24%</td><td>100%</td><td>100%</td><td>101%</td></tr>
+        <tr><td>near-half cost</td><td>0.0%</td><td>28.0%</td><td>40.4%</td><td class="lose">177%</td></tr>
+        <tr><td>disparity offset / tracker median</td><td>0.000</td><td>0.549</td><td>1.014</td><td class="lose">195%</td></tr>
+        <tr><td>scale-fit information beyond 1.5× median</td><td>0.0%</td><td>3.8%</td><td>1.3%</td><td class="lose">226%</td></tr>
+      </tbody></table></div>
+    <p class="cap">Two priors, two families, three optima. The tail statistics that an earlier sweep
+    matched on (p95, p99) vary by a third; the one that does not is a comparison against the
+    <em>tracker</em>, not a property of the prior alone.</p>
+  </div>
+
+  <div class="finding col"><p><b>The push.</b> Take the pixels the tracker itself calls far — its
+  own disparity below ⅔ of its frame median — and ask how much nearer than that the aligned prior
+  insists they are. At the optimum of every curve measured, that ratio is <b>1.89, 1.89, 1.95</b>.
+  Not a fixed tag, not a fixed tail: a fixed argument with the tracker. Both quantities are in the
+  video buffer at run time, so the rule is computable online, with no GT and no sweep.</p></div>
+
+  <div class="col">
+    <h3>Inverting it</h3>
+    <p>Bisecting on the tag until the push hits 1.9, on the same dumps:</p>
+  </div>
+
+  <div class="figure">
+    <div class="tablewrap"><table>
+      <thead><tr><th>prior</th><th>push, untransformed</th><th>@ceil</th><th>@soft</th><th>@ped</th>
+        <th>swept optimum</th></tr></thead>
+      <tbody>
+        <tr><td>kitti omni</td><td>1.47</td><td class="win">1.42</td><td>1.55</td><td class="win">1.79</td>
+          <td>1.435 (ceil) · 1.862 (ped)</td></tr>
+        <tr><td>kitti VGGT base</td><td>1.32</td><td>1.37</td><td>1.28</td><td class="lose">1.20</td>
+          <td>0.994 (ped)</td></tr>
+        <tr><td>kitti VGGT adapted</td><td>1.50</td><td>1.49</td><td>1.56</td><td>1.72</td>
+          <td class="dim">never swept</td></tr>
+        <tr><td>kitti omni@ceil1.5 <span class="dim">(as run)</span></td><td>1.85</td>
+          <td colspan="3" class="dim">already at target — nothing to add</td>
+          <td>4.30 m at 1.5</td></tr>
+        <tr><td>rellis omni</td><td class="lose">10.86</td><td colspan="3" class="dim">unreachable —
+          the rule says bound nothing</td><td>raw is best</td></tr>
+      </tbody></table></div>
+    <p class="cap">The omni predictions land on the swept optima (1.42 against 1.435; 1.79 against
+    1.862). The arm that was actually run at <code>@ceil1p5</code> realises push 1.85 on its own
+    dump, so the offline inversion is not reading its own tail. The base pedestal is the miss —
+    1.20 asked against 0.99 measured, worth about 1.8 m — and it is the one family that rewrites
+    100% of the pixels, including the near field the counterfactual tracker was recorded under.</p>
+  </div>
+
+  <div class="col">
+    <h3>Where the rule breaks</h3>
+    <p>It locates optima; it does not predict ATE. Fitted over all 30 frozen arms,
+    <code>|log(push/1.9)|</code> explains R²&nbsp;0.53 of log ATE — the best of the nine by a wide
+    margin (the next is 0.33, and no pair of statistics passes 0.66 on 30 points). The failure is
+    one-sided and worth stating plainly: <b>every arm under 4.4&nbsp;m sits at push 1.84–1.95, and
+    four arms inside that same band track at 5.6–8.6&nbsp;m.</b> Hitting the push is necessary, not
+    sufficient — the second factor is the near-field cost, which is what makes this a
+    <em>constrained</em> choice: hit the push, then take the family that pays the least near field
+    for it.</p>
+  </div>
+
+  <div class="figure">
+    <div class="chart">
+      <div class="legend">
+        <span><i class="sw" style="background:var(--s1)"></i>Omnidata arms</span>
+        <span><i class="sw" style="background:var(--s2)"></i>VGGT base arms</span>
+        <span class="dim">line: push = 1.9</span>
+      </div>
+      <svg id="pu" viewBox="0 0 900 400" role="img"
+        aria-label="ATE against the push statistic for 30 arms; every arm below 4.4 m sits in a narrow band around 1.9, but not every arm in that band is good."></svg>
+    </div>
+    <p class="cap">The band is a gate, not a predictor: nothing good lives outside it, and not
+    everything inside it is good.</p>
+  </div>
+
+  <div class="col">
+    <h3>The scene that says no</h3>
+    <p>RELLIS is the useful negative. Re-measuring its 231 arms the same way, the wobble law holds
+    with a different constant (ATE ≈ 33 × wobble, corr +0.83) — but only after windows the platform
+    barely moved through are dropped; without that guard an off-road scene with stops reads
+    corr −0.33, which is the metric failing, not the law. And on that scene the ceiling does nothing
+    at all: omni 31.28, @ceil3 31.39, @ceil2 31.68, @ceil1p5 32.66 — bounding only hurts. The rule
+    agrees before the fact: that prior already pushes <b>10.9</b> against its tracker, far past
+    target, and no bound can lower a push. The honest caveat is that every RELLIS arm is broken
+    (wobble 1.2 means the local scale swings ±120%), so the scene confirms the rule's verdict
+    without being able to discriminate much else.</p>
+
+    <h3>What a controller would need</h3>
+    <p>A single keyframe's push is noisy: at <code>@ceil1p42</code> the per-keyframe median is 1.79
+    with a 10–90 range of 1.44–2.53 and a frame-to-frame step of 0.15. So the online form is not
+    per-frame inversion but a slow integrator — hold the median push over the last ~10 keyframes at
+    target by nudging the tag — which also removes the counterfactual weakness of the offline
+    inversion, since it reads the tracker it is actually steering. That is the piece of code this
+    analysis argues for next, and it is ~30 lines against
+    <span class="m">adaslam/online/prior.py</span>'s existing serving hook.</p>
+  </div>
+
+  <div class="finding col"><p><b>Verdict, after eleven arms.</b> On Omnidata the rule
+  works and the plateau confirms it: it asked for 1.55, and <code>@soft1p45</code> and
+  <code>@soft1p55</code> both land at <b>3.89 m</b>. On VGGT it over-asks — 1.20 for
+  <code>@ped</code> against 0.99, 1.28 for <code>@soft</code> against 0.98 — and its sharpest
+  cross-prior prediction is dead: <code>base@ceil1p45</code> was to land far below
+  <code>@ceil1p5</code>'s 9.56 and landed at <b>9.14</b>. Retuned on all five curves, the same
+  statistic gets to a 7% mean tag error; what it cannot do is survive a change of scene.</p></div>
+</section>
+
+<section>
+  <div class="col">
+    <h2><span class="n">The batch</span>What the eleven arms said</h2>
+    <p>Eleven arms, about six minutes each, all single draws. The near-identical tags
+    <code>@ceil1p4/1p42/1p43/1p45</code> reproduce to ±0.07 m and three seeds of
+    <code>base_ped1</code> to ±0.08 m, so that is the floor to read the table against.</p>
+  </div>
+
+  <div class="figure">
+    <div class="tablewrap"><table>
+      <thead><tr><th>arm</th><th>family</th><th>ATE</th><th>wobble</th><th>push</th>
+        <th>near cost</th><th>served tail</th></tr></thead>
+      <tbody>
+        <tr><td>base@ped1 <span class="dim">ref</span></td><td>ped</td><td class="win">3.79</td><td>0.072</td><td>1.95</td><td>40.3%</td><td>1.54</td></tr>
+        <tr><td>omni@ceil1p45 <span class="dim">ref</span></td><td>ceil</td><td class="win">3.83</td><td>0.067</td><td>1.88</td><td>0.0%</td><td>1.45</td></tr>
+        <tr><td><b>omni@soft1p45</b></td><td>soft</td><td class="win">3.89</td><td>0.067</td><td>1.93</td><td>10.9%</td><td>1.70</td></tr>
+        <tr><td><b>omni@soft1p55</b></td><td>soft</td><td class="win">3.89</td><td>0.067</td><td>1.91</td><td>9.8%</td><td>1.73</td></tr>
+        <tr><td>omni@ped1p8 <span class="dim">ref</span></td><td>ped</td><td class="win">3.94</td><td>0.072</td><td>1.90</td><td>28.6%</td><td>2.12</td></tr>
+        <tr><td><b>omni@soft1p7</b></td><td>soft</td><td>4.21</td><td>0.066</td><td>1.86</td><td>8.3%</td><td>1.88</td></tr>
+        <tr><td><b>base@soft1</b></td><td>soft</td><td>4.86</td><td>0.101</td><td>2.02</td><td>18.1%</td><td>1.35</td></tr>
+        <tr><td><b>base@soft0p9</b></td><td>soft</td><td>5.62</td><td>0.115</td><td>2.06</td><td>21.0%</td><td>1.27</td></tr>
+        <tr><td><b>omni@soft1p2</b></td><td>soft</td><td>5.64</td><td>0.114</td><td>2.01</td><td>14.8%</td><td>1.52</td></tr>
+        <tr><td><b>base@soft1p2</b></td><td>soft</td><td>8.97</td><td>0.131</td><td>1.93</td><td>13.8%</td><td>1.46</td></tr>
+        <tr><td><b>base@ceil1p45</b></td><td>ceil</td><td>9.14</td><td>0.133</td><td>1.84</td><td>0.0%</td><td>1.45</td></tr>
+        <tr><td><b>base@soft0p8</b></td><td>soft</td><td>9.57</td><td>0.136</td><td>2.10</td><td>24.4%</td><td>1.23</td></tr>
+        <tr><td>omni raw <span class="dim">ref</span></td><td>—</td><td class="lose">11.40</td><td>0.168</td><td>1.47</td><td>0.0%</td><td>5.81</td></tr>
+        <tr><td>base raw <span class="dim">ref</span></td><td>—</td><td class="lose">15.63</td><td>0.233</td><td>1.32</td><td>0.0%</td><td>3.51</td></tr>
+        <tr><td><b>omni@mask1p45</b></td><td>mask</td><td class="lose">16.28</td><td>0.241</td><td>—</td><td>0.0%</td><td>78.5% mute</td></tr>
+        <tr><td><b>base@mask1p45</b></td><td>mask</td><td class="lose">18.06</td><td>0.277</td><td>—</td><td>0.0%</td><td>77.2% mute</td></tr>
+      </tbody></table></div>
+    <p class="cap">Bold is new. &ldquo;Mute&rdquo; is the share of the pixels the tracker calls far
+    that the mask left with no prior at all. Every new arm sits on the wobble law: ATE/wobble runs
+    56–69 across the eleven.</p>
+  </div>
+
+  <div class="finding col"><p><b>The mask settles the mechanism, and not subtly.</b> Same threshold,
+  the same 25.9% of the frame: <em>pinned</em> at 1.45× the frame median it is the best arm on
+  record (3.83 m); <em>deleted</em> it is worse than doing nothing at all (16.28 against 11.40 raw)
+  — a factor of 4.3 between two readings of the same pixels. And the wobble is monotone in how
+  tightly that far field is held: mute 0.241 &gt; raw prior 0.168 &gt; bounded 0.067 on Omnidata,
+  0.277 &gt; 0.233 &gt; 0.072 on VGGT. The prior's far field earns its keep as a rigid anchor, not
+  as information — at the optimum it is asserting 0.27× the true depth out there.</p></div>
+
+  <div class="col">
+    <h3>The family ties on one prior and splits on the other</h3>
+    <p>On Omnidata all three sharpnesses reach the same place: 3.83 (clamp, k = ∞), 3.89
+    (quadrature, k = 2), 3.94 (pedestal, k = 1), against a ±0.08 m floor — and their near-field
+    costs are 0%, 11% and 29%. The hypothesis this family was built on is therefore <b>wrong</b>:
+    once the bound is right, what it charges the near field does not matter on that prior.</p>
+    <p>On VGGT it matters enormously, and with the opposite sign. <code>@ped1</code> 3.79 (40% near
+    cost) &lt; <code>@soft1</code> 4.86 (18%) &lt; <code>@soft1p2</code> 8.97 (14%) ≈
+    <code>@ceil1p45</code> 9.14 (0%). Correlating log ATE against near-field cost inside each prior:
+    <b>−0.71 on VGGT, +0.58 on Omnidata</b>. The near-field compression Omnidata is indifferent to
+    is the thing VGGT needs, and a clamp cannot supply it at any tag.</p>
+    <p>The raw mid fields say why, in the same direction the assertion table did: Omnidata already
+    asserts 10–20 m at 0.89 of true depth, VGGT at 0.96, and a clamp leaves that untouched. A prior
+    that is <em>faithful</em> in the mid field has to be compressed there too before it tracks —
+    which is what the two families that touch the near field do, and the clamp does not.</p>
+
+    <h3>Retuning it: 7% on five curves</h3>
+    <p>With five bracketed optima instead of three, the far-field threshold and the target are
+    themselves fittable. Sweeping both: the best rule is <b>the push measured past 1.5× the
+    tracker's own median depth, held at 1.93</b>. Inverting it inside each family gives</p>
+  </div>
+
+  <div class="figure">
+    <div class="tablewrap"><table>
+      <thead><tr><th>curve</th><th>swept optimum</th><th>rule's tag</th><th>error</th>
+        <th>ATE cost of using the rule's tag</th></tr></thead>
+      <tbody>
+        <tr><td>omni @ceil</td><td>1.44</td><td>1.40</td><td class="win">−3%</td><td>+0.13 m</td></tr>
+        <tr><td>omni @soft</td><td>1.50</td><td>1.50</td><td class="win">0%</td><td>0.00 m</td></tr>
+        <tr><td>omni @ped</td><td>1.86</td><td>1.67</td><td>−10%</td><td>≈ +0.7 m</td></tr>
+        <tr><td>base @ped</td><td>0.99</td><td>1.02</td><td class="win">+3%</td><td>≈ +0.2 m</td></tr>
+        <tr><td>base @soft</td><td>0.98</td><td>1.17</td><td class="lose">+19%</td><td>≈ +3.5 m</td></tr>
+      </tbody></table></div>
+    <p class="cap">Mean 7%, worst 20%. The target transfers between priors: fitted on VGGT alone it
+    reads 1.94 and still places Omnidata's three optima to 7%; fitted on Omnidata alone, 1.91. Every
+    other band of the prior/tracker disagreement profile inverts worse (0.23–0.42 mean log error) or
+    cannot reach its target at all inside a family — a clamp, in particular, cannot move the near
+    bands by construction, which is the second half of the rule.</p>
+  </div>
+
+  <div class="col">
+    <h3>Two questions, two statistics</h3>
+    <p>The near band — pixels the tracker puts closer than half its median depth — is what says
+    <em>which family</em> is even viable, and it is the one thing a clamp cannot touch at any tag.
+    At the five optima it sits at 0.91 (spread 4%). Untransformed, Omnidata reads <b>0.937</b> and
+    VGGT <b>0.965</b>: near enough for Omnidata, out of reach for VGGT, which is exactly the
+    9.14-versus-3.79 the clamp and the pedestal returned on that prior. The same statistic run on
+    the adapted VGGT reads 0.971 — so that prior, never swept, is predicted to need a pedestal too,
+    at a tag of 1.62.</p>
+    <p>And the push doubles as the gate on whether to bound at all. Untransformed it reads 1.48 on
+    Omnidata, 1.32 on VGGT, 1.52 on the adapted VGGT — all far under target, all needing a bound —
+    and <b>8.65 on RELLIS</b>, already past it, where no bound can help and none did.</p>
+  </div>
+
+  <div class="finding col"><p><b>But R is not a property of the prior.</b> Same prior, same
+  tracking config, frames 1000–2000 instead of 0–1000, and VGGT's pedestal optimum moves from 1.0 to
+  <b>0.8</b>: 0.7 → 4.97, <b>0.8 → 3.46</b>, 0.9 → 4.02, 1.0 → 4.90, 1.1 → 6.04. A tag calibrated
+  once per prior is already wrong one window later.</p></div>
+
+  <div class="col">
+    <h3>Does the statistic follow the scene? Partly.</h3>
+    <p>That question was worth one extract run, and it is now answered on the second window's own
+    dump. The rule <em>does</em> move — it asks 1.04 on f0–1000 and <b>0.65</b> on f1000–2000 — but
+    it moves twice as far as the optimum does (0.99 → 0.82, a 17% shift, against the rule's 37%).
+    Its 21% under-shoot on the new window would cost about 2 m of ATE, which is worse than simply
+    reusing the previous window's tag.</p>
+    <p>The reason is visible in one number: the push measured at each window's <em>own</em> swept
+    optimum is <b>1.942</b> on f0–1000 and <b>1.870</b> on f1000–2000. With a well this narrow —
+    2.5% off target roughly doubles the tag error — that 4% is the entire miss. And the two windows
+    are otherwise indistinguishable: median lidar depth 9.7 against 9.9 m, served tail 3.51 against
+    3.49 median-depths, far-pixel share 30.7% against 28.5%. Nothing descriptive about the scene
+    predicts the shift, which closes the door on a "scene statistic → R" lookup as well.</p>
+    <p>Nor does re-parameterising the transform against the prior's own tail, which is the obvious
+    next thing to try. Expressing the pedestal's added disparity <code>b</code> at each window's own
+    optimum against tail references instead of the median moves every one of them by the same
+    18–21%:</p>
+  </div>
+
+  <div class="figure">
+    <div class="tablewrap"><table>
+      <thead><tr><th>window</th><th>R</th><th>b / median</th><th>b / q01</th><th>b / q05</th>
+        <th>b / q10</th><th>b / min</th><th>pixels below b</th></tr></thead>
+      <tbody>
+        <tr><td>f0–1000</td><td>0.99</td><td>1.01</td><td>3.54</td><td>2.79</td><td>2.28</td>
+          <td>4.09</td><td>51.0%</td></tr>
+        <tr><td>f1000–2000</td><td>0.82</td><td>1.22</td><td>4.26</td><td>3.37</td><td>2.81</td>
+          <td>4.83</td><td>65.1%</td></tr>
+      </tbody></table></div>
+    <p class="cap">The two windows' priors are the same shape (served tail 3.51 against 3.49
+    median-depths), so any parameterisation defined on the prior alone — median, percentile, floor,
+    clipped fraction — shifts together and explains none of the move. Whatever moved the optimum is
+    on the tracker's side, which is why only a tracker-referenced quantity moved at all.</p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <h2><span class="n">Verdict</span>The target moves, and that kills the controller</h2>
+    <p>Both in-situ runs are in. Each tracked <em>under</em> the pedestal its own window's sweep
+    chose, so the push on its dump is measured on the tracker the transform actually produced — no
+    counterfactual left.</p>
+  </div>
+
+  <div class="figure">
+    <div class="tablewrap"><table>
+      <thead><tr><th>dump</th><th>served</th><th>push (JDSA's own grid)</th><th>push (refit)</th>
+        <th>counterfactual estimate</th><th>near band</th></tr></thead>
+      <tbody>
+        <tr><td>f0–1000</td><td>@ped1 <span class="dim">(its opt 0.99)</span></td><td>1.900</td>
+          <td><b>1.926</b></td><td>1.942</td><td>0.905</td></tr>
+        <tr><td>f1000–2000</td><td>@ped0.8 <span class="dim">(its opt 0.82)</span></td><td>1.522</td>
+          <td><b>1.819</b></td><td>1.870</td><td>0.884</td></tr>
+      </tbody></table></div>
+    <p class="cap">The counterfactual estimates were accurate to 0.8% and 2.8% — the offline
+    inversion was never the error. What is not constant is the target itself: 1.93 against 1.82 on
+    the refit alignment, 1.90 against 1.52 on the grid JDSA actually fitted.</p>
+  </div>
+
+  <div class="finding col"><p><b>So a controller holding 1.93 would make the same mistake.</b> The
+  21% miss on the second window was not an artefact of scoring a candidate transform against the
+  wrong tracker field; the push at the optimum genuinely differs between windows, and a fixed-target
+  loop — online or offline — chases a number that has moved. That is worth knowing for the price of
+  two extracts: the ~30 lines do not get written.</p></div>
+
+  <div class="col">
+    <p>The other candidate has the opposite failure. The near band held tighter in situ (0.905
+    against 0.884), but inverting it gives 1.10 on the first window and 1.07 on the second — it is
+    nearly blind to a shift the truth makes at 17%. One statistic over-reacts by 2×, the other does
+    not react at all.</p>
+    <p>The shift itself is now confirmed rather than assumed: these two extracts are independent
+    runs of the same operating points and they reproduce the sweeps — 3.64 m at <code>@ped1</code> on
+    f0–1000 (the end2end arm and its three seeds read 3.79 / 3.62 / 3.64 / 3.70) and 3.48 m at
+    <code>@ped0p8</code> on f1000–2000 (end2end 3.46). The optimum really does move between two
+    halves of one sequence.</p>
+
+    <h3>What the remaining uncertainty is worth</h3>
+    <p>Worth keeping in proportion. Bounding the tail <em>at all</em> is worth 8–12 m of ATE
+    (15.63 → 3.79 on VGGT, 11.40 → 3.83 on Omnidata). Getting the tag right <em>within</em> a
+    sensible bracket is worth 1–3.5 m. The zero-run rule was chasing the second-order term, and two
+    of its three plausible statistics are now excluded.</p>
+    <p>So the protocol that stands: <b>let the rule place one arm, then bracket it ±25%</b> — three
+    arms, about 18 minutes, per new scene or prior. Against the seven-to-nine-arm sweeps that
+    produced every curve here, that is most of the saving the rule was ever going to deliver.</p>
+
+    <h3>Where the next metre is, if it is anywhere</h3>
+    <p>Not in R. The structural comparison of the two priors turned up a confound worth more than
+    the tag: Omnidata is fed a hard <code>Resize((512, 512))</code> of an 848×256 frame
+    (<span class="m">motion_filter.py:62</span>) — a 3.3:1 image squashed to 1:1 — while VGGT gets an
+    aspect-preserved resize. Every Omnidata-vs-VGGT comparison in this project carries that
+    asymmetry, and it plausibly explains the mid-field compression that decides which transform
+    family Omnidata needs. One arm tests it, but it needs a small prior class that owns its own
+    resize rather than a spec modifier, since the squash happens inside the extractor before the
+    model call.</p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <h2><span class="n">Method</span>What was measured, and what it cannot say</h2>
+    <ul class="foot">
+      <li>Depth numbers come from the seven <span class="m">full/slam_depth.npz</span> dumps
+      (<code>disps_prior</code>, <code>disps</code>, <code>dscales</code>, poses) at the 1/8 grid JDSA
+      runs on, against <span class="m">data/KITTI/00/depths</span> resized nearest and sampled at the
+      same <code>[3::8, 3::8]</code> offsets the tracker uses.</li>
+      <li>Trajectory numbers were recomputed from raw <span class="m">traj_full.txt</span> files with
+      an own Umeyama Sim(3); no <span class="m">results.json</span> was read.</li>
+      <li>The lidar covers 56% of the frame &mdash; none of the sky, ~45 pixels per keyframe beyond
+      40 m. Every far-field ratio rests on those pixels; nothing here measures what the prior does
+      above the horizon.</li>
+      <li>Offline transform screens (near-field cost, asserted profile, grid tilt) apply a candidate
+      transform to a prior recorded under a <em>different</em> run's keyframes and tracker field. They
+      predicted the realised grid tilt of the clamped arm to within 0.002, but they remain
+      counterfactual.</li>
+      <li>Two mechanisms were tested and do not survive: per-point inter-frame repeatability of the
+      prior (VGGT is twice as repeatable as Omnidata and tracks worse), and far-field contamination of
+      the near-field alignment (it ranks the clamp <em>below</em> the raw prior, and the mask above
+      both).</li>
+      <li>The optimum of each tag curve is a parabola through its best three points in log-tag,
+      not a measured arm; the rule is read at that interpolated tag.</li>
+      <li>The local-scale wobble needs a motion guard — windows the platform covers less than 3 m of
+      GT path through cannot identify a scale, and on a scene with stops they are most of them.
+      Without it RELLIS reads corr &minus;0.33 instead of +0.83.</li>
+      <li>The push inversion is counterfactual in the same way: it evaluates a candidate transform
+      against a tracker field recorded under a different one. The arm actually run at
+      <code>@ceil1p5</code> realises the push its inversion predicts, but a family that rewrites the
+      near field (the pedestal) is where that assumption is weakest — and that is exactly where the
+      inversion misses.</li>
+      <li>Every ATE is a single draw.</li>
+    </ul>
+  </div>
+</section>
+</div>
+<div class="tip" id="tip"></div>
+<script>
+const ARMS=[["base_ped1_r2",3.623,0.0638,0],["base_ped1_r3",3.639,0.0645,0],["base_ped1_r1",3.7,0.0659,0],["live_fg2a05ped1p35_e5_w10_a16_w12_lag5_base_live",3.734,0.0745,0],["base_ped1",3.788,0.0717,0],["omni_ceil1p45",3.83,0.0669,0],["omni_ped1p8",3.94,0.0708,0],["omni_ceil1p42",3.957,0.0726,0],["omni_ceil1p4",3.963,0.0753,0],["omni_ceil1p43",3.974,0.073,0],["omni_ped2",4.139,0.0679,0],["omni_ceil1p5",4.295,0.0676,0],["live_fg2a05ceil1p5_e5_w10_a16_w12_lag5_base_ceil1p5_ped1p3",4.32,0.0844,0],["omni_ceil1p35",4.598,0.0957,0],["live_fg2a05ped1p45_e5_w10_a16_w12_lag5_base_live",4.627,0.0948,0],["base_ceil1p5_ped1p3",5.018,0.1043,0],["omni_ped1p6",5.021,0.1058,0],["omni_ceil1p25",5.085,0.1063,0],["base_ped0p9",5.156,0.1026,0],["base_ped1p1",5.212,0.0788,0],["live_fg2a05ped1p4_e5_w10_a16_w12_lag5_base_live",5.34,0.1062,0],["live_fg2a05ped1p15_e5_w10_a16_w12_lag5_base_live",5.587,0.1091,0],["base_ped1p25",5.615,0.0862,0],["omni_ped1p4",5.73,0.1104,0],["live_fg2a05ped1p25_e5_w10_a16_w12_lag5_base_live",6.055,0.1146,0],["live_fg2a05ceil1p5_e5_w10_a16_w12_lag5_base_ped1p3",6.082,0.0901,0],["live_fg2a05ceil1p5_e5_w10_a16_w12_lag5_base_live",6.479,0.0958,0],["live_fg2a05ceil1p5_e20_w10_a16_w12_lag5_base_live",6.568,0.0976,0],["base_ped1p3",6.737,0.1003,0],["base_ped1p15",6.948,0.1015,0],["gt_oracle",6.992,0.126,0],["base_ped0p8",7.085,0.1287,0],["omni_ped1p2",7.322,0.1272,0],["live_fg2a05ped1_e5_w10_a16_w12_lag5_base_live",7.341,0.1328,0],["gt_oracle",7.65,0.1542,1],["base_ped1p5",8.624,0.125,0],["omni_ceil2",8.664,0.1266,0],["base_ceil1p5",9.562,0.1368,0],["live_fg2a05ceil2_e5_w10_a16_w12_lag5_base_live",10.819,0.1553,0],["omni_ped1",11.006,0.1707,0],["omni_ceil3",11.165,0.1628,0],["omni",11.403,0.1664,0],["base_ped2",11.68,0.1641,0],["base_ped3",12.285,0.1735,0],["base_ceil2",13.084,0.1879,0],["live_fg2a05ped0p8_e5_w10_a16_w12_lag5_base_live",13.321,0.2113,0],["live_fg2a05ceil1p5_e5_w10_a16_w12_lag5_base",13.953,0.1962,0],["omni_ped0p85",14.012,0.2151,0],["live_fg2a05_e20_w6_a16_w12_lag5_raw_base_live",15.084,0.2187,0],["live_fg2a05_e5_w10_a16_w12_lag5_base_live",15.423,0.2272,0],["omni",15.466,0.2273,1],["base",15.627,0.2303,0],["live_e3_w10_a16_w12_lag5_lr12_monoa10_base_live",15.798,0.2358,1],["live_e5_w10_a16_w12_lag5_monoa5_base_live",16.362,0.2443,1],["base_hw154",16.427,0.2448,1],["base",16.582,0.2466,1],["live_e15_w10_a16_w12_lag5_low045_raw_base_live",16.606,0.2483,1],["live_e10_w10_a16_w12_lag5_low045_raw_base_live",16.707,0.249,1],["live_e10_w10_a16_w12_lag3_r_fix_base_live",16.757,0.2474,1],["wonline_a16_e1_w10_lr05_p10",16.777,0.2517,1],["wonline_a16_e12_w10_lr05_p10",16.785,0.2507,1],["live_e15_w10_a16_w12_lag3_r_fix_base_live",16.831,0.2483,1],["wonline_a16_e12_w10_p10",16.916,0.2561,1],["live_e40_a16_w12_lag3_low045_raw_base_live",17.062,0.257,1],["live_e3_w10_a16_w12_lag3_low045_raw_base_live",17.072,0.2556,1],["live_e40_a16_w12_lag7_low045_raw_base_live",17.086,0.256,1],["live_e40_a16_w12_lag5_low045_raw_r_fix_base_live",17.185,0.2577,1],["wonline_a16_e3_w10_p10",17.209,0.2575,1],["live_fg2a05ped0p6_e5_w10_a16_w12_lag5_base_live",20.27,0.3363,0],["omni_ped0p7",21.684,0.3394,0],["omni_ped0p6",25.945,0.4307,0],["live_fg2a05ped0p3_e5_w10_a16_w12_lag5_base_live",45.814,1.915,0]];
+const NS = 'http://www.w3.org/2000/svg';
+const el = (t, a = {}) => { const n = document.createElementNS(NS, t);
+  for (const k in a) n.setAttribute(k, a[k]); return n; };
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const tip = document.getElementById('tip');
+const showTip = (html, ev) => { tip.innerHTML = html; tip.style.opacity = 1;
+  tip.style.left = Math.min(ev.clientX + 14, innerWidth - 230) + 'px';
+  tip.style.top = (ev.clientY - 12) + 'px'; };
+const hideTip = () => { tip.style.opacity = 0; };
+
+function frame(svg, m, w, h, xd, yd, xt, yt, xlab, ylab) {
+  svg.textContent = '';
+  const X = v => m.l + (v - xd[0]) / (xd[1] - xd[0]) * (w - m.l - m.r);
+  const Y = v => h - m.b - (v - yd[0]) / (yd[1] - yd[0]) * (h - m.t - m.b);
+  const g = el('g'); svg.appendChild(g);
+  const ink3 = css('--ink-3'), rule = css('--rule');
+  for (const v of yt) {
+    g.appendChild(el('line', {x1: m.l, x2: w - m.r, y1: Y(v), y2: Y(v),
+      stroke: rule, 'stroke-width': 1}));
+    const t = el('text', {x: m.l - 10, y: Y(v) + 4, 'text-anchor': 'end', fill: ink3,
+      'font-size': 12, 'font-family': css('--mono')}); t.textContent = v; g.appendChild(t);
+  }
+  for (const v of xt) {
+    const t = el('text', {x: X(v), y: h - m.b + 20, 'text-anchor': 'middle', fill: ink3,
+      'font-size': 12, 'font-family': css('--mono')}); t.textContent = v; g.appendChild(t);
+  }
+  g.appendChild(el('line', {x1: m.l, x2: w - m.r, y1: h - m.b, y2: h - m.b,
+    stroke: css('--rule-2'), 'stroke-width': 1}));
+  const xl = el('text', {x: (m.l + w - m.r) / 2, y: h - 4, 'text-anchor': 'middle', fill: ink3,
+    'font-size': 12.5, 'font-family': css('--sans')}); xl.textContent = xlab; g.appendChild(xl);
+  const yl = el('text', {x: 14, y: (m.t + h - m.b) / 2, 'text-anchor': 'middle', fill: ink3,
+    'font-size': 12.5, 'font-family': css('--sans'),
+    transform: `rotate(-90 14 ${(m.t + h - m.b) / 2})`}); yl.textContent = ylab;
+  g.appendChild(yl);
+  return {g, X, Y};
+}
+
+function scatter() {
+  const svg = document.getElementById('sc'), w = 900, h = 430;
+  const m = {l: 56, r: 26, t: 14, b: 44};
+  const xd = [0, 0.45], yd = [0, 30];
+  const {g, X, Y} = frame(svg, m, w, h, xd, yd, [0, 0.1, 0.2, 0.3, 0.4],
+    [0, 5, 10, 15, 20, 25, 30], 'local Sim(3) scale wobble  (std over a 31-frame window)',
+    'ATE (m)');
+  g.appendChild(el('line', {x1: X(0), y1: Y(0), x2: X(0.45), y2: Y(Math.min(30, 66 * 0.45)),
+    stroke: css('--ink-3'), 'stroke-width': 1.5, 'stroke-dasharray': '5 5', opacity: .7}));
+  const cols = [css('--s1'), css('--s2')];
+  const pts = [];
+  for (const [name, ate, wob, grp] of ARMS) {
+    if (wob > xd[1] || ate > yd[1]) continue;
+    const c = el('circle', {cx: X(wob), cy: Y(ate), r: 5, fill: cols[grp],
+      stroke: css('--panel'), 'stroke-width': 2, opacity: .95});
+    c.addEventListener('mouseenter', e => { c.setAttribute('r', 7);
+      showTip(`<b>${name}</b><br>ATE ${ate.toFixed(2)} m &middot; wobble ${wob.toFixed(4)}`, e); });
+    c.addEventListener('mousemove', e => showTip(tip.innerHTML, e));
+    c.addEventListener('mouseleave', () => { c.setAttribute('r', 5); hideTip(); });
+    g.appendChild(c); pts.push(c);
+  }
+  const note = el('text', {x: X(0.36), y: Y(26.5), 'text-anchor': 'start', fill: css('--ink-3'),
+    'font-size': 12, 'font-family': css('--sans')});
+  note.textContent = '1 arm off scale: wobble 1.92, ATE 45.8';
+  g.appendChild(note);
+}
+
+function response() {
+  const svg = document.getElementById('rc'), w = 900, h = 400;
+  const m = {l: 56, r: 96, t: 16, b: 44};
+  const T = 1.45, xd = [0, 6], yd = [0, 1.1];
+  const {g, X, Y} = frame(svg, m, w, h, xd, yd, [0, 1, 2, 3, 4, 5, 6],
+    [0, 0.25, 0.5, 0.75, 1], 'true depth  (× the frame’s median depth)',
+    'served depth / true depth');
+  g.insertBefore(el('rect', {x: X(0), y: Y(1.1), width: X(1) - X(0), height: Y(0) - Y(1.1),
+    fill: css('--accent'), opacity: .07}), g.firstChild);
+  const band = el('text', {x: X(0.5), y: Y(1.06), 'text-anchor': 'middle', fill: css('--ink-3'),
+    'font-size': 11.5, 'font-family': css('--sans')});
+  band.textContent = '82% of the alignment’s leverage'; g.appendChild(band);
+  g.appendChild(el('line', {x1: X(T), x2: X(T), y1: Y(0), y2: Y(1.02), stroke: css('--rule-2'),
+    'stroke-width': 1, 'stroke-dasharray': '3 4'}));
+  const tag = el('text', {x: X(T) + 6, y: Y(1.05), fill: css('--ink-3'), 'font-size': 11.5,
+    'font-family': css('--mono')}); tag.textContent = 'tag 1.45'; g.appendChild(tag);
+  const series = [
+    {n: '@ceil1.45', c: css('--s1'), f: u => Math.min(u, T) / u},
+    {n: '@soft1.45', c: css('--s3'), f: u => 1 / Math.sqrt(1 + (u / T) ** 2)},
+    {n: '@ped1.45', c: css('--s2'), f: u => 1 / (1 + u / T)}];
+  for (const s of series) {
+    let d = '';
+    for (let i = 0; i <= 300; i++) {
+      const u = xd[0] + (xd[1] - xd[0]) * i / 300;
+      const y = u < 1e-6 ? 1 : s.f(u);
+      d += (i ? 'L' : 'M') + X(u).toFixed(1) + ' ' + Y(y).toFixed(1);
+    }
+    g.appendChild(el('path', {d, fill: 'none', stroke: s.c, 'stroke-width': 2.2,
+      'stroke-linejoin': 'round'}));
+    const t = el('text', {x: X(6) + 8, y: Y(s.f(6)) + 4, fill: s.c, 'font-size': 12.5,
+      'font-weight': 500, 'font-family': css('--mono')});
+    t.textContent = s.n; g.appendChild(t);
+  }
+  const hit = el('rect', {x: m.l, y: m.t, width: w - m.l - m.r, height: h - m.t - m.b,
+    fill: 'transparent'});
+  const cross = el('line', {y1: m.t, y2: h - m.b, stroke: css('--ink-3'), 'stroke-width': 1,
+    'stroke-dasharray': '2 3', opacity: 0});
+  g.appendChild(cross); g.appendChild(hit);
+  hit.addEventListener('mousemove', e => {
+    const r = svg.getBoundingClientRect();
+    const px = (e.clientX - r.left) / r.width * w;
+    const u = xd[0] + (px - m.l) / (w - m.l - m.r) * (xd[1] - xd[0]);
+    const uu = Math.max(0.02, Math.min(6, u));
+    cross.setAttribute('x1', X(uu)); cross.setAttribute('x2', X(uu));
+    cross.setAttribute('opacity', .8);
+    showTip(`at <b>${uu.toFixed(2)}×</b> median depth<br>` +
+      series.map(s => `${s.n} &rarr; ${(s.f(uu) * 100).toFixed(0)}%`).join('<br>'), e);
+  });
+  hit.addEventListener('mouseleave', () => { cross.setAttribute('opacity', 0); hideTip(); });
+}
+
+const PUSH=[["base_ped1",1.952,3.788],["omni_ceil1p45",1.8768,3.83],["omni_ped1p8",1.8988,3.94],["omni_ceil1p4",1.913,3.963],["omni_ped2",1.8732,4.139],["omni_ceil1p5",1.8423,4.295],["omni_ceil1p35",1.9503,4.598],["omni_ped1p6",1.9277,5.021],["omni_ceil1p25",2.0282,5.085],["base_ped0p9",1.9806,5.156],["base_ped1p1",1.9258,5.212],["base_ped1p25",1.8891,5.615],["omni_ped1p4",1.9602,5.73],["base_ped1p3",1.8775,6.737],["base_ped1p15",1.9138,6.948],["base_ped0p8",2.0137,7.085],["omni_ped1p2",1.9982,7.322],["base_ped1p5",1.8368,8.624],["omni_ceil2",1.6114,8.664],["base_ceil1p5",1.8046,9.562],["omni_ped1",2.0426,11.006],["omni_ceil3",1.495,11.165],["omni",1.4664,11.403],["base_ped2",1.7559,11.68],["base_ped3",1.6548,12.285],["base_ceil2",1.5269,13.084],["omni_ped0p85",2.0795,14.012],["base",1.3207,15.627],["omni_ped0p7",2.1227,21.684],["omni_ped0p6",2.1507,25.945]];
+
+function pushchart() {
+  const svg = document.getElementById('pu'), w = 900, h = 400;
+  const m = {l: 56, r: 26, t: 14, b: 44};
+  const xd = [1.25, 2.25], yd = [0, 28];
+  const {g, X, Y} = frame(svg, m, w, h, xd, yd, [1.3, 1.5, 1.7, 1.9, 2.1],
+    [0, 5, 10, 15, 20, 25], 'push  (aligned prior / tracker disparity, on the tracker\u2019s far pixels)',
+    'ATE (m)');
+  g.insertBefore(el('rect', {x: X(1.84), y: Y(yd[1]), width: X(1.95) - X(1.84),
+    height: Y(0) - Y(yd[1]), fill: css('--accent'), opacity: .09}), g.firstChild);
+  g.appendChild(el('line', {x1: X(1.9), x2: X(1.9), y1: Y(0), y2: Y(yd[1]),
+    stroke: css('--ink-3'), 'stroke-width': 1.5, 'stroke-dasharray': '5 5', opacity: .75}));
+  const lab = el('text', {x: X(1.9), y: Y(yd[1]) - 3, 'text-anchor': 'middle', fill: css('--ink-3'),
+    'font-size': 12, 'font-family': css('--sans')});
+  lab.textContent = 'every arm under 4.4 m lives in this band'; g.appendChild(lab);
+  for (const [name, pu, a] of PUSH) {
+    if (a > yd[1]) continue;
+    const c = el('circle', {cx: X(pu), cy: Y(a), r: 5,
+      fill: css(name.startsWith('base') ? '--s2' : '--s1'), stroke: css('--panel'),
+      'stroke-width': 2, opacity: .95});
+    c.addEventListener('mouseenter', e => { c.setAttribute('r', 7);
+      showTip(`<b>${name}</b><br>ATE ${a.toFixed(2)} m &middot; push ${pu.toFixed(2)}`, e); });
+    c.addEventListener('mousemove', e => showTip(tip.innerHTML, e));
+    c.addEventListener('mouseleave', () => { c.setAttribute('r', 5); hideTip(); });
+    g.appendChild(c);
+  }
+  const n = el('text', {x: X(2.13), y: Y(24), fill: css('--ink-3'), 'font-size': 12,
+    'font-family': css('--sans')});
+  n.textContent = '@ped0p6: 25.9 m'; g.appendChild(n);
+}
+
+scatter(); response(); pushchart();
+const mq = matchMedia('(prefers-color-scheme: dark)');
+mq.addEventListener('change', () => { scatter(); response(); pushchart(); });
+new MutationObserver(() => { scatter(); response(); pushchart(); })
+  .observe(document.documentElement, {attributes: true, attributeFilter: ['data-theme']});
+
+</script>

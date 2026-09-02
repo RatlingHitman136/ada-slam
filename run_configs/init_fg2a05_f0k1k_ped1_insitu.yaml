@@ -1,0 +1,136 @@
+# IN-SITU PUSH: is the target 1.93 scene-invariant, or is the offline inversion biased?
+#
+#   python scripts/init_adapt_pipeline.py -c init_fg2a05_f0k1k_ped1_insitu
+#
+# The window test (scripts/jdsa_input/25_window_test.py) left one thing undecided. The rule
+# predicted VGGT's pedestal at 1.04 on f0-1000 (swept 0.99, +5%) and 0.65 on f1000-2000 (swept
+# 0.82, -21%), and the push it reads AT each window's swept optimum differs: 1.942 against 1.870.
+# With a target well as narrow as this one - 2.5% off the target roughly doubles the tag error -
+# that 4% is the whole miss. Two readings of it, and they call for opposite fixes:
+#
+#   (i)  the TARGET moves with the scene   -> no fixed-target rule can hit the optimum, online
+#        controller included, and the tag always needs a bracket.
+#   (ii) the offline INVERSION is biased   -> it scores a candidate pedestal against a tracker
+#        field recorded under the RAW prior, and a pedestal rewrites all 100% of the pixels. Then
+#        the target is fine and a controller, which reads the tracker it is steering, fixes it.
+#
+# Both numbers above are counterfactual, so they cannot separate the two. These two runs can: each
+# tracks under the pedestal its own window's sweep chose, so the push measured on the dump is
+# IN SITU. Read them as a pair:
+#
+#   both land near 1.93            -> (ii). Write the controller.
+#   f0-1000 ~1.94, f1k2k ~1.87     -> (i). The target is not a constant; keep the bracket.
+#
+# The clamp family already suggests the counterfactual is not always the problem: for
+# omni@ceil1p5 the counterfactual push (1.842) and the in-situ one from its own dump (1.84) agree
+# to 0.002 - as they should, since a clamp leaves the near field, and so the tracker, alone.
+#
+# STAGES is [extract] only: one tracked run and its dump, no adapter, no arms, no comparison.
+
+# ---------------------------------------------------------------- data (preprocessing is NOT here)
+SCENE: kitti_00_fg2a05                       # names the outputs/ tree
+DATA: data/KITTI/00                   # preprocess_kitti.py's output layout
+COLORS: data/KITTI/00/colors          # the four below are spelled out rather than derived from
+DEPTHS: data/KITTI/00/depths          # DATA - change them together. null disables the accuracy
+                                      # table and the prior stage; it never reaches Hi2 (9.3)
+GT_TRAJ: data/KITTI/00/traj_tum.txt
+CALIB: data/KITTI/00/calib.txt
+CONFIG: config/kitti_fg2_a05_config.yaml
+DROID_WEIGHTS: pretrained_models/droid.pth
+UNDISTORT: false                      # undistort offline in the preprocess script instead (10.1)
+CROP_BORDER: 0
+
+# ---------------------------------------------------------------- run control
+STAGES: [extract]                     # any subset of extract/adapt/end2end/prior, in that order
+SKIP_EXISTING: true                   # reuse a stage's output if it is already on disk
+MIN_FREE_VRAM_MB: 10000               # checked once at the top of main()
+FRACTION: 100                         # % of the WINDOW the adapter trains on, NOT of the sequence
+START: 0
+STOP: 1000                            # exclusive; null = to the end. Re-keys the outputs tree
+STREAM_RES: 218240                    # 341 * 640 - a pixel budget, not a shape (9.6)
+DEPTH_PNG_SCALE: 256.0                # metres = px / this; KITTI's convention (TUM is 6553.5)
+RENDER_EVAL: false                    # hi2.py's eval_rendering -> renders/ + psnr/ (11)
+
+# ---------------------------------------------------------------- names and lineage
+OUT_ROOT: outputs
+EXTRACT_NAME: insitu_ped1             # required; unique within its scene only
+ADAPT_NAME: unused_no_adapt_stage   # required; unique within its scene only
+EXTRACT_PRIOR: vggt_base@ped1              # the prior the EXTRACT tracks under; null = stock Omnidata
+ADAPT_INIT_NAME: null                 # an adapt experiment in this scene to CONTINUE from
+VGGT_HW: null                         # null = derive | [378, 518] TUM | [294, 518] Replica
+
+# ---------------------------------------------------------------- prior generators
+END2END_PRIORS: [omnidata, vggt_base, outputs/adapt/kitti_00_f0-1000/wonline_a16_e12_w10_p10]
+PRIOR_PRIORS: [omnidata, vggt_base,
+               outputs/adapt/kitti_00_f0-1000/live_e10_w10_a16_w12_lag3_r_fix_base,
+               outputs/adapt/kitti_00_f0-1000/live_e10_w10_a16_w12_lag5_low045_raw_base,
+               outputs/adapt/kitti_00_f0-1000/live_e15_w10_a16_w12_lag3_r_fix_base,
+               outputs/adapt/kitti_00_f0-1000/live_e15_w10_a16_w12_lag5_low045_raw_base,
+               outputs/adapt/kitti_00_f0-1000/live_e3_w10_a16_w12_lag3_low045_raw_base,
+               outputs/adapt/kitti_00_f0-1000/live_e40_a16_w12_lag3_low045_raw_base,
+               outputs/adapt/kitti_00_f0-1000/live_e40_a16_w12_lag5_low045_raw_r_fix_base,
+               outputs/adapt/kitti_00_f0-1000/live_e40_a16_w12_lag7_low045_raw_base,
+               outputs/adapt/kitti_00_f0-1000/wonline_a16_e12_w10_p10]
+
+# ---------------------------------------------------------------- extract (stage 1)
+extract:
+  kf_motion_thresh: 2.4               # motion_filter.thresh; any threshold may be null = inherit
+  kf_init_thresh: 4.0                 # the same gate before initialisation
+  kf_redundant_thresh: 4.0            # the one that actually moves the keyframe count
+  kf_covis_thresh: 0.2                # extras inserted in terminate(); LOWER -> more
+  buffer: 1500                        # hard cap; MUST exceed the count (no overflow guard)
+  mask_filter_thresh: 0.005           # depth_filter disparity agreement
+  mask_min_count: 2                   # min agreeing neighbours out of 6
+  mask_min_disp_ratio: 0.5            # drop pixels below this fraction of the frame's mean disp
+
+# ---------------------------------------------------------------- the adapter structure
+lora:
+  weights: pretrained_models/vggt
+  rank: 8
+  alpha: 16
+  targets: [attn.qkv, attn.proj, mlp.fc1, mlp.fc2]
+  patch_embed: false                  # false = adapt only the alternating-attention stack
+
+# ---------------------------------------------------------------- adapt (stage 2)
+adapt:
+  p_single_view: 1
+  max_left: 4
+  max_right: 4
+  radius: 8
+  adapt_style: wonline                # 'normal' epochs | 'online' per arrival | 'wonline' window
+  epochs: 12
+  batch_size: 2
+  window_size: 10                     # 'wonline' only
+  lr: 1.0e-4                          # NOT 1e-4 - YAML reads that as a string
+  weight_decay: 0.0
+  grad_clip: 1.0
+  lambda_pose: 1.0
+  coupled_scale: true
+  min_mask_pixels: 16
+  seed: 0
+  log_every: 20
+  kf_fraction: 1.0                    # 1.0 = every exported keyframe
+  val_source: tail                    # 'tail' = the selection's tail | 'rest' = what it skipped
+  train_frac: 0.9                     # 'tail' ONLY
+  eval_on_val: true
+  eval_on_train: true
+  eval_every_epoch: false
+  eval_max_kf: 100                    # 0 = no cap
+  keep_best: false
+  checkpoint_every: 0                 # 0 = off
+
+# ---------------------------------------------------------------- end2end test (stage 3)
+end2end:
+  length: 100000                      # 100000 = whole sequence
+  buffer: 1500                        # a hard cap with no overflow guard
+  omni_normal_ckpt: pretrained_models/omnidata_dpt_normal_v2.ckpt
+  omni_normal_hw: [512, 512]
+
+# ---------------------------------------------------------------- prior test (stage 4)
+prior:
+  eval_min_depth: 1.0                 # m
+  eval_max_depth: 50.0                # m; these six fields are the frames.csv cache key
+  eval_samples_per_frame: 20000       # 0 = all valid (needs the RAM)
+  seed: 0
+  omni_normal_ckpt: pretrained_models/omnidata_dpt_normal_v2.ckpt
+  omni_normal_hw: [512, 512]

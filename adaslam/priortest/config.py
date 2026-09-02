@@ -10,7 +10,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from ..adapt import LoRAConfig
-from ..end2end.config import SENTINELS, adapter_path, arm_name
+from ..end2end.config import SENTINELS, adapter_path, arm_name, parse_ceil
 
 __all__ = ['PriorTestConfig', 'arm_split_at', 'resolve_split']
 
@@ -20,6 +20,7 @@ def arm_split_at(spec):
 
     In order: config.json['split_at'] | its extract run's last traj_full.txt frame + 1 | None.
     """
+    spec, _ = parse_ceil(spec)         # a modifier changes the serving, not the training boundary
     if spec in SENTINELS:
         return None
     cfg_path = os.path.join(str(spec).rstrip('/'), 'config.json')

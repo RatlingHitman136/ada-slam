@@ -1,0 +1,214 @@
+# THE SHARPNESS AXIS, AND WHETHER THE FAR FIELD SHOULD BE PINNED OR SILENCED.
+# STAGES is [end2end] only - no online run, no adapter, ~6 min per arm: EIGHT new, six reused.
+#
+#   python scripts/online_adapt_pipeline.py -c live_fg2a05_softmask
+#
+# WHY. Re-measured from the raw dumps and trajectories (nothing here is read off an earlier
+# results.json): across 72 arms on this scene ATE is a pure function of ONE quantity, the local
+# Sim(3) scale wobble in a 31-frame window - ATE ~ 60-67 x std(local scale), corr +0.99 within a
+# tracking config. Depth accuracy does not predict it: the most accurate prior on record
+# (adapted VGGT: aligned depth within 7% of lidar out to 40 m) tracks at 14.2 m while
+# omnidata@ceil1p5, which asserts 40-80 m structure at 0.33x its true depth, tracks at 4.3 m.
+# What the good arms share is not accuracy but a BOUNDED tail, and what separates them from the
+# arms that overshoot is what the bound charges the NEAR field.
+#
+# THE FAMILY. @ceil, @soft and @ped are three members of one family - served disparity
+# q' = (q^k + b^k)^(1/k), b = median(q)/tag - at k = inf, 2, 1. All three bound the served depth
+# at `tag` x the frame median; they differ only in the near-field cost of that bound. Measured on
+# this scene's own priors, at the ratio that makes each assert the SAME far field:
+#
+#   spec         5-10m  10-20m  20-40m  40-80m   p99      near-half   ATE
+#                       (aligned depth / true depth)      cost        (measured)
+#   omni         1.006   0.888   0.719   0.549   29.5 m    0.0%       11.40
+#   omni@ceil1p45 1.027  0.891   0.526   0.268   13.6 m    0.0%        3.83   <- best omni arm
+#   omni@soft1p7 1.044   0.821   0.530   0.307   15.9 m    9.4%        ?      <- this file
+#   omni@ped1p8  1.055   0.797   0.516   0.310   16.2 m   30.4%        3.94
+#   base@ped1    1.075   0.787   0.488   0.279   14.0 m   43.4%        3.79   <- best base arm
+#   base@soft1   1.092   0.795   0.464   0.248   12.6 m   20.9%        ?      <- this file
+#
+# @soft reaches the pedestal's far-field statement at a THIRD of its near-field cost, and unlike
+# the clamp it collapses no pixel onto a shared constant. The pedestal's own sweep is what says
+# the near field is where the cost is paid: on one prior, @ped2 -> @ped1 moves the 20-40 m
+# assertion by 5% (0.524 -> 0.466) and the near-half cost from 28% to 44%, and the ATE from 4.14
+# to 11.01. If that reading is right, k = 2 should beat both k = 1 and k = inf on both priors.
+#
+# WHAT @mask DECIDES, and it is the one arm here that can falsify the whole picture. A ceiling
+# does two things at once: it deletes the tail's scene-dependent CONTENT and it pins those pixels
+# at a fixed disparity. @mask does the first without the second - disps_prior 0, so JDSA's m gates
+# the pixel out of both the residual and the scale grid and eta damps it instead.
+#   * @mask1p45 ~ @ceil1p45  ->  what matters is that the far field says NOTHING useful.
+#   * @mask1p45 much worse   ->  the pinning is the mechanism; the prior's far field works as a
+#                                rigid anchor, and accuracy out there is beside the point.
+# Every offline statistic ranks these two OPPOSITELY (the ceiling raises the far field's leverage
+# in the scale fit, the mask removes it; the ceiling raises the grid's fitted tilt from 0.70 to
+# 0.58 top/bottom, the mask leaves it at 0.70), so this is the discriminating pair.
+#
+# base@ceil1p45 is the fourth question, and it needs no new code: base@ceil1p5 tracked at 9.56
+# while omni@ceil1p5 tracked at 4.30 with a nearly identical far-field bound. The two differ in
+# the MID field - the clamped VGGT still asserts 10-20 m at 0.96 of truth where clamped Omnidata
+# asserts 0.89 - so this arm asks whether the mid-field compression is a second axis or noise.
+#
+# THE TAGS BELOW ARE NOT SWEPT BLIND - they come from a rule, and the run tests the rule too.
+# Measured on the dumps: at the optimum of every tag-vs-ATE curve on disk, ONE quantity takes the
+# same value - the median over the pixels THE TRACKER calls far (its own disparity below 2/3 of its
+# frame median) of (aligned served disparity / tracker disparity). Call it the PUSH: how much
+# nearer than the tracker's own estimate the aligned prior insists the far field is.
+#
+#   curve            optimum tag (parabola)   push at it
+#   omni x @ceil            1.435               1.89
+#   omni x @ped             1.862               1.89
+#   base x @ped             0.994               1.95      <- spread 3% across two priors and
+#                                                            two families
+#
+# Inverting it (bisection on the tag, same dumps) gives 1.42 for omni@ceil against 1.435 measured
+# and 1.79 for omni@ped against 1.862 measured; the arm that was actually RUN at @ceil1p5 realises
+# push 1.85 on its own dump, so the offline inversion is not fooling itself. On rellis_00000 the
+# untransformed prior already pushes 10.9 - the rule says bound nothing - and the ceiling sweep
+# there agrees (omni 31.28, @ceil3 31.39, @ceil2 31.68, @ceil1p5 32.66; bounding only hurts).
+#
+# It is NECESSARY, NOT SUFFICIENT, and the run config should say so: every arm under 4.4 m sits at
+# push 1.84-1.95, but four arms in that same band track at 5.6-8.6 m, and |log(push/1.9)| explains
+# only R2 0.53 of log ATE over 30 arms. The second factor is the near-field cost, which is why the
+# rule is a CONSTRAINED choice - hit the push, then take the family that pays the least near field
+# for it - and why @soft exists at all.
+#
+# WHAT THAT PREDICTS FOR THE ARMS BELOW, so a wrong prediction is visible rather than absorbed:
+#   * omni@soft1p55 is the rule's own answer for this prior in this family; 1p45 and 1p7 bracket
+#     it. If the optimum is not inside the bracket, the inversion is wrong for k = 2.
+#   * base@soft1p28 likewise, bracketed by 1p0 and 1p45. base is where the inversion is weakest -
+#     it asks 1.20 for base@ped where the sweep's optimum is 0.99, a 1.8 m miss - so this is the
+#     arm that decides whether that miss is the k = 1 family's near-field damage (which moves the
+#     tracker the inversion reads) or the rule.
+#   * base@ceil1p45 is a sharp one: the rule puts base's ceiling optimum at 1.37, so this arm
+#     should land far below base@ceil1p5's 9.56 despite a tag 3% away from it. If it does not,
+#     the push does not transfer across priors within the clamp family.
+#   * @mask asserts nothing, so it has no push at all. The rule therefore predicts it tracks like
+#     the untransformed prior (~11 m on omni). A mask that instead matches @ceil1p45 falsifies the
+#     whole push framing, which is the most useful outcome on this list.
+#
+# READ BEFORE THE ATE, per arm: soft_stats.json's p95_shrink >= 1% and near_half_shrink, and
+# mask_stats.json's masked_frac_max < 45% (past 50% the dscale seed in track_frontend.py:44
+# divides by zero). Run-to-run spread at this scene/length is ~0.08 m (base_ped1 seeds: 3.62,
+# 3.64, 3.70), so differences under ~0.2 m are not differences.
+#
+# REQUIRES the @soft / @mask modifiers added to adaslam/end2end/{config,prior}.py. Without them
+# every new arm below dies in split_mods before any GPU work, which is the intended failure.
+
+# ---------------------------------------------------------------- data (preprocessing is NOT here)
+SCENE: kitti_00_fg2a05
+DATA: data/KITTI/00                   # preprocess_kitti.py's output layout
+COLORS: data/KITTI/00/colors          # the four paths below are spelled out rather than derived
+DEPTHS: null                          # from DATA - change them together. Unread by this stage
+GT_TRAJ: data/KITTI/00/traj_tum.txt
+CALIB: data/KITTI/00/calib.txt
+CONFIG: config/kitti_fg2_a05_config.yaml   # alpha 0.05 * far_gain 2 - the tree's config
+DROID_WEIGHTS: pretrained_models/droid.pth
+UNDISTORT: false                      # undistort offline in the preprocess script instead (10.1)
+CROP_BORDER: 0
+
+# ---------------------------------------------------------------- run control
+STAGES: [end2end]                     # references only - the online stage is skipped entirely
+SKIP_EXISTING: true                   # the six reused arms are on disk and cost no GPU
+MIN_FREE_VRAM_MB: 15000               # VGGT arms load ~2.5 GB on top of the tracker
+GPU_WAIT_MIN: 120                     # minutes to WAIT for that much VRAM instead of
+                                      # refusing; 0 = refuse immediately. Polls every 60 s
+LENGTH: 100000
+START: 0
+STOP: 1000                            # exclusive; the window every number in the header used
+STREAM_RES: 218240                    # 341 * 640 - a pixel budget, not a shape (9.6)
+BUFFER: 1500                          # keyframe buffer; a HARD CAP with no overflow guard
+RENDER_EVAL: false                    # hi2.py's eval_rendering -> renders/ + psnr/ (11)
+
+# ---------------------------------------------------------------- names and lineage
+OUT_ROOT: outputs
+ONLINE_NAME: live_softmask            # placeholder: the online stage never runs (STAGES above)
+ADAPT_INIT_NAME: null                 # an adapt experiment in this scene to CONTINUE from
+VGGT_HW: null                         # null = derive | [378, 518] TUM | [294, 518] Replica
+
+# ---------------------------------------------------------------- the arms (stage 2)
+# ROUND 1 IS IN (2026-09-01), and it moved three of the four questions below. What is left is
+# THREE arms, ~6 min each: omnidata@soft1p55 completes the omni curve at the tag the rule asked
+# for (measured optimum from 1p2/1p45/1p7 is 1.52), and vggt_base@soft0p8 / @soft0p9 chase base's
+# soft optimum DOWNWARD, since @soft1 4.86 and @soft1p2 8.97 say it is at or below 1.0 - the same
+# direction the rule missed in on that prior. Everything else on the list is on disk:
+#
+#   omni@soft1p45 3.89  @soft1p7 4.21  @soft1p2 5.64     the k=2 family TIES the clamp (3.83) and
+#                                                        the pedestal (3.94) at its own optimum
+#   base@soft1 4.86  @soft1p2 8.97  base@ceil1p45 9.14   on VGGT the families do NOT tie:
+#                                                        ped 3.79 < soft 4.86 < ceil 9.14
+#   omni@mask1p45 16.28  base@mask1p45 18.06             SILENCING the far field is worse than
+#                                                        leaving it raw (11.40 / 15.63) and 4x
+#                                                        worse than PINNING it (3.83). The
+#                                                        mechanism is the pin.
+#
+# The original nine, for the record:
+#   omnidata@soft1p55 + @soft1p45 / @soft1p7  the rule's tag for this prior, and its brackets
+#   vggt_base@soft1p28 + @soft1 / @soft1p45   the same on the other prior; @soft1 is also the
+#                                             near-field-cheap partner of base@ped1
+#   omnidata@mask1p45 / vggt_base@mask1p45    pin vs silence, at the best omni arm's own bound
+#   vggt_base@ceil1p45                        the rule says base's clamp optimum is 1.37, not the
+#                                             1.5 that tracked at 9.56
+# SIX REUSED at zero cost, so one table carries every comparison the header makes:
+#   omnidata 11.40 | omnidata@ceil1p45 3.83 (the arm to beat) | omnidata@ped1p8 3.94
+#   vggt_base 15.63 | vggt_base@ped1 3.79 (best base arm) | vggt_base@ceil1p5 9.56
+END2END_PRIORS: [omnidata, omnidata@ceil1p45, omnidata@ped1p8, vggt_base, vggt_base@ped1, vggt_base@ceil1p5,
+                 omnidata@soft1p45, omnidata@soft1p55, omnidata@soft1p7,
+                 vggt_base@soft0p8, vggt_base@soft0p9, vggt_base@soft1, vggt_base@soft1p2,
+                 omnidata@mask1p45, vggt_base@mask1p45, vggt_base@ceil1p45]
+SPLIT_AT: null                        # null = the whole run, so [unseen] is empty (12.2)
+
+# ---------------------------------------------------------------- the adapter structure
+lora:
+  weights: pretrained_models/vggt
+  rank: 8
+  alpha: 16
+  targets: [attn.qkv, attn.proj, mlp.fc1, mlp.fc2]
+  patch_embed: false                  # false = adapt only the alternating-attention stack
+
+# ---------------------------------------------------------------- online adaptation (stage 1)
+# stated in full although STAGES skips the stage: a run config is all-or-nothing (13.7)
+online:
+  # warm-up: TWO gates - when the adapter starts LEARNING, and when it starts SERVING
+  warmup_kf: 12                       # keyframes before the first optimiser step, which lands at +1
+  handover_kf: 12                     # keyframes served by the FALLBACK prior; must be >= warmup_kf
+  warmup_prior: omnidata              # 'omnidata' = upstream's prior | 'self' = the adapting VGGT
+  # schedule
+  adapt_style: wonline                # 'online' = the arrival alone | 'wonline' = a sliding window
+  steps_per_kf: 5
+  window_size: 10                     # 'wonline' ONLY
+  batch_size: 2                       # 'wonline' ONLY
+  lag: 5                              # keyframes back from the end the target is taken
+  # serving
+  ceil_ratio: 1.0                     # unread here - the online stage is skipped
+  ceil_target: false                  # unread here too (14.6)
+  ped_ratio: null                     # unread here too. The transforms this file sweeps are
+                                      # carried by the @soft / @mask SPECS above, not by these
+                                      # knobs - a spec names its own arm directory, which is what
+                                      # lets several ratios coexist in one comparison (14.4)
+  # sample construction
+  context_kf: 0                       # previous KEYFRAMES appended after the target; 0 = monocular
+  # optimisation
+  lr: 1.0e-4                          # NOT 1e-4 - YAML reads that as a string
+  weight_decay: 0.0
+  grad_clip: 1.0
+  lambda_pose: 1.0
+  coupled_scale: true
+  min_mask_pixels: 16
+  seed: 0
+  log_every: 5
+  # supervision mask (the same knobs ExtractConfig uses for depth_slam/)
+  mask_filter_thresh: 0.005
+  mask_min_count: 2
+  mask_min_disp_ratio: 0.5
+  # the loss gate: skip an arrival whose newest keyframe is not worth training on
+  gate_metric: raw                    # 'rel' = flat across a run | 'raw' = drifts with it
+  gate_lo: 0.0                        # 0 = off; skip BELOW this - the target already fits
+  gate_hi: 0.0                        # 0 = off; skip ABOVE this - the target is broken, not hard
+  # output
+  checkpoint_every_kf: 0              # 0 = off; N = a loadable adapter dir every N
+                                      # adapted keyframes
+
+# ---------------------------------------------------------------- what scores the arms
+end2end:
+  omni_normal_ckpt: pretrained_models/omnidata_dpt_normal_v2.ckpt
+  omni_normal_hw: [512, 512]

@@ -6,6 +6,7 @@ meaningless choices. Field names that mean the same thing as AdaptConfig's are d
 the same; no field carries a default (9.5).
 """
 from dataclasses import dataclass
+from typing import Optional
 
 # The two adapt/trainer.py:schedule styles that are meaningful live. 'normal' is not: an epoch over
 # a fixed train set does not exist while the set is still arriving.
@@ -51,6 +52,40 @@ class OnlineConfig:
     lag: int                 # keyframes back from counter.value the target is taken. 2 matches
                              # track_frontend.py:65, the repo's own "settled enough to hand
                              # downstream" line: __update returns arange(ii.min(), t1-1).
+
+    # ---------------------------------------------------------------- serving
+    # The far-field ceiling (14): depth <- min(depth, ceil_ratio * frame median) on everything
+    # this prior SERVES - both branches, warm-up fallback included, so the arm's serving is
+    # "prior + ceiling" throughout. 1.0 = off, and off is exactly the pre-knob behaviour:
+    # ceil_clamp returns before any tensor op, so every live run recorded before this field exists
+    # stays comparable. Frozen/reference arms spell the same thing as a spec modifier instead
+    # ('vggt_base@ceil2'), because their arm directory is inferred from the spec; this arm is
+    # named by ONLINE_NAME, so it alone carries a knob.
+    ceil_ratio: float
+    # And the TRAINING side of the same ceiling (14.6): False = the target (SLAM depth) is never
+    # clamped, the original behaviour; True = the target is clamped at the same ceil_ratio over
+    # its VALID pixels (target.py:kf_target - zeros stay zero, min() cannot lift them), so the
+    # adapter is TAUGHT "never assert past the ceiling" instead of only being served through it.
+    # True at ceil_ratio 1.0 is refused: it would silently be a no-op, and a stated instruction
+    # that does nothing is the failure mode rule 1 of 9.5 exists to prevent.
+    ceil_target: bool
+    # The far-field PEDESTAL (14.9): depth <- 1/(1/depth + median(1/depth)/ped_ratio) on the same
+    # served depth, both branches, applied AFTER the ceiling (the MOD_ORDER a spec is written in).
+    # None = off, and off is exactly the pre-knob behaviour - pedestal_shift returns before any
+    # tensor op, so every live run recorded before this field exists stays comparable.
+    #
+    # NOTE THE OFF SENTINEL DIFFERS FROM ceil_ratio's, and it has to: a ceiling at 1.0 is
+    # degenerate so 1.0 can mean off there, while a pedestal at 1.0 is a real (very strong)
+    # transform. Off is the absence of a pedestal, which is None, not a ratio.
+    # ANY POSITIVE ratio is legal, sub-1 included, and sub-1 is where the transform earns its
+    # keep: the bound it realises is `ratio + 1` POST-shift medians (pedestal_shift's docstring),
+    # so 0.5 bounds the frame at 1.5x its own median - the same tail @ceil1p5 serves, reached
+    # without flattening a pixel.
+    # Frozen/reference arms spell this as a spec modifier instead ('vggt_base@ped1p3'), because
+    # their arm directory is inferred from the spec; this arm is named by ONLINE_NAME, so it alone
+    # carries a knob. There is deliberately no ped_target twin - 14.6 retired ceil_target's
+    # premise, and an unexercised lever is worse than none.
+    ped_ratio: Optional[float]
 
     # ---------------------------------------------------------------- sample construction
     context_kf: int          # previous KEYFRAMES appended after the target. 0 = monocular and
@@ -119,6 +154,30 @@ class OnlineConfig:
         if self.lag < 1:
             raise ValueError(f'lag={self.lag} must be >= 1: the arriving keyframe has not been '
                              f'through BA yet when its prior is extracted')
+        if self.ceil_ratio < 1.0:
+            raise ValueError(f'ceil_ratio={self.ceil_ratio} must be >= 1.0 (1.0 = off; above it, '
+                             f'served depth is clamped at ceil_ratio x the frame median)')
+        if self.ceil_target and self.ceil_ratio <= 1.0:
+            raise ValueError(f'ceil_target=True at ceil_ratio={self.ceil_ratio} clamps nothing - '
+                             f'the target ceiling reuses ceil_ratio, so raise it above 1.0 or '
+                             f'set ceil_target=False')
+        # explicit, because runconfig._checked waves a value through whenever the literal default
+        # is None - so a YAML `ped_ratio: 1e-4`-style string would otherwise reach the comparison
+        if self.ped_ratio is not None and (isinstance(self.ped_ratio, bool)
+                                           or not isinstance(self.ped_ratio, (int, float))):
+            raise ValueError(f'ped_ratio={self.ped_ratio!r} must be a number or null, not '
+                             f'{type(self.ped_ratio).__name__} (YAML reads 1e-4 as a string - '
+                             f'write 1.3, not "1.3")')
+        if self.ped_ratio is not None and self.ped_ratio <= 0.0:
+            raise ValueError(f'ped_ratio={self.ped_ratio} must be positive, or null for off. It '
+                             f'is the depth the served prior saturates at in units of the '
+                             f"frame's PRE-shift median, so at or below 0 it is a negative "
+                             f'disparity offset rather than a bound. Ratios BELOW 1 are legal and '
+                             f'are the interesting ones - the realised bound is ratio + 1 '
+                             f"POST-shift medians, so 0.5 bounds at 1.5x the frame's own median, "
+                             f'as gently as ceil_ratio 1.5 and without flattening a pixel. Note '
+                             f'the off sentinel is null, NOT 1.0 as ceil_ratio uses - a pedestal '
+                             f'at 1.0 is a real transform (14.9)')
         if self.context_kf < 0:
             raise ValueError(f'context_kf={self.context_kf} must be >= 0')
         if self.steps_per_kf < 0:
@@ -136,3 +195,19 @@ class OnlineConfig:
             raise ValueError(f'gate_hi={self.gate_hi} must exceed gate_lo={self.gate_lo}: with '
                              f'both set the gate keeps the BAND between them, so this would skip '
                              f'every arrival and no optimiser step would ever run')
+
+    def served_mods(self):
+        """The spec-modifier dict this arm's SERVING is equivalent to (14, 14.9).
+
+        The one place the two serving knobs become the vocabulary end2end/config.py:split_mods
+        produces, so a live arm and a frozen '@ceil<tag>@ped<tag>' replay of it are spelled - and
+        applied - identically rather than by two hand-kept-in-sync code paths. Off values simply
+        do not appear, which is why the two different off sentinels (ceil_ratio 1.0, ped_ratio
+        None) stop being visible past this point.
+        """
+        mods = {}
+        if self.ceil_ratio > 1.0:
+            mods['ceil'] = self.ceil_ratio
+        if self.ped_ratio is not None:
+            mods['ped'] = self.ped_ratio
+        return mods

@@ -126,6 +126,16 @@ OMNI_ARM = SENTINELS['omnidata']
 # listed, so a sentinel added there shows up in all three tables without an edit here.
 SENTINEL_ARMS = frozenset(SENTINELS.values())
 
+# a '@ceil<tag>' spec (14) scores into '<sentinel>_ceil<tag>' - e.g. omni_ceil2 - and those are
+# baselines exactly like their parents, so they ride in every table too. Matched on the arm NAME
+# because that is all a directory listing has; a ceil-modified ADAPTER arm still needs its kind's
+# prefix like any other adapter arm.
+_CEIL_SUFFIX = re.compile(r'_ceil\d+(?:p\d+)?$')
+
+
+def is_sentinel_arm(arm):
+    return _CEIL_SUFFIX.sub('', arm) in SENTINEL_ARMS
+
 RESULTS, CONFIG = 'results.json', 'config.json'
 
 KIND_INIT, KIND_CONT, KIND_LIVE = 'init', 'cont', 'live'
@@ -148,7 +158,8 @@ CONT_COLUMNS = ('arm', 'style', 'regime', 'epochs', 'window', 'lr',
                 'base_train_l1', 'train_l1', 'base_val_l1', 'val_l1', 'd_val_l1',
                 'ate_all', 'd_ate_vs_omni', 'd_ate_pct', 'exported_at')
 
-LIVE_COLUMNS = ('arm', 'style', 'steps_per_kf', 'window', 'lr', 'alpha', 'lag',
+LIVE_COLUMNS = ('arm', 'style', 'steps_per_kf', 'window', 'lr', 'alpha', 'lag', 'ceil_ratio',
+                'ceil_target', 'ped_ratio',
                 'warmup_kf', 'handover_kf', 'warmup_prior', 'warmup_end_frame',
                 'first_adapted_kf',
                 'n_units', 'n_train_kf', 'adapt_cost', 'train_seconds', 'init_adapter',
@@ -388,8 +399,9 @@ def select(rows, kind):
                   f'to fix it')
 
         # omni is what the deltas are against, base is 13's reference, omni_dense is the
-        # keyframe-density control - all three belong in every table
-        if arm in SENTINEL_ARMS:
+        # keyframe-density control - all of them, ceil-modified variants included, belong in
+        # every table
+        if is_sentinel_arm(arm):
             out.append(r)
             continue
         if named != kind:
@@ -401,7 +413,7 @@ def select(rows, kind):
             continue
         out.append(r)
 
-    if not any(r['arm'] not in SENTINEL_ARMS for r in out):
+    if not any(not is_sentinel_arm(r['arm']) for r in out):
         print(f'WARNING: no {kind!r} arms in this scene - only the baselines will be exported. '
               f'That driver names its experiments with the {PREFIX.get(kind, "(no)")!r} prefix; '
               f'an experiment named otherwise is exported as {KIND_INIT!r}')
@@ -500,6 +512,14 @@ def live_cells(cfg, n_frames):
         'window': num(window_of(cfg)),
         'alpha': num(cfg.get('alpha')),
         'lag': num(cfg.get('lag')),
+        # blank on every adapter written before the far-field ceiling existed (14): no key means
+        # "not measured", never "1.0". Same for ceil_target (14.6), where blank is never "False"
+        'ceil_ratio': num(cfg.get('ceil_ratio')),
+        'ceil_target': cfg.get('ceil_target', ''),
+        # blank = not measured (a run predating 14.9); 'off' = measured and off. num() would print
+        # both as blank, and a knob that was recorded as off must not read as unrecorded.
+        'ped_ratio': ('' if 'ped_ratio' not in cfg else
+                      'off' if cfg['ped_ratio'] is None else num(cfg['ped_ratio'])),
         'warmup_kf': num(cfg.get('warmup_kf')),
         # blank on every adapter written before online/config.py split the one warm-up gate in two;
         # there handover_kf WAS warmup_kf, and a blank says "not measured" rather than asserting it

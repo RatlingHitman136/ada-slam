@@ -1,0 +1,37 @@
+inherit_from: config/rellis_config.yaml   # everything else identical - this file changes TWO knobs
+
+# RELLIS-3D 00000 with the depth prior weighted BOTH harder and by range - the fg2a05 setting
+# transplanted from KITTI, so the far-field ceiling (14) can be swept on a second scene.
+#
+#   mono_depth_alpha    0.01 -> 0.05     the floor, applied everywhere
+#   mono_depth_far_gain (absent) -> 2.0  multiplies it toward the far end
+#
+# 0.01 is inherited from the TUM preset by way of rellis_config.yaml; far_gain was absent, which
+# track_frontend.py:31 reads as 1.0 (flat). The two knobs COMPOUND - geom/ba.py:228 is
+# `alpha_pixel = alpha * far` with `far = clamp(depth/median, 1, far_gain)` - so the effective
+# weight runs 0.05 at the frame's median depth to 0.10 on its farthest pixels, against the damping
+# alpha REPLACES where the prior is valid (eta ~ 1.4e-3): 36x near, 72x far.
+#
+# WHY THIS EXISTS. On KITTI 00 this exact pair is the tree every §14 ceiling result was measured
+# in, and the ceiling there was worth metres: omni 11.40 unclamped -> 8.66 at ceil2 -> 4.30 at
+# ceil1.5, with the optimum a plateau at 1.40-1.45 sitting exactly where scale drift crosses 1.0.
+# None of that has been tried on a second scene. RELLIS is the natural one: off-road, forward
+# motion, a genuine far field, and 200+ arms already recorded at alpha 0.01 for context.
+#
+# THE ARMS ALREADY IN outputs/test/end2end/rellis_00000/ ARE NOT COMPARABLE TO THIS CONFIG.
+# They ran at alpha 0.01 / far_gain 1.0 (omni 31.279, base 33.224, gt_oracle 22.981). A run under
+# this file therefore keys its own tree - SCENE: rellis_00000_fg2a05 - and its omni and base have
+# to be produced fresh. Nothing is reused across the two.
+#
+# What to watch, since these numbers were tuned on a different dataset:
+#   * geom/ba.py's _report_alpha prints alpha against the photometric Hessian for the first three
+#     JDSA solves. If alpha/C sits well above 1 the prior is governing the solve, not regularising
+#     it - which is the intent here, but RELLIS's prior quality is not KITTI's.
+#   * rellis_config.yaml keeps pgba off (one-way path, no loop) and position_lr_max_steps 14000
+#     for the 2847-frame colour refinement. Both are inherited unchanged and MUST stay identical
+#     across every arm of a comparison.
+
+Tracking:
+  frontend:
+    mono_depth_alpha: 0.05     # the floor; 0.01 is what rellis_config inherits from the TUM preset
+    mono_depth_far_gain: 2.0   # multiplies it toward the far end; 1.0 = flat (the default)

@@ -1,0 +1,34 @@
+inherit_from: config/kitti_config.yaml   # everything else identical - this file changes ONE knob
+
+# KITTI 00 at alpha 0.05 with a FLAT prior weight - the missing cell in the config matrix.
+#
+#   file                        mono_depth_alpha   mono_depth_far_gain
+#   kitti_config.yaml                 0.01              1.0 (absent)
+#   kitti_fg5_config.yaml             0.01              5.0
+#   kitti_fg2_a05_config.yaml         0.05              2.0
+#   kitti_fg5_a05_config.yaml         0.05              5.0
+#   THIS FILE                         0.05              1.0 (absent)
+#
+# Until this file, every run that raised alpha to 0.05 also turned the range ramp on, so the two
+# have never been separated. That matters for reading the far-field ceiling (14): the ramp and
+# the ceiling are computed off the SAME disps_prior, and the ceiling's clamp bounds the ramp's own
+# input. Measured on this scene's recorded Omnidata prior, with geom/ba.py's own formula:
+#
+#   effective max ramp = min(far_gain, ceil_ratio)      exact to <1% (subsample vs full-res median)
+#
+# So a '@ceil' arm run against fg2_a05 is only confound-free at ceil_ratio >= 2.0; at ceil1p5 the
+# ramp was silently cut to 1.5x. Here far_gain is 1.0, so `far` is identically 1 (ba.py:224 skips
+# the branch entirely) and a ceiling arm varies the clamp and NOTHING else. That is what
+# run_configs/live_a05_ceilsweep.yaml is for.
+#
+# What alpha 0.05 does on its own, for reference: geom/ba.py has mono_depth_alpha REPLACE the
+# network's per-pixel damping eta wherever the prior is valid, and eta reaching there is
+# 0.2 * 0.01 * Softplus(.) ~ 1.4e-3 - so 0.05 is ~36x the damping it displaces, everywhere in the
+# frame rather than only at range. Read geom/ba.py's _report_alpha lines from the first three JDSA
+# solves: alpha/C well above 1 means the prior is governing the solve, not regularising it.
+
+Tracking:
+  frontend:
+    mono_depth_alpha: 0.05     # the floor; 0.01 is upstream's, inherited from the TUM preset.
+                               # mono_depth_far_gain is deliberately ABSENT - absent = 1.0 = flat
+                               # (track_frontend.py:31 reads it with a 1.0 default)

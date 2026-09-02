@@ -11,9 +11,10 @@ from ..common import probe_stream_hw
 from ..print_utils import banner
 from ..runtime import free_vram
 
-from .config import OMNIDATA_DENSE, SENTINELS, VGGT_BASE, adapter_path, arm_name
+from .config import OMNIDATA, OMNIDATA_DENSE, SENTINELS, VGGT_BASE, adapter_path, arm_name, \
+    split_mods
 from .metrics import RESULTS, evaluate
-from .prior import VggtPrior
+from .prior import VggtPrior, mods_label, wrap_mods
 from .report import compare, print_report
 
 
@@ -23,8 +24,13 @@ def make_prior(spec, cfg, stream_hw=None):
     Reached only when the arm has no traj_full.txt at all: run_end2end_test checks cached_results
     and the reuse-and-re-score branch first. That is what makes the OMNIDATA_DENSE refusal below
     a guard rather than a wall - an arm already on disk is reused and never comes through here.
+
+    Any spec may carry '@ceil<tag>' (14) and/or '@ped<tag>' (14.9) modifiers: the base prior is
+    built as usual and served through the wrapper chain. Plain 'omnidata' still returns None - the
+    stock path stays untouched.
     """
-    if spec == OMNIDATA_DENSE:
+    base, mods = split_mods(spec)
+    if base == OMNIDATA_DENSE:
         # NOT a prior variant: the same Omnidata prior at a different KEYFRAME DENSITY, which is a
         # property of the tracking config. Every arm here shares one arm_config (see the print at
         # the top of run_end2end_test), so building it would run stock keyframing and write the
@@ -34,13 +40,21 @@ def make_prior(spec, cfg, stream_hw=None):
             f'{spec!r} cannot be produced by the end2end stage: it is the Omnidata prior at '
             f'DENSIFIED keyframing, and keyframe density lives in the tracking config, which is '
             f'identical for every arm of a comparison. Run scripts/dense_kf_arm.py to produce '
-            f'{arm_name(spec)}, then list {spec!r} in END2END_PRIORS with SKIP_EXISTING=True to '
+            f'{arm_name(base)}, then list {base!r} in END2END_PRIORS with SKIP_EXISTING=True to '
             f'have it reused from disk (SKIP_EXISTING is what reaches the cache before this).')
-    if spec not in SENTINELS:
-        return VggtPrior(cfg, adapter_path(spec), stream_hw)
-    if spec == VGGT_BASE:
-        return VggtPrior(cfg, None, stream_hw)      # stock VGGT-1B, no adapter
-    return None                                     # 'omnidata': upstream's own prior
+    if base == OMNIDATA:
+        if not mods:
+            return None                             # upstream's own prior, the stock path
+        # captured HERE, before SlamRunner.run overwrites the class attribute with ours - a lazy
+        # fetch from inside the installed extractor would fetch itself (slam/stock_prior.py)
+        from ..slam import stock_prior_extractor
+        return wrap_mods(stock_prior_extractor(), mods,
+                         f'Omnidata depth{mods_label(mods)} / Omnidata normals')
+    inner = VggtPrior(cfg, None if base == VGGT_BASE else adapter_path(base), stream_hw)
+    if not mods:
+        return inner
+    return wrap_mods(inner.extractor(), mods, f'{inner.label}{mods_label(mods)}',
+                     release=inner.release)
 
 
 def cached_results(out, split_at):
@@ -109,6 +123,11 @@ def run_end2end_test(runner, slam_cfg, cfg, out_root, arm_config, split_at, skip
             finally:
                 if prior is not None:
                     prior.release()      # in a finally: a crashed arm otherwise strands ~2.5 GB
+            if hasattr(prior, 'chain'):
+                # a modified arm leaves its audit trail: clip fractions / tail shrink say whether
+                # the transform bit. One file per link, so a stacked spec records both.
+                for tr in prior.chain():
+                    json.dump(tr.report(), open(f'{out}/{tr.STATS_FILE}', 'w'), indent=2)
             free_vram(f'arm {name}')
 
         res = evaluate(out, label, split_at, cfg)

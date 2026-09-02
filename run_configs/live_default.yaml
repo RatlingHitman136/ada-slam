@@ -69,6 +69,16 @@ online:
   window_size: 10                     # 'wonline' ONLY
   batch_size: 2                       # 'wonline' ONLY
   lag: 5                              # keyframes back from the end the target is taken
+  # serving
+  ceil_ratio: 1.0                     # far-field ceiling on the SERVED depth (14):
+                                      # clamp at this x the frame median, warm-up
+                                      # branch included; 1.0 = off
+  ceil_target: false                  # true = clamp the TRAINING target at ceil_ratio too (14.6);
+                                      # refused at ceil_ratio 1.0, where it would do nothing
+  ped_ratio: null                     # far-field PEDESTAL on the SERVED depth (14.9): the served
+                                      # depth saturates at this x the frame's PRE-SHIFT median,
+                                      # applied AFTER the ceiling. null = off - NOT 1.0, which is
+                                      # a real pedestal; the two knobs' off values differ.
   # sample construction
   context_kf: 0                       # previous KEYFRAMES appended after the target; 0 = monocular
   # optimisation

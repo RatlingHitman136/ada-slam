@@ -1,0 +1,167 @@
+# LOCATE THE PEDESTAL'S DRIFT-1.0 CROSSING (14.9): STAGES is [end2end] only - no online run, no
+# adapter, ~6 min per arm. Four new base arms in R = 1.1 .. 0.8, plus six references reused from
+# disk at zero GPU cost.
+#
+# WHY THIS AND NOT ANOTHER LIVE RUN. The four-arm ped-only live sweep put three of its four points
+# in a region that turned out to be catastrophic, and the two that ran say so unambiguously:
+#
+#   arm        kind   served tail   ATE      drift
+#   base       -       (none)       15.627   0.507
+#   @ped3      base    1.884        12.285   0.588
+#   @ped2      base    1.715        11.680   0.606
+#   @ped1p5    base    1.601         8.624   0.679
+#   @ped1p3    base    1.547         6.737   0.740     <- best ped-only arm on record
+#   @ped1p15   base    1.503         6.948   0.738
+#   ------------------------------- the old validator floor sat HERE -------------------------
+#   @ped0p6    live    1.306        20.270   2.128     <- already 2x OVERSHOT
+#   @ped0p3    live    1.169        45.814   9.789     <- blown up
+#
+# So the sub-1 region is REAL but NARROW, and it is not where it was predicted. Bracketed by
+# @ped1p15 (0.738) and @ped0p6 (2.128), the drift-1.0 crossing sits at R = 0.95 .. 1.05 depending
+# on how you interpolate - i.e. essentially AT the floor that used to refuse it. This file spends
+# 24 min of end2end to pin it instead of 95 min of live run to guess at it again.
+#
+# WHY THE PREDICTION FAILED, since the same mistake is easy to repeat. The four live ratios were
+# chosen by matching SERVED p95/MEDIAN to the best stacked arm - and 14.9 already recorded that a
+# tail statistic is not a sufficient statistic ACROSS transform families (it ranks perfectly
+# WITHIN one). A clamp leaves everything below the bound untouched and truncates above it; a
+# pedestal compresses the WHOLE range, response(u) = (R+1)/(R+u) at u = Z / frame-median-depth. At
+# a matched p95/median the two are near-identical in the far field and diverge in the NEAR one:
+#
+#   u = Z/Z_median        0.25     0.5       1       2       5
+#   @ped0p45             2.071   1.526   1.000   0.592   0.266
+#   @ceil1p5@ped1p3      1.484   1.278   1.000   0.616   0.246
+#
+# The sub-1 pedestal inflates depth at a QUARTER of the frame median by 2.07x where the stack
+# inflates it by 1.48x - 40% more, in the band that carries the most parallax and essentially all
+# of the supervision mask (14.9: P(in mask) is 10.2% at 1-10 m and 0.0% past 30 m). Telling BA the
+# near field is further than it is shrinks the translation that explains the same flow, the
+# estimated scale deflates, and drift runs away - 2.13 and 9.79 are that runaway. The far-field
+# bound was matched; the near field was never checked. Match on the RESPONSE CURVE, not on a
+# percentile, before choosing a ratio in a new transform family.
+#
+# WHAT THIS SWEEP DECIDES. Four arms across R 1.1 -> 0.8, served tail 1.487 -> 1.385, near-field
+# inflation at u=0.25 rising 1.556 -> 1.714:
+#
+#   @ped1p1  tail 1.487    @ped1  tail 1.455    @ped0p9  tail 1.421    @ped0p8  tail 1.385
+#
+#   * If drift crosses 1.0 inside this window, the crossing is measured to ~0.1 in R and the ATE
+#     minimum comes with it - 14.6's rule says they coincide. That ratio is then the ONE live arm
+#     worth running, and `@ped<R>` alone can be read against base@ceil1p5@ped1p3 (5.018) and
+#     <adapter>@ceil1p5@ped1p3 (4.320) to settle whether the pedestal subsumes the clamp.
+#   * If ATE keeps rising through the whole window while drift crosses, then the crossing and the
+#     minimum have come apart - which would be the first arm to break 14.6's rule across 20+ arms,
+#     and worth more than any ratio.
+#
+# NOTE ON WHAT THE TWO LIVE ARMS ABOVE CAN AND CANNOT SAY. They are ADAPTED and the R>1 arms above
+# them are not, so the column is not a clean single-variable curve. Adaptation has never been
+# worth more than 3.1 m or 0.11 of drift in any measured arm, so it cannot account for 0.74 ->
+# 2.13; the serving is doing it. `base_ped0p8` below overlaps the live sweep's loosest point and
+# is the arm that makes that comparison exact.
+#
+#   python scripts/online_adapt_pipeline.py -c live_fg2a05_pedfine
+#
+# REQUIRES the ratio-floor fix of 2026-08-30 in adaslam/end2end/prior.py (_ServedTransform.
+# RATIO_FLOOR, 1.0 for a ceiling and 0.0 for a pedestal). Without it every arm here dies in
+# PedestalPrior.__init__ on `assert ratio > 1.0` - which is exactly how the live sweep lost all
+# four of its base reference arms while its live arms ran to completion.
+#
+# CHECK ped_stats.json's p95_shrink >= 1% per arm before reading any ATE. Every number quoted is a
+# SINGLE draw and 14.7's run-to-run floor at this scene/length is still unmeasured.
+
+# ---------------------------------------------------------------- data (preprocessing is NOT here)
+SCENE: kitti_00_fg2a05
+DATA: data/KITTI/00                   # preprocess_kitti.py's output layout
+COLORS: data/KITTI/00/colors          # the four paths below are spelled out rather than derived
+DEPTHS: null                          # from DATA - change them together. Unread by this stage
+GT_TRAJ: data/KITTI/00/traj_tum.txt
+CALIB: data/KITTI/00/calib.txt
+CONFIG: config/kitti_fg2_a05_config.yaml   # alpha 0.05 * far_gain 2 - the tree's config
+DROID_WEIGHTS: pretrained_models/droid.pth
+UNDISTORT: false                      # undistort offline in the preprocess script instead (10.1)
+CROP_BORDER: 0
+
+# ---------------------------------------------------------------- run control
+STAGES: [end2end]                     # references only - the online stage is skipped entirely
+SKIP_EXISTING: true                   # the six reused arms are on disk and cost no GPU
+MIN_FREE_VRAM_MB: 15000               # VGGT arms load ~2.5 GB on top of the tracker
+GPU_WAIT_MIN: 120                     # minutes to WAIT for that much VRAM instead of
+                                      # refusing; 0 = refuse immediately. Polls every 60 s
+LENGTH: 100000
+START: 0
+STOP: 1000                            # exclusive; the window every number in the header used
+STREAM_RES: 218240                    # 341 * 640 - a pixel budget, not a shape (9.6)
+BUFFER: 1500                          # keyframe buffer; a HARD CAP with no overflow guard
+RENDER_EVAL: false                    # hi2.py's eval_rendering -> renders/ + psnr/ (11)
+
+# ---------------------------------------------------------------- names and lineage
+OUT_ROOT: outputs
+ONLINE_NAME: live_pedfine             # placeholder: the online stage never runs (STAGES above)
+ADAPT_INIT_NAME: null                 # an adapt experiment in this scene to CONTINUE from
+VGGT_HW: null                         # null = derive | [378, 518] TUM | [294, 518] Replica
+
+# ---------------------------------------------------------------- the arms (stage 2)
+# FOUR NEW, ~6 min each - the grid between the last arm that worked (@ped1p15, 6.948 / 0.738) and
+# the first that did not (@ped0p6, 20.270 / 2.128).
+# SIX REUSED at zero cost, so one table carries every comparison the header makes:
+#   omnidata 11.403 | omnidata@ceil1p45 3.830 (the arm to beat) | vggt_base 15.627
+#   vggt_base@ped1p3 6.737 (best ped-only) | vggt_base@ped1p15 6.948 (the old floor)
+#   vggt_base@ceil1p5@ped1p3 5.018 (the stack the pedestal is meant to subsume)
+END2END_PRIORS: [omnidata, omnidata@ceil1p45, vggt_base, vggt_base@ped1p3, vggt_base@ped1p15, vggt_base@ceil1p5@ped1p3, vggt_base@ped1p1, vggt_base@ped1, vggt_base@ped0p9, vggt_base@ped0p8]
+SPLIT_AT: null                        # null = the whole run, so [unseen] is empty (12.2)
+
+# ---------------------------------------------------------------- the adapter structure
+lora:
+  weights: pretrained_models/vggt
+  rank: 8
+  alpha: 16
+  targets: [attn.qkv, attn.proj, mlp.fc1, mlp.fc2]
+  patch_embed: false                  # false = adapt only the alternating-attention stack
+
+# ---------------------------------------------------------------- online adaptation (stage 1)
+# stated in full although STAGES skips the stage: a run config is all-or-nothing (13.7)
+online:
+  # warm-up: TWO gates - when the adapter starts LEARNING, and when it starts SERVING
+  warmup_kf: 12                       # keyframes before the first optimiser step, which lands at +1
+  handover_kf: 12                     # keyframes served by the FALLBACK prior; must be >= warmup_kf
+  warmup_prior: omnidata              # 'omnidata' = upstream's prior | 'self' = the adapting VGGT
+  # schedule
+  adapt_style: wonline                # 'online' = the arrival alone | 'wonline' = a sliding window
+  steps_per_kf: 5
+  window_size: 10                     # 'wonline' ONLY
+  batch_size: 2                       # 'wonline' ONLY
+  lag: 5                              # keyframes back from the end the target is taken
+  # serving
+  ceil_ratio: 1.0                     # unread here - the online stage is skipped
+  ceil_target: false                  # unread here too (14.6)
+  ped_ratio: null                     # unread here too. The pedestals this file sweeps are
+                                      # carried by the @ped SPECS above, not by this knob - a spec
+                                      # names its own arm directory, which is what lets several
+                                      # ratios coexist in one comparison (14.4)
+  # sample construction
+  context_kf: 0                       # previous KEYFRAMES appended after the target; 0 = monocular
+  # optimisation
+  lr: 1.0e-4                          # NOT 1e-4 - YAML reads that as a string
+  weight_decay: 0.0
+  grad_clip: 1.0
+  lambda_pose: 1.0
+  coupled_scale: true
+  min_mask_pixels: 16
+  seed: 0
+  log_every: 5
+  # supervision mask (the same knobs ExtractConfig uses for depth_slam/)
+  mask_filter_thresh: 0.005
+  mask_min_count: 2
+  mask_min_disp_ratio: 0.5
+  # the loss gate: skip an arrival whose newest keyframe is not worth training on
+  gate_metric: raw                    # 'rel' = flat across a run | 'raw' = drifts with it
+  gate_lo: 0.0                        # 0 = off; skip BELOW this - the target already fits
+  gate_hi: 0.0                        # 0 = off; skip ABOVE this - the target is broken, not hard
+  # output
+  checkpoint_every_kf: 0              # 0 = off; N = a loadable adapter dir every N
+                                      # adapted keyframes
+
+# ---------------------------------------------------------------- what scores the arms
+end2end:
+  omni_normal_ckpt: pretrained_models/omnidata_dpt_normal_v2.ckpt
+  omni_normal_hw: [512, 512]

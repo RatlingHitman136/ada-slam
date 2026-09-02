@@ -17,13 +17,21 @@ def handoff_paths(out):
             *(f'{out}/{f}' for f in HANDOFF_UP)]
 
 
-def run_extract(runner, cfg, out, length, base_config, skip_existing=False):
+def run_extract(runner, cfg, out, length, base_config, skip_existing=False, prior=None):
     """SLAM over the first `length` frames with the depth dump on, then export what it wrote.
 
     `out` is the EXPERIMENT directory; the run goes into out/full. This is the ONLY run that gets
     the keyframe knobs layered onto `base_config`. Returns the keyframes exported, or None.
+
+    `prior` is the depth prior to run under, the same object an end2end arm takes (anything with
+    `.extractor()`); None is upstream's Omnidata, which is what every extract before this argument
+    used and still the default. It is NOT released here - the caller built it and owns it. What it
+    changes in the dump is `disps_prior`, so an extract run under a different prior is how that
+    prior's own scale-grid behaviour becomes readable offline (scripts/tmp_dscales_probe.py).
+    The spec is recorded beside the export because the directory name is a label, not data (12.2).
     """
     banner(f'extract  -> {out}')
+    print(f'depth prior: {getattr(prior, "label", None) or "Omnidata (upstream, the default)"}')
     run_dir = extract_run_dir(out)
     tracking_cfg = write_tracking_config(run_dir, base_config,
                                          motion_thresh=cfg.kf_motion_thresh,
@@ -43,7 +51,7 @@ def run_extract(runner, cfg, out, length, base_config, skip_existing=False):
         # gtdepthdir stays None - GT depth must never reach Hi2 on a run that becomes training
         # data (9.3). cfg.gt_depths reaches the accuracy table below instead.
         n_kf = runner.run(run_dir, tracking_cfg, length, cfg.buffer,
-                          gtdepthdir=None, dump_slam_depth=True).n_kf
+                          gtdepthdir=None, dump_slam_depth=True, prior=prior).n_kf
         print(f'=== SLAM done in {time.time()-t0:.0f}s: {n_kf} keyframes over {length} '
               f'frames (1 per {length/max(n_kf,1):.1f}). For more, lower kf_redundant_thresh '
               f'({cfg.kf_redundant_thresh}) first, then kf_motion_thresh '
@@ -58,8 +66,13 @@ def run_extract(runner, cfg, out, length, base_config, skip_existing=False):
                              f'save_trajectory - delete {run_dir} and let the SLAM run repeat')
         shutil.copyfile(f'{run_dir}/{name}', f'{out}/{name}')
 
+    # which prior produced disps_prior, as DATA - the experiment name is a label and may lie
+    prior_label = getattr(prior, 'label', None) or 'Omnidata'
+    with open(f'{out}/extract_prior.txt', 'w') as f:
+        f.write(f'{prior_label}\n')
+
     with tee(f'{out}/export.txt'):
-        n_exported = export_slam_depth(out, cfg)
+        n_exported = export_slam_depth(out, cfg, prior_label)
     free_vram('extract')
     print(f'{n_exported} keyframes exported to {out}/{DEPTH_DIR}/')
     return n_exported

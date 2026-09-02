@@ -28,8 +28,14 @@ def l1_global(pairs):
     return np.mean([np.abs(g - s * p).mean() for g, p in pairs])
 
 
-def report_accuracy(x, cfg):
-    """Print the table. No-op without cfg.gt_depths. Reads nothing off disk but the GT depth."""
+def report_accuracy(x, cfg, prior_label='Omnidata'):
+    """Print the table. No-op without cfg.gt_depths. Reads nothing off disk but the GT depth.
+
+    `prior_label` names whatever produced `disps_prior` in the dump. It defaults to Omnidata
+    because that is what every extract ran before run_extract took a `prior` argument, but a run
+    under another prior MUST pass its own name - the row is computed from the npz either way, so a
+    stale label would silently attribute VGGT's numbers to Omnidata.
+    """
     from geom.ba import get_prior_depth_aligned
     if cfg.gt_depths is None:
         return None
@@ -63,7 +69,7 @@ def report_accuracy(x, cfg):
     print(f'  {"source":<34} {"per-frame":>10} {"global":>10}')
     print(f'  {"-" * 56}')
     for name, label in (('slam', 'SLAM depth (1/disps_up)'),
-                        ('prior', 'JDSA-aligned Omnidata prior')):
+                        ('prior', f'JDSA-aligned {prior_label} prior')):
         if pairs[name]:
             print(f'  {label:<34} {l1_per_frame(pairs[name]):>10.4f} '
                   f'{l1_global(pairs[name]):>10.4f}')

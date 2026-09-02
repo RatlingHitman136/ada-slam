@@ -69,7 +69,9 @@ from adaslam.slam import SlamConfig
 #  PARAMETERS
 # ==============================================================================
 
-SCENE_KEY = 'kitti_00_f0-1000'         # names the outputs/ tree the adapters live in
+SCENE_KEY = 'kitti_00_fg2a05_f0-1000'  # names the outputs/ tree the adapters live in. The
+                                       # pre-ceiling rows (omni/base + the flat-tree adapters)
+                                       # are saved under kitti_00_f0-1000's OUT and stay valid
 DATA      = 'data/KITTI/00'
 COLORS    = f'{DATA}/colors'
 DEPTHS    = f'{DATA}/depths'           # only to locate the GT/no-GT boundary, never scored against
@@ -88,13 +90,20 @@ def _a(name):
 
 # label -> prior spec, exactly the vocabulary END2END_PRIORS uses. Order is the print order;
 # 'omni' first because it is the arm every VGGT one has to be read against.
+#
+# The fg2a05 CEIL-TRAINED adapters (14.6): they trained UNCLAMPED behind a clamped serving, so
+# the question this roster decides is whether they still grow the runaway far field the
+# pre-ceiling adapters did (top p95 344x the band on wonline_e12, saved in the old tree's OUT) -
+# i.e. whether OnlineConfig.ceil_target is a needed lever or the serving clamp already tamed
+# what the adapter learns. The specs are the RAW adapters, no @ceil: the probe should see what
+# the model asserts, not what the clamp serves.
 ARMS = {
-    'omni':          'omnidata',
-    'base':          'vggt_base',
-    'live_e15_lag5': _a('live_e15_w10_a16_w12_lag5_low045_raw_base'),
-    'live_e40_lag3': _a('live_e40_a16_w12_lag3_low045_raw_base'),
-    'live_e3_lag3':  _a('live_e3_w10_a16_w12_lag3_low045_raw_base'),
-    'wonline_e12':   _a('wonline_a16_e12_w10_p10'),
+    'omni':            'omnidata',
+    'base':            'vggt_base',
+    'live_ceil1p5_e5': _a('live_fg2a05ceil1p5_e5_w10_a16_w12_lag5_base'),
+    'live_ceil1p5_e20': _a('live_fg2a05ceil1p5_e20_w10_a16_w12_lag5_base'),
+    'live_ceil2_e5':   _a('live_fg2a05ceil2_e5_w10_a16_w12_lag5_base'),
+    'live_noceil_e5':  _a('live_fg2a05_e5_w10_a16_w12_lag5_base'),
 }
 
 SLAM = SlamConfig(
@@ -134,6 +143,9 @@ def regions(gt_paths, hw):
     return any_gt, top, int(rows.min()), int(rows.max())
 
 
+CEIL_RATIOS = (1.5, 2.0, 3.0)          # the clamp-band fractions reported per arm (14)
+
+
 def probe_arm(label, spec, frames, files, band, top):
     """One arm -> its row. Builds the prior, walks the frames, releases everything."""
     from adaslam.end2end.stage import make_prior
@@ -146,7 +158,16 @@ def probe_arm(label, spec, frames, files, band, top):
     prior = make_prior(spec, e2e, band.shape) if spec != 'omnidata' else None
     probe = PriorProbe(SLAM, prior)
 
+    # where the >2x-median mass sits: top region, upper half of the lidar band, lower half. The
+    # remainder (band holes) is 1 - their sum, so the three need not add to exactly 1.
+    rowidx = np.arange(band.shape[0])[:, None]
+    rows = np.where(band.any(1))[0]
+    mid = (rows.min() + rows.max()) // 2
+    band_up, band_lo = band & (rowidx <= mid), band & (rowidx > mid)
+
     t_med, b_med, t_p95, t_min, spread = [], [], [], [], []
+    over = {r: [] for r in CEIL_RATIOS}
+    p99m, maxm, loc = [], [], {'top': [], 'band_up': [], 'band_lo': []}
     try:
         for t in frames:
             d = probe.depth(os.path.join(COLORS, files[t]))
@@ -158,6 +179,17 @@ def probe_arm(label, spec, frames, files, band, top):
             # quantity JDSA's residual is written in
             sub = 1.0 / np.clip(d[3::8, 3::8], 1e-6, None)
             spread.append(np.percentile(sub, 95) / max(np.percentile(sub, 5), 1e-9))
+            # the clamp band (14): what a ceiling at r x median would bite, and where it sits
+            med = max(float(np.median(d)), 1e-9)
+            for r in CEIL_RATIOS:
+                over[r].append(float((d > r * med).mean()))
+            p99m.append(float(np.percentile(d, 99) / med))
+            maxm.append(float(d.max() / med))
+            m2 = d > 2.0 * med
+            tot = max(int(m2.sum()), 1)
+            loc['top'].append(m2[top].sum() / tot)
+            loc['band_up'].append(m2[band_up].sum() / tot)
+            loc['band_lo'].append(m2[band_lo].sum() / tot)
     finally:
         probe.release()
 
@@ -167,17 +199,37 @@ def probe_arm(label, spec, frames, files, band, top):
                 top_over_band=float(np.median(t_med) / np.median(b_med)),
                 top_p95=float(np.median(t_p95)), top_min=float(np.median(t_min)),
                 disp_spread=float(np.median(spread)),
-                top_cv=float(t_med.std() / t_med.mean()))
+                top_cv=float(t_med.std() / t_med.mean()),
+                **{f'over_{f"{r:g}".replace(".", "p")}': float(np.median(v))
+                   for r, v in over.items()},
+                p99_over_med=float(np.median(p99m)), max_over_med=float(np.median(maxm)),
+                over2_in_top=float(np.median(loc['top'])),
+                over2_band_upper=float(np.median(loc['band_up'])),
+                over2_band_lower=float(np.median(loc['band_lo'])))
 
 
 HEAD = (f'{"arm":<16}{"top/band":>10}{"disp p95/p5":>13}{"top CV":>9}'
         f'{"top med":>10}{"band med":>10}{"top p95":>10}{"top min":>10}')
+
+# the clamp band (14): what a ceiling would bite (fractions of ALL pixels beyond r x the frame
+# median), how long the tail is, and WHERE the >2x mass sits (their sum's shortfall from 100% is
+# the band's holes)
+CEIL_HEAD = (f'{"arm":<16}{">1.5xmed":>10}{">2xmed":>9}{">3xmed":>9}{"p99/med":>9}'
+             f'{"max/med":>9}{"@top":>7}{"@bandUp":>9}{"@bandLo":>9}')
 
 
 def row_line(r):
     return (f'{r["arm"]:<16}{r["top_over_band"]:>10.2f}{r["disp_spread"]:>13.1f}'
             f'{r["top_cv"]:>9.3f}{r["top_med"]:>10.3f}{r["band_med"]:>10.3f}'
             f'{r["top_p95"]:>10.3f}{r["top_min"]:>10.4f}')
+
+
+def ceil_row_line(r):
+    if 'over_2' not in r:
+        return f'{r["arm"]:<16}  (row predates the clamp-band stats - rerun this arm)'
+    return (f'{r["arm"]:<16}{r["over_1p5"]:>10.1%}{r["over_2"]:>9.1%}{r["over_3"]:>9.1%}'
+            f'{r["p99_over_med"]:>9.2f}{r["max_over_med"]:>9.2f}{r["over2_in_top"]:>7.0%}'
+            f'{r["over2_band_upper"]:>9.0%}{r["over2_band_lower"]:>9.0%}')
 
 
 def load_rows():
@@ -262,6 +314,10 @@ def main():
         print(HEAD)
         for r in got:
             print(row_line(r))
+        print(f'\nthe clamp band (14) - what a ceiling would bite, and where the >2x mass sits:')
+        print(CEIL_HEAD)
+        for r in got:
+            print(ceil_row_line(r))
         base = got[0]
         if len(got) > 1:
             print(f'\ntop/band against {base["arm"]}: '

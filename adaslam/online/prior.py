@@ -67,10 +67,21 @@ class OnlineVggtPrior(VggtPrior):
         split = online_cfg.handover_kf - online_cfg.warmup_kf
         which = ('Omnidata' if self._fallback else
                  'this same VGGT, frozen' if not split else 'this same VGGT, ALREADY ADAPTING')
+        # spelled through the same helper a spec modifier uses, so a live arm and a frozen
+        # '@ceil...@ped...' replay of it cannot drift apart in what they call themselves
+        from ..end2end.prior import mods_label
+        mods = online_cfg.served_mods()
         self.label = (f'VGGT adapted ONLINE ({online_cfg.adapt_style}, '
-                      f'{online_cfg.steps_per_kf} steps/kf) / Omnidata normals')
+                      f'{online_cfg.steps_per_kf} steps/kf){mods_label(mods)} / Omnidata normals')
         print(f'online     : first {online_cfg.handover_kf} keyframes served by {which}; '
               f'adaptation starts at keyframe {online_cfg.warmup_kf + 1}')
+        if 'ceil' in mods:
+            print(f'             served depth clamped at {online_cfg.ceil_ratio:g}x the frame '
+                  f'median (14), warm-up branch included; the training target is never clamped')
+        if 'ped' in mods:
+            print(f'             served depth carries a pedestal at {online_cfg.ped_ratio:g}x the '
+                  f"frame's pre-shift median (14.9), warm-up branch included; the training "
+                  f'target never carries one')
         if split:
             print(f'             gates SPLIT: the adapter trains on {split} keyframes before it '
                   f'serves anything')
@@ -86,9 +97,18 @@ class OnlineVggtPrior(VggtPrior):
         Still a plain FUNCTION, never a bound method - 9.3's descriptor reasoning is unchanged: mf
         binds as arg 0 and everything else arrives through the closure.
         """
+        from ..end2end.prior import ceil_clamp, pedestal_shift
         vggt_fn = super().extractor()             # normals + VGGT depth, reused verbatim
         fallback = self._fallback or vggt_fn      # 'self' = the same model, just not adapting yet
         cfg, trainer = self.online, self.trainer
+        ceil = cfg.ceil_ratio                     # 1.0 = ceil_clamp returns the depth untouched
+        ped = cfg.ped_ratio                       # None = pedestal_shift returns it untouched
+
+        def serve(depth):
+            """Ceiling then pedestal - the same order a stacked spec applies them in (MOD_ORDER),
+            so 'vggt_base@ceil1p5@ped2' and this arm at the same two ratios serve the same depth.
+            """
+            return pedestal_shift(ceil_clamp(depth, ceil), ped)
 
         @torch.no_grad()
         def prior_extractor(mf, im_tensor):
@@ -105,8 +125,12 @@ class OnlineVggtPrior(VggtPrior):
 
             # the SERVING gate, which is not the learning gate above: between warmup_kf and
             # handover_kf the adapter is taking steps while the fallback still drives.
+            # The transforms (14, 14.9) sit on BOTH branches: this arm's serving is "prior +
+            # ceiling + pedestal" throughout, whatever generates the depth. The training target
+            # carries neither.
             if n < cfg.handover_kf:
-                return fallback(mf, im_tensor)
+                depth, normal = fallback(mf, im_tensor)
+                return serve(depth), normal
             # recorded on the TRAINER, which is what writes the adapter's config.json. It is the
             # one frame index that separates fallback-served tracking from VGGT-served tracking,
             # so it is the split any later re-scoring would want (12.3).
@@ -114,7 +138,8 @@ class OnlineVggtPrior(VggtPrior):
                 trainer.warmup_end_frame = trainer.frame(video, n - 1) + 1
                 print(f'  [online] handover at keyframe {n}, frame '
                       f'{trainer.warmup_end_frame}: VGGT is the depth prior from here')
-            return vggt_fn(mf, im_tensor)
+            depth, normal = vggt_fn(mf, im_tensor)
+            return serve(depth), normal
 
         return prior_extractor
 

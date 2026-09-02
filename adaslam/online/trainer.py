@@ -289,6 +289,14 @@ class LiveTrainer:
                 'lambda_pose': cfg.lambda_pose, 'coupled_scale': cfg.coupled_scale,
                 'context_kf': cfg.context_kf, 'lag': cfg.lag, 'seed': cfg.seed,
                 'stream_res': cfg.stream_res,
+                # the far-field ceiling on the SERVED depth (14); 1.0 = off. Pre-knob adapters
+                # have no such key, which the export reads as blank rather than as 1.0. Same
+                # for ceil_target (14.6), the TRAINING side of the same ceiling.
+                'ceil_ratio': cfg.ceil_ratio,
+                'ceil_target': cfg.ceil_target,
+                # 14.9's pedestal. null here is OFF, not "not measured" - the export column
+                # distinguishes the two by key presence, as it does for ceil_target.
+                'ped_ratio': cfg.ped_ratio,
                 # SlamConfig.start, i.e. the frame every index above is offset by. Recorded so a
                 # windowed adapter's first_adapted_kf / warmup_end_frame can be read without
                 # knowing which driver produced it.

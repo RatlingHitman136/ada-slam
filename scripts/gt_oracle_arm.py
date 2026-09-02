@@ -83,13 +83,13 @@ from adaslam.slam import SlamConfig, SlamRunner, stock_prior_extractor
 # ==============================================================================
 
 # ---------------------------------------------------------------- data
-SCENE   = 'kitti_00'
+SCENE   = 'kitti_00_fg2a05'
 DATA    = 'data/KITTI/00'
 COLORS  = f'{DATA}/colors'
 DEPTHS  = f'{DATA}/depths'             # THE PRIOR, here - not just the accuracy table
 GT_TRAJ = f'{DATA}/traj_tum.txt'
 CALIB   = f'{DATA}/calib.txt'
-CONFIG  = 'config/rellis_config.yaml'
+CONFIG  = 'config/kitti_fg2_a05_config.yaml'
 DROID_WEIGHTS = 'pretrained_models/droid.pth'
 
 DEPTH_PNG_SCALE = 256.0                # metres = png / this. MUST match the dataset (TUM 6553.5)

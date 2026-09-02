@@ -100,10 +100,14 @@ def write_keyframes(exp_dir, x, cfg):
     return rows
 
 
-def export_slam_depth(exp_dir, cfg):
-    """load -> write -> accuracy table, over the EXPERIMENT dir. Returns the keyframe count."""
+def export_slam_depth(exp_dir, cfg, prior_label='Omnidata'):
+    """load -> write -> accuracy table, over the EXPERIMENT dir. Returns the keyframe count.
+
+    `prior_label` only names the prior row of the table; the numbers come from the dump's
+    disps_prior regardless of what it is called.
+    """
     from .accuracy import report_accuracy
     x = load_export(extract_run_dir(exp_dir), cfg)
     kept = write_keyframes(exp_dir, x, cfg)
-    report_accuracy(x, cfg)
+    report_accuracy(x, cfg, prior_label)
     return len(kept)

@@ -1,0 +1,172 @@
+# f1000-2000: WHERE IS THIS WINDOW'S UNTRAINED OPTIMUM? STAGES is [end2end] only - no online run,
+# no adapter. THREE new `vggt_base@ped<R>` arms, ~6 min each, plus five references already scored
+# in this tree and reused free. ~18 min total.
+#
+# THIS IS A DECISION GATE, not a sweep. The transfer test made the adapted arm look like a winner:
+#
+#   arm                f0-1000            f1000-2000
+#   base              15.627 / 0.507     15.806 / 0.508     the windows inflate IDENTICALLY
+#   omni              11.403 / 0.598     11.952 / 0.611
+#   omni@ceil1p45      3.830 / 0.990      5.741 / 0.808
+#   base_ped1p35       ~6.9  / ~0.72      8.186 / 0.729
+#   base_ped1          3.687 / 0.989      4.900 / 0.870
+#   live@ped1p35       3.734 / 1.079      4.341 / 0.883     <- best arm on this window
+#
+# `live@ped1p35` beating `base_ped1` by 0.56 m would be the first time an adapted arm beat the best
+# untrained one - the thing this whole campaign has been chasing. BUT base_ped1 IS NOT THIS
+# WINDOW'S OPTIMUM. It sits at drift 0.870, well short of the crossing, exactly like every other
+# transform here (omni@ceil1p45 0.808, base_ped1p35 0.729). A properly tuned untrained arm could
+# plausibly reach ~3.9-4.3 and erase the win entirely. 18 minutes settles that before anyone spends
+# 5 h replicating it.
+#
+# THE TRANSFER PUZZLE THESE ARMS ALSO PROBE. The two windows are matched on both quantities that
+# ought to determine the outcome:
+#
+#   raw inflation   base drift  0.507  vs  0.508
+#   served depth    base_ped1 pre-transform p95/med 2.664 vs 2.686 -> SERVED TAIL 1.454 vs 1.457
+#
+# Identical prior, identical transform, identical served tail - and drift 0.989 vs 0.870. So the
+# transform's GAIN is scene-dependent in a way neither raw drift nor the served tail captures, and
+# holding the served tail constant across scenes (the "tail-targeting" knob sketched earlier) would
+# therefore fix nothing. That idea is dropped, and these arms measure the gain curve directly
+# instead.
+#
+# WHY 0.9 / 0.8 / 0.7 - bracketing, not extrapolation. Two independent estimates of this window's
+# crossing DISAGREE, which is exactly when to span rather than to guess:
+#
+#   local slope through the two f1000-2000 points (-0.40 drift per unit R)   -> R ~ 0.68
+#   f0-1000's excess-drift curve scaled by the measured gain ratio 0.75      -> R ~ 0.85
+#     (excess over raw: f0-1000 @ped1 +0.482, f1000-2000 @ped1 +0.362)
+#     under that scaling @ped0p9 -> drift ~1.04 and @ped0p8 -> ~1.13
+#
+# 0.9 / 0.8 / 0.7 spans both. They also MIRROR f0-1000's grid, where base_ped0p9 (1.222) and
+# base_ped0p8 (1.330) are already scored - so the two windows' response curves compare arm for arm
+# rather than through a fitted line. Served tails here: @ped0p9 1.423, @ped0p8 1.387, @ped0p7 1.349.
+#
+# HOW TO READ THE GATE, against live@ped1p35 = 4.341 in this same tree:
+#   * best untrained arm >= 4.341        => the live win survives a fair control. Worth the 3 h of
+#                                           live replicates and a third window to establish it.
+#   * best untrained arm < 4.341 - 0.2 m => the win was an artifact of a mis-tuned control. The
+#                                           conclusion reverts to "the serving transform is the
+#                                           whole game", and the open question becomes WHY the
+#                                           transform's gain is scene-dependent.
+#   (0.2 m is the read floor: 4 draws of base_ped1 on f0-1000 gave ATE 3.700 / 3.623 / 3.639 /
+#    3.788 - mean 3.687, std 0.075, RANGE 0.165. The LIVE floor is still unmeasured, so live-vs-live
+#    differences remain unreadable either way.)
+#
+#   python scripts/online_adapt_pipeline.py -c live_fg2a05_f1k2k_pedfine
+#
+# CHECK `ped_stats.json` `p95_shrink >= 1%` per arm before reading any ATE, and read DRIFT first -
+# |drift-1| ranks ATE across all 40+ arms in this project (Spearman 0.984). Every arm is a SINGLE
+# draw. Compare only against numbers from THIS tree, never against f0-1000.
+
+# ---------------------------------------------------------------- data (preprocessing is NOT here)
+SCENE: kitti_00_fg2a05
+DATA: data/KITTI/00                   # preprocess_kitti.py's output layout
+COLORS: data/KITTI/00/colors          # the four paths below are spelled out rather than derived
+DEPTHS: null                          # from DATA - change them together. KITTI ships no GT depth
+GT_TRAJ: data/KITTI/00/traj_tum.txt   # all 4541 frames; evo associates the window by timestamp
+CALIB: data/KITTI/00/calib.txt
+CONFIG: config/kitti_fg2_a05_config.yaml   # alpha 0.05 * far_gain 2 - unchanged from f0-1000
+DROID_WEIGHTS: pretrained_models/droid.pth
+UNDISTORT: false                      # undistort offline in the preprocess script instead (10.1)
+CROP_BORDER: 0
+
+# ---------------------------------------------------------------- run control
+STAGES: [end2end]                     # references only - the online stage is skipped entirely
+SKIP_EXISTING: true                   # the five references are already scored in this tree
+MIN_FREE_VRAM_MB: 15000               # raise with BUFFER on a bigger card
+GPU_WAIT_MIN: 120                     # minutes to WAIT for that much VRAM instead of
+                                      # refusing; 0 = refuse immediately. Polls every 60 s
+LENGTH: 100000                        # uncapped; STOP defines the window
+START: 1000                           # >>> THE WINDOW. All 4541 colors/depths/GT rows exist
+STOP: 2000                            # exclusive -> frames 1000..1999, 1000 frames like f0-1000
+STREAM_RES: 218240                    # 341 * 640 - a pixel budget, not a shape (9.6)
+BUFFER: 1500                          # keyframe buffer; a HARD CAP with no overflow guard
+RENDER_EVAL: false                    # hi2.py's eval_rendering -> renders/ + psnr/ (11)
+
+# ---------------------------------------------------------------- names and lineage
+OUT_ROOT: outputs
+ONLINE_NAME: live_f1k2k_pedfine       # placeholder: the online stage never runs (STAGES above)
+ADAPT_INIT_NAME: null                 # from stock VGGT-1B: this tests the RECIPE, not the adapter
+VGGT_HW: null                         # null = derive | [378, 518] TUM | [294, 518] Replica
+
+# ---------------------------------------------------------------- the arms (stage 2)
+# THREE NEW (~6 min each): the tighter ratios that bracket this window's crossing.
+# FIVE REUSED at zero cost - everything the transfer run already scored in this tree:
+#   omnidata           11.952  drift 0.611
+#   omnidata@ceil1p45   5.741  drift 0.808   the best clamp arm, under-shooting here too
+#   vggt_base          15.806  drift 0.508   the window's raw inflation - same as f0-1000's 0.507
+#   vggt_base@ped1p35   8.186  drift 0.729   the live arm's matched no-training control
+#   vggt_base@ped1      4.900  drift 0.870   the transferred f0-1000 optimum, UNDER-shooting here
+END2END_PRIORS: [omnidata, omnidata@ceil1p45, vggt_base, vggt_base@ped1p35, vggt_base@ped1p2, vggt_base@ped1p1, vggt_base@ped1, vggt_base@ped0p9, vggt_base@ped0p8, vggt_base@ped0p7]
+SPLIT_AT: null                          # null = the whole run, so [unseen] is empty (12.2)
+
+# ---------------------------------------------------------------- the adapter structure
+# byte-identical to every f0-1000 live arm, so the window is the only variable
+lora:
+  weights: pretrained_models/vggt
+  rank: 8
+  alpha: 16
+  targets: [attn.qkv, attn.proj, mlp.fc1, mlp.fc2]
+  patch_embed: false                  # false = adapt only the alternating-attention stack
+
+# ---------------------------------------------------------------- online adaptation (stage 1)
+# every field identical to the f0-1000 recipe: the window is the experiment, not the knobs
+online:
+  # warm-up: TWO gates - when the adapter starts LEARNING, and when it starts SERVING
+  warmup_kf: 12                       # keyframes before the first optimiser step, which lands at +1
+  handover_kf: 12                     # keyframes served by the FALLBACK prior; must be >= warmup_kf
+  warmup_prior: omnidata              # 'omnidata' = upstream's prior | 'self' = the adapting VGGT
+                                      # omni is much tailier (p95/med 4.22 vs base 2.67), so these
+                                      # 12 keyframes serve 1.780, not stock VGGT's 1.561
+  # schedule
+  adapt_style: wonline                # 'online' = the arrival alone | 'wonline' = a sliding window
+  steps_per_kf: 5                     # e5: e20 bought nothing over e5 at ceil1p5 (14.6)
+  window_size: 10                     # 'wonline' ONLY
+  batch_size: 2                       # 'wonline' ONLY
+  lag: 5                              # keyframes back from the end the target is taken
+  # serving
+  ceil_ratio: 1.0                     # OFF. No clamp on either branch - on f0-1000 the pedestal
+                                      # alone beat the clamp and the two stacked (3.700 vs 5.018)
+  ceil_target: false                  # forced: ceil_target at ceil_ratio 1.0 is refused
+  ped_ratio: 1.35                     # >>> THE TRANSFERRED KNOB. Served depth saturates at 1.35x
+                                      # the frame's PRE-shift median = 2.35x its POST-shift median.
+                                      # Stock VGGT under this serves a 1.561 tail; the f0-1000
+                                      # UNTRAINED peak was 1.455, and the gap is the compensation
+                                      # for the prior flattening as it trains (2.670 -> ~2.25).
+                                      # Chosen as "what f0-1000 would have made you pick", NOT as
+                                      # a believed optimum - the live sweep had p = 0.28 on R.
+                                      # Applied to both branches, warm-up included; the training
+                                      # target carries it on neither, which is why the adapter
+                                      # cannot learn the bias and instead erases its own
+  # sample construction
+  context_kf: 0                       # previous KEYFRAMES appended after the target; 0 = monocular
+                                      # also the reason intrinsics never reach the adapter: K only
+                                      # enters via pose_encoding, which is skipped below 2 frames
+  # optimisation
+  lr: 1.0e-4                          # NOT 1e-4 - YAML reads that as a string
+  weight_decay: 0.0
+  grad_clip: 1.0
+  lambda_pose: 1.0
+  coupled_scale: true
+  min_mask_pixels: 16
+  seed: 0
+  log_every: 5
+  # supervision mask (the same knobs ExtractConfig uses for depth_slam/)
+  mask_filter_thresh: 0.005
+  mask_min_count: 2
+  mask_min_disp_ratio: 0.5            # 14.9 measured the mask as exactly zero past 30 m, so the
+                                      # far field - all the pedestal touches - is unsupervised
+  # the loss gate: skip an arrival whose newest keyframe is not worth training on
+  gate_metric: raw                    # 'rel' = flat across a run | 'raw' = drifts with it
+  gate_lo: 0.0                        # 0 = off; skip BELOW this - the target already fits
+  gate_hi: 0.0                        # 0 = off; skip ABOVE this - the target is broken, not hard
+  # output
+  checkpoint_every_kf: 0              # 0 = off; N = a loadable adapter dir every N
+                                      # adapted keyframes
+
+# ---------------------------------------------------------------- what scores the arms
+end2end:
+  omni_normal_ckpt: pretrained_models/omnidata_dpt_normal_v2.ckpt
+  omni_normal_hw: [512, 512]

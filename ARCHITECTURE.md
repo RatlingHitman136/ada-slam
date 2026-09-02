@@ -459,6 +459,7 @@ you vary it, or two fractions overwrite each other.
 | `'vggt_base'` | `base` |
 | `outputs/adapt/<scene>/<aname>` | `<aname>` |
 | `outputs/adapt/<scene>/<aname>/checkpoints/epoch_005` | `<aname>_chkp_005` |
+| any of the above + `@ceil2` (the far-field ceiling, §14) | the same name + `_ceil2` |
 
 That is what makes an arm **reusable**: one adapter always scores into one directory, so a scene's
 `omni` baseline is run once and every later comparison finds it instead of repeating it. Two entries
@@ -1470,7 +1471,7 @@ of independent fits — the moments carry from the first keyframe to the last.
 
 | File | Contents |
 |---|---|
-| `adaslam/online/config.py` | `OnlineConfig` — frozen, no field carries a default (§9.5 rule 1). Its own config rather than `AdaptConfig`: that one carries a dozen fields this run never reads (`kf_fraction`, `val_source`, `train_frac`, `eval_*`, `keep_best`) whose `__post_init__` would force meaningless choices. Names that mean the same thing are spelled the same. |
+| `adaslam/online/config.py` | `OnlineConfig` — frozen, no field carries a default (§9.5 rule 1). Its own config rather than `AdaptConfig`: that one carries a dozen fields this run never reads (`kf_fraction`, `val_source`, `train_frac`, `eval_*`, `keep_best`) whose `__post_init__` would force meaningless choices. Names that mean the same thing are spelled the same. `ceil_ratio` is the far-field ceiling on the *served* depth (§14) — the live arm's spelling of what a frozen arm spells `@ceil` in its spec — and `ceil_target` extends the same clamp to the training target (§14.4). |
 | `adaslam/online/target.py` | `settled` / `unit_keyframes` / `context_keyframes` / `LiveSampler` — the online counterpart of `adapt/data.py:SceneData`, returning **exactly** its 5-tuple so `adapt/losses.py` is reused unchanged. |
 | `adaslam/online/trainer.py` | `LiveTrainer` — the optimiser, `on_keyframe`, the checkpoint cadence, and `stats()`, whose key names are the offline ones wherever they mean the same thing. |
 | `adaslam/online/prior.py` | `OnlineVggtPrior(VggtPrior)` — the parent's extractor with the warm-up branch and the adaptation step around it. Still a plain function, never a bound method (§9.3's descriptor reasoning). |
@@ -1653,3 +1654,400 @@ Two YAML traps the reader turns into errors rather than into a run: `lr: 1e-4` i
 YAML 1.1 (PyYAML's float resolver wants the dot — write `1.0e-4`), and unquoted `yes`/`no`/`on`/`off`
 are booleans. Every value is type-checked against the literal it replaces, so both fail at parse
 time instead of a thousand optimiser steps later, in a child.
+
+---
+
+## 14. The far-field ceiling — `@ceil` specs and `OnlineConfig.ceil_ratio`
+
+One transform, measured before it was mechanised: **clamp a depth prior at `ratio × the frame's
+median depth` before the tracker sees it.** On KITTI 00 it is the only change so far that moved
+the headline number by metres rather than tenths.
+
+### 14.1 Why — the KITTI ATE is scale drift, decided where no metric can see
+
+Established on `kitti_00_fg2a05_f0-1000` (2026-08, from saved outputs alone):
+
+- **The ATE is monotone scale drift.** Every arm's estimated scale inflates ~1.8× over 1000
+  frames (blockwise GT-metres-per-unit 6.3 → 3.4); `gt_oracle` (GT-depth prior,
+  `scripts/gt_oracle_arm.py`) holds it near-constant and halves the ATE. §12.4 saw the same drift
+  on rellis_00000.
+- **The scored region predicts the wrong ranking.** Within lidar coverage (1–50 m, the lower ~75 %
+  of rows) VGGT beats Omnidata on every prior-test metric including the pipeline's own alignment
+  family — yet loses end-to-end. The deciding region is the one the prior test is blind to: the
+  top ~25 % of rows plus everything past ~50 m, **~39 % of the `[3::8,3::8]` points BA consumes**
+  (`scripts/tmp_sky_probe.py` measures it).
+- **In disparity space, "far" is a licence, not a constraint.** JDSA consumes the prior as
+  disparity, so a pixel asserted beyond ~2× the frame median is a near-zero-disparity pull with no
+  restoring force — and `mono_depth_far_gain` gives exactly those pixels the highest weight. While
+  the tracker's failure is scale inflation, "far, don't care exactly" *licenses* the inflation. A
+  hard ceiling resists it.
+
+### 14.2 The road here — the levers that did not move it, and what the priors actually assert
+
+§14.1 is the diagnosis; this is the evidence trail that forced it, kept because every dead end
+below is a hypothesis someone will otherwise propose again. Each was a scene tree under
+`outputs/test/end2end/`, so every number is checkable.
+
+**The KITTI null, and the proof of headroom.** At upstream-flavour settings
+(`kitti_00_f0-1000`, flat α 0.01): omni 15.47, base 16.58 — and **~14 live/wonline adaptation
+recipes all landed 15.8–17.2**, spanning steps 1–40, lags 3–7, lr and gate variants. Adaptation
+was a reproducible null. But `gt_oracle` (GT depth served as the prior,
+`scripts/gt_oracle_arm.py`) read **7.65** — the prior channel could halve the ATE, so the
+headroom was real and the levers were wrong, not the target.
+
+**The lever sweep that failed to reach it** — one tracking-config tree each:
+
+| tree | lever | omni | base | adapted |
+|---|---|---|---|---|
+| `crop976` | crop the sky rows out of the stream | 20.0 | 22.6 | 21.9–22.6 |
+| `jdsa4` | more JDSA iterations | 15.4 | 16.3 | 16.8 |
+| `jdsa4fg5` | + far_gain 5 | 14.7 | 15.7 | 15.8–16.7 |
+| `fg5a05` | far_gain 5, α 0.05 | 11.3 | 15.5 | 14.9 |
+| `fg2a05` | far_gain 2, α 0.05 — **became the tree** | 11.40 | 15.63 | 15.1–15.4 |
+
+Cropping made everything *worse* — the top rows cost less than the peripheral parallax they
+carry. Raising α moved omni metres and VGGT barely, and adaptation stayed null in every tree.
+The prior mattered more and more, and VGGT kept losing through it.
+
+**What the two priors actually assert** — the depth anatomy the ceiling decision rests on.
+Sources: `ceil_stats.json` (whole-frame tail over 845 keyframe calls, fg2a05 arms), the saved
+sky-probe rows (`outputs/test/prior/kitti_00_f0-1000/tmp_sky_probe.json`, 40 frames — units are
+model-specific, ratios only), and the two prior tests (`test/prior/kitti_00_f0-1000` = lidar
+band 1–50 m, `…_far` = 20–80 m):
+
+| measure | omni | vggt base | adapted (pre-ceil) |
+|---|---|---|---|
+| whole-frame tail: p95 / p99 / max over median | 4.22 / 5.60 / **12.77** | 2.67 / 3.36 / **3.93** | — |
+| top-region (no-GT) median / band median | 1.58 | 1.51 | 1.69–1.77 |
+| top-region p95 / band median | 6.5× | 3.1× | up to **344×** (wonline_e12) |
+| disparity spread p95/p5 on the BA grid | 8.5 | 5.3 | 6.4–16.7 |
+| cross-frame stability of the top median (CV) | 0.129 | 0.139 | 0.15–0.16 |
+| per-frame fitted-scale spread `scale_cv` (in-band) | 0.176 | 0.157 | — |
+| in-band per-frame L1 / AbsRel / δ1.25 | 1.88 / 0.132 / 0.818 | **1.06 / 0.071 / 0.947** | — |
+| far-band (20–80 m) per-frame L1 / AbsRel | 4.97 / 0.140 | **4.08 / 0.107** | — |
+| JDSA-grid-aligned L1, **median** frame, in-band / far-band | 1.50 / 4.08 m | **0.84 / 3.52 m** | — |
+| the same as a **mean** — outlier-dominated, do not use | 1.61 / 4.25 m | 1101 / 1618 m | 281–1859 m |
+
+**Read the median row, not the mean row.** `results.json` reports the mean, and on this metric the
+mean is not a summary: VGGT base's in-band 1101 m is **one frame of 1000** (idx 287, l1_jdsa
+1.1e6, 99.9 % of the total mass), whose *prediction* is entirely healthy — `l1_perframe` 1.93 m,
+AbsRel 0.166, δ1.25 0.894. What blew up is the closed-form fit, not the depth. Drop that single
+frame and VGGT reads **0.95 m against omni's 1.61 m**. Omni has no such tail at all (in-band max
+4.12 m, top frame 0.2 % of the mass); every VGGT arm does. So the honest statement is *the JDSA
+scale fit occasionally goes degenerate on VGGT and never on omni* — a fragility, not a level.
+
+Three answers that table settles:
+
+- **VGGT does not predict further than omni — the opposite.** Its far field is compressed: the
+  tail ends at 3.9× the frame median where omni's reaches 12.8×, and its no-GT top region tops
+  out at 3.1× the band median vs omni's 6.5×. Stock VGGT puts the sky barely past the road.
+- **VGGT is not noisier either.** Cross-frame stability of the unscored region is comparable
+  (CV 0.139 vs 0.129), its per-frame fitted scale is *more* consistent (0.157 vs 0.176), and it
+  wins every GT-scored shape metric in-band *and* in the far band.
+- **VGGT wins this metric too, and the far field's real problem is leverage, not accuracy.**
+  JDSA fits the 2×2 scale grid in *disparity* and **scale-only** — `get_prior_depth_aligned` is
+  `depth_prior * mscales_bi`, no shift — so the residual is `rd_p = d_p − s(p)·q_p` and its
+  derivative w.r.t. a grid corner is `∂rd_p/∂σ_c = −q_p·w_c(p)` (`ba.py:215`,
+  `Jso = -m * disps_prior * Jbi`). **That gradient is proportional to the prior's own disparity**,
+  so it vanishes on far pixels, and in the normal equations
+  (`Hs = Σ α·JsoᵀJso`) the leverage falls off as **q²**. Measured on this scene's recorded prior:
+  the >2×-median-depth pixels are **14.6 % of the frame but 1.31 % of the scale-grid leverage**,
+  an 11× under-representation. Meanwhile the depth diagonal gets `+α` regardless of q
+  (`C = C_photo + m·α`), so those same pixels have *full* authority over their own depth. The far
+  field is therefore a **sink**: it absorbs whatever scale the near field negotiated and imposes
+  it on ~39 % of BA's points, with almost no ability to push back. That asymmetry — full
+  authority, ~1 % say — is §14.1's "far is a licence, not a constraint" in the algebra.
+
+**A plateau is not the cause, and that was checked rather than assumed.** Flattening the far
+region of a real prior to a single value moves the fit's conditioning by 0.5 % (median cond(Hs)
+28.64 → 28.78), and a *uniform* disparity field is better conditioned still (22.13) — all of them
+far from singular. So "VGGT's plateau gives the fit a degenerate corner" is **false**; what
+frame 287 is remains unexplained, and needs VGGT's actual prediction on that frame to diagnose.
+
+**The ceiling raises the far field's vote — but that is not why it works.** Clamping depth at
+`R × median` floors disparity at `q_med/R`, which raises q on exactly the starved pixels: their
+share of the scale-grid leverage goes 1.31 % → 2.81 % (ceil 2.0) → 4.83 % (ceil 1.5).
+`scripts/tmp_dscales_probe.py` measures both halves, and the second half kills the tidy reading:
+with the clamp on, the far field's **served depth moves further from what the tracker believes**,
+not closer — 52.5 % → 67.9 % → 75.2 % median relative disagreement on the same pixels. So a
+clamped prior is *more* wrong out there and still wins by metres. The ceiling therefore acts as
+§14.1 first described it — a **bound**, not a correction: a prior that cannot assert past
+`R × median` cannot license unbounded scale inflation, and boundedness is doing the work even
+though accuracy gets worse. Do not re-derive it as "the far field now helps set its own scale";
+that was tried and the measurement refused it.
+
+Adaptation with the far field masked out of supervision (`mask_min_disp_ratio 0.5`) leaves that
+region uncontrolled and it runs away (p95 344× the band; disparity spread 16.7 vs base's 5.3),
+which is what `ceil_target` (§14.4) exists to address.
+
+**What the scale grid actually does with drift.** `extract/normal` and `extract/normal_vggt` are
+the same window, config and `kf_*` knobs with **only the prior swapped** (`run_extract`'s `prior=`
+argument, §9.2.1), so this is the controlled omni-vs-VGGT comparison at the scale-grid interface:
+
+| | omni, 430 kf | **VGGT, 438 kf** | dense prefix, 78 kf |
+|---|---|---|---|
+| `s_near` / `s_far` | 0.494 / 0.280 | 0.272 / 0.172 | 0.611 / 0.356 |
+| `s_far/s_near` — do near and far agree? | 0.566 | **0.633** | 0.582 |
+| far field's share of the vote | 1.24 % | 1.20 % | 1.36 % |
+| far field: served vs tracker depth | 52.5 % | **29.8 %** | 49.6 % |
+| chosen grid ÷ least-squares optimum | 0.946 | **1.002** | 0.939 |
+| keyframes with a **negative** corner | 2 (0.5 %) | **0** | 0 |
+| fitted scale, first third → last third | ×0.609 | ×0.572 | ×0.995 |
+| trajectory scale over the same span | ×0.543 | **×0.523** | ×0.939 |
+
+Two structural facts, then the result that matters.
+
+**Near and far want scales differing by ~40 %, reproducibly**, and one 2×2 grid cannot serve both
+— the vote share decides which it serves. And **the fitted scale drifts in lockstep with the
+trajectory's** on full-length runs while barely moving on the short prefix, which is the link
+§14.1 asserted and never measured. Note what that implies about reach: both priors are stateless
+and per-frame, so *they* do not drift — the drift in `s_all` is the **tracker's**, and because
+JDSA re-fits a fresh 4-DoF grid on **every keyframe**, it is absorbed rather than resisted. A
+per-keyframe scale constrains depth *shape* within a frame; it structurally cannot enforce scale
+*consistency* across frames. That is §9.4's old suspicion with numbers on it, and it bounds what
+any better prior, adapted or not, can buy through this interface.
+
+**And VGGT is better on every column here and still drifts more.** Its near and far agree more
+closely (0.633 vs 0.566), its far field sits far nearer what the tracker believes (29.8 % vs
+52.5 %), its frontend grid lands on the least-squares optimum almost exactly (1.002 vs 0.946), and
+it produces **no degenerate corners at all** where omni produces two. Yet its trajectory scale
+drifts further (×0.523 vs ×0.543) and its ATE is worse (16.58 vs 15.47 in this tree). Every
+remaining "VGGT's far field is pathological" hypothesis is now dead — it is not further, not
+noisier, not degenerate, not worse-agreeing, and not less accurate against GT.
+
+**The hypothesis that survives is the opposite one: VGGT agrees with the tracker too well to
+correct it.** A prior earns its place in JDSA by *disagreeing usefully* — the residual
+`rd = d − s·q` is the only channel through which it can move anything, and a prior whose scaled
+disparity already matches what BA believes is a rubber stamp. That reading is the first that
+explains **both** standing results at once: the ceiling *increases* far-field disagreement
+(52.5 % → 75.2 %) and improves ATE by metres, while VGGT *decreases* it (52.5 % → 29.8 %) and
+loses. Same axis, both directions. It is two points on that axis and therefore a hypothesis, not
+a finding — `run_configs/live_a05_ceilsweep.yaml` tests it directly, since it runs omni and VGGT
+at three clamp levels in a tree with no `far_gain` confound.
+
+### 14.3 The falsification result
+
+The test clamped each prior at 2× median and ran both as ordinary arms (same tree, same
+`kitti_fg2_a05_config.yaml`). Both **improved** — the extended far tail was a liability for its
+owner, not the asset the tail-hypothesis assumed:
+
+| arm | ATE (m) | drift last/first | clamp bit |
+|---|---|---|---|
+| omni | 11.40 | 0.63× | — |
+| **omni_ceil2** | **8.66** | 0.70× | 14.6 % of px |
+| base | 15.63 | 0.54× | — |
+| **base_ceil2** | **13.08** | 0.60× | 13.6 % of px |
+| gt_oracle *(flat tree, flat α)* | 7.65 | 1.19× | — |
+
+What the clamp removed is **not** rare huge-depth outliers: base VGGT's tail is *shorter* than
+Omnidata's (pre-clamp p95/median 2.67 vs 4.22), yet the clamp still bit ~14 % of pixels — a broad
+mass of moderately-far FOE/sky pixels. The exception is the **adapted** arms, which do grow
+runaway far assertions (the sky probe reads a top-region p95 of 344× the band on one wonline
+adapter, vs 3.1× for base) — training on drifting SLAM depth creates them, which makes the
+ceiling *more* relevant after adaptation, not less. Open residual: at identical compression omni
+still beats VGGT by 4.4 m, so compression is *a* mechanism, not the whole story. *(§14.6:
+adaptation later halved that residual to ~2.2 m, ratio-independent — still open, but smaller.)*
+
+### 14.4 The two spellings
+
+**A frozen or reference arm carries the ceiling in its SPEC** — `end2end/config.py:parse_ceil`:
+
+```
+END2END_PRIORS = ('omnidata', 'vggt_base', 'omnidata@ceil2',
+                  'outputs/adapt/<scene>/<aname>@ceil1p5')
+```
+
+A spec, never a config field, because the arm directory is inferred from the spec (§7.1) — a
+clamped arm *must* name a different directory than its unclamped parent or the two would silently
+overwrite each other, the trap §9.3 exists to prevent. `arm_name` appends `_ceil<tag>`
+(`ceil_tag`: `2.0 → '2'`, `1.5 → '1p5'`), so ratios never collide, per-arm ratios coexist in one
+comparison, and `SKIP_EXISTING` reuses whatever is on disk. Both `make_prior`s honour it
+(end2end and priortest — a clamped generator scores in the prior stage under the same name), with
+`CeilingPrior` (`end2end/prior.py`) wrapping the base prior's extractor; for `'omnidata@ceilR'`
+that is `stock_prior_extractor()`, captured before `SlamRunner.run` installs anything
+(`slam/stock_prior.py`'s recursion warning). Plain `'omnidata'` still takes the untouched
+`prior=None` stock path.
+
+**The online live arm carries it as `OnlineConfig.ceil_ratio`** — it is named by `ONLINE_NAME`,
+not by a spec. The clamp sits on everything the prior *serves*, warm-up fallback included; the
+**training target (SLAM depth) is clamped only when `OnlineConfig.ceil_target` says so** —
+`false` reproduces the original serve-only behaviour exactly, `true` clamps the target at the
+same `ceil_ratio` (over its valid pixels, in `online/target.py:kf_target`) so the adapter is
+*taught* the ceiling instead of only being served through it (`true` at `ceil_ratio 1.0` is
+refused as contradictory). Both are recorded into the adapter's `config.json` and exported as
+`--live` columns. **The knob is unexercised and probably unnecessary**: it was built to stop
+adapters growing a runaway far field, and §14.6's sky probe then found this tree's adapters do
+not — the serving clamp already propagates into what they learn. Keep it for a family that does
+show the tail; do not spend a run on it before one does.
+
+`ceil_clamp` (`end2end/prior.py`) is the one definition, and at `ratio ≤ 1.0` it returns before
+any tensor op — so `ceil_ratio: 1.0` and an unmodified spec are *bit-identical* to the pre-§14
+code path, and every arm recorded before this section stays comparable.
+
+### 14.5 Reading a ceiling arm
+
+- **`ceil_stats.json`** is written beside the arm's `results.json` (both test kinds): clip
+  fraction (mean/min/max over keyframes) and pre-clamp p95/p99/max over median. **A mean clip
+  fraction under 1 % is printed as a warning and means the arm decides nothing** — the prior
+  asserted nothing beyond the ceiling in the first place.
+- The mechanism's fingerprint is the **drift**, not just the ATE: `plot_trajectories.py`'s
+  scale/drift summary (§12.4) should move toward 1.0 as the ceiling works.
+- `scripts/tmp_sky_probe.py` reports, per arm, what a ceiling at 1.5/2/3× would bite and *where*
+  the >2×-median mass sits (top region vs upper/lower lidar band).
+- A frozen replay of a ceil-trained adapter is **unclamped unless its spec says `@ceil`** — the
+  knob clamps a run's serving, it does not mark the adapter.
+- ~1e-3–8e-3 run-to-run noise (§11.2, §13.6) applies as ever; the deltas above are ~300× it.
+
+The interim script that produced `omni_ceil2`/`base_ceil2` (`scripts/far_clamp_arm.py`) is
+deleted — a clamped arm is one spec entry now, and its on-disk arms carry the exact names the
+spec infers, so they were grandfathered in place.
+
+### 14.6 The sweep and the adapted arms — results (2026-08)
+
+The two prepared experiments (`live_fg2a05_ceilsweep.yaml`, `live_fg2a05_ceil1p5_e20.yaml`) ran,
+plus a small extra grid: adapted arms at ceil ∈ {none, 2.0, 1.5} × {e5, e20}. Everything below is
+in `outputs/test/end2end/kitti_00_fg2a05_f0-1000/`; drift is GT-metres-per-est-unit, last tenth
+over first tenth (1.0 = no scale drift, the §12.4 convention).
+
+**The sweep, refined to a minimum. The optimum is a plateau at ~1.40–1.45, and it sits exactly
+where scale drift passes through 1.0.**
+
+| ceiling | ATE (m) | drift | \|drift − 1\| | clip frac |
+|---|---|---|---|---|
+| none | 11.403 | 0.59 | 0.41 | — |
+| 3.0 | 11.165 | 0.60 | 0.40 | 7.6 % |
+| 2.0 | 8.664 | 0.67 | 0.33 | 14.6 % |
+| 1.5 | 4.295 | 0.87 | 0.13 | 24.5 % |
+| **1.45** | **3.830** | **0.98** | **0.02** | 25.9 % |
+| 1.42 | 3.957 | 1.02 | 0.02 | 26.9 % |
+| 1.40 | 3.963 | 1.05 | 0.05 | 27.6 % |
+| 1.35 | 4.598 | 1.15 | 0.15 | 29.4 % |
+| 1.25 | 5.085 | 1.22 | 0.22 | 33.5 % |
+| `gt_oracle` (GT depth, unclamped) | 6.992 | 1.29 | 0.29 | — |
+
+**`|drift − 1|` ranks ATE monotonically across all ten rows.** That is not a correlation to note
+in passing — it is a *predictive rule*, and it was used as one: the coarse sweep put drift at 0.87
+(ceil 1.5) and 1.15 (ceil 1.35), the crossing was predicted to lie near 1.42, and 1.45 duly came
+back as the minimum at drift 0.98. On a new scene this replaces a sweep: run two ceilings, read
+their drift, interpolate to 1.0. Under-clamping lets the estimated scale inflate (drift < 1);
+over-clamping deflates it (drift > 1); the ATE minimum is the crossing.
+
+**Read the plateau as a plateau.** 1.45 / 1.42 / 1.40 span 0.133 m, at or below the measured
+run-to-run noise floor (§14.7: mean 0.109 m, max 0.283 m), so those three are one result and
+cannot be ranked against each other. 1.5 (+0.47) and 1.35 (+0.77) are outside it and genuinely
+worse. Best estimate: **ATE ≈ 3.9 m at a ceiling somewhere in 1.40–1.45**, a 66 % cut from
+unclamped omni's 11.40.
+
+**And it beats ground truth by 1.8×.** `gt_oracle` — real lidar depth served as the prior in this
+same tree — reads 6.992 at drift 1.29. A deliberately false, bounded prior beats a true one,
+which is the strongest available confirmation of §14.2's "the ceiling wins while being more
+wrong": true depth has a true far field, and a true far field is what licenses the drift.
+
+**The adapted arms: adaptation is null without the ceiling, real with it — and does not yet
+close the gap.**
+
+| arm | ATE (m) | drift | reading |
+|---|---|---|---|
+| base | 15.63 | 0.50 | |
+| live e5 w10, no ceil | 15.42 | 0.51 | adaptation alone: null, like every pre-ceiling live run |
+| base_ceil2 | 13.08 | 0.56 | |
+| live ceil2 e5 | 10.82 | 0.62 | adapting adds −2.3 m on top of the clamp |
+| base_ceil1p5 | 9.56 | 0.65 | |
+| **live ceil1p5 e5** | **6.48** | **0.75** | adds −3.1 m; beats plain omni by 4.9 m (−43 %) |
+| live ceil1p5 e20 | 6.57 | 0.74 | 4× the compute, no gain — steps are not the bottleneck |
+
+Four readings, all mechanism-consistent:
+
+- **ATE ranks by drift across all 11 arms** — the scale-drift story is now a straight line
+  through every number in this tree, not just the falsification pair.
+- **Adaptation and the ceiling are synergistic.** Without the clamp the adapter's in-band
+  improvement is invisible (drift 0.50 → 0.51); with it, the adapter improves drift *further*
+  than the clamp alone (0.65 → 0.75 at 1.5). The in-band gains only matter once the far-field
+  licence is revoked — exactly what §14.1 predicts.
+- **§14.3's open residual narrowed from 4.4 m to ~2.2 m and is ratio-independent**:
+  10.82 − 8.66 = 2.16 at ceil2, 6.48 − 4.30 = 2.18 at ceil1p5. The adapted arm's remaining
+  deficit against omni-at-the-same-ceiling is exactly its remaining drift deficit (0.75 vs 0.87).
+- **"Beats omni" is true against stock omni, not yet against omni through the same ceiling.**
+  The honest target is now 4.30. Caveat: every arm is a single draw and the run-to-run floor at
+  this scene/length is unmeasured (§13.6's rule — measure it where you compare).
+
+**The adapters do not grow a runaway far field, so `ceil_target`'s premise fails.**
+`scripts/tmp_sky_probe.py` over this tree's live adapters (2026-08):
+
+| arm | max/median | p99/median | top p95 / band | disp spread | top CV | ATE |
+|---|---|---|---|---|---|---|
+| omni | 14.80 | 5.77 | 6.5 | 8.5 | 0.129 | 11.40 |
+| base | 3.87 | 3.35 | 3.1 | 5.3 | 0.139 | 15.63 |
+| live noceil e5 | 3.83 | 3.51 | 3.6 | 6.1 | 0.158 | 15.42 |
+| live ceil2 e5 | 3.56 | 3.30 | 3.3 | 5.8 | 0.145 | 10.82 |
+| live ceil1p5 e20 | 2.93 | 2.68 | 2.9 | 5.2 | 0.121 | 6.57 |
+| **live ceil1p5 e5** | **2.70** | **2.50** | **2.8** | **4.8** | **0.119** | **6.48** |
+
+Two readings, one of which retires a prepared experiment. **The 344× runaway was a property of the
+old *offline, flat-α* adapters, not of adaptation** — `live noceil e5` is the control here (live,
+same tree, no clamp) and reads 3.83, no runaway at all. So `ceil_target` and
+`live_fg2a05_ceilteach_e5.yaml` target a failure mode that does not occur in this family; skip
+that run unless a future arm actually shows the tail. And: **the serving clamp propagates into the
+adapter's own learned far field even though the training target is never clamped** —
+tighter ceiling → tighter learned tail (3.83 → 3.56 → 2.93 → 2.70), monotone, and the ATE column
+is monotone with it. The ceil-trained adapter ends up with the most compressed *and* the most
+temporally stable far field of any arm here, base and omni included.
+
+### 14.7 The flat-α sweep — the clamp is real, and it compounds with `far_gain`
+
+`run_configs/live_a05_ceilsweep.yaml` re-ran the ceiling in `config/kitti_a05_config.yaml`
+(α 0.05, **`far_gain` absent = 1.0**), so `far ≡ 1` and a clamped arm varies the clamp and nothing
+else. Six arms, tree `kitti_00_a05_f0-1000`:
+
+| arm | ATE (m) | drift | Δ vs unclamped | | arm | ATE (m) | drift | Δ |
+|---|---|---|---|---|---|---|---|---|
+| omni | 12.84 | 0.56 | — | | base | 16.26 | 0.49 | — |
+| omni_ceil2 | 11.79 | 0.58 | −1.06 | | base_ceil2 | 14.75 | 0.53 | −1.51 |
+| **omni_ceil1p9** | **11.10** | 0.60 | **−1.74** | | **base_ceil1p9** | **14.09** | 0.54 | **−2.17** |
+
+**The clamp is not a `far_gain` artifact.** Both priors improve at both ratios with the ramp
+switched off entirely, so §14.3's falsification and §14.6's sweep stand on their own.
+
+**But the two knobs compound, and the mechanism is amplification, not truncation.** ceil2 buys
+−1.06 here against −2.74 in the fg2a05 tree — and *neither* of those is ramp-truncated, since
+`far ≤ min(far_gain, ceil_ratio) = 2` in both. So the earlier worry that ceiling arms were
+silently running a shortened ramp does not explain the difference (it applies only where
+`ceil_ratio < far_gain`, i.e. to the fg2a05 `ceil1p5` arms). What does explain it: `far_gain`
+raises the far field's **authority** (`α·far` on the depth diagonal), so bounding what the far
+field asserts matters more when it has more of it. Keep both knobs — fg2a05 + ceil1p5 (omni 4.30)
+remains the best recipe on record, well ahead of anything at flat α.
+
+**A ceiling at or below `far_gain` makes `far_gain`'s value irrelevant — check this before
+designing any (`far_gain`, `ceil`) sweep.** `far = clamp(median/q, 1, far_gain)` and the clamp
+forces `median/q ≤ ceil_ratio`, so at `far_gain ≥ ceil_ratio` the cap never binds and `far` is
+simply the range ratio, whatever `far_gain` says. Measured elementwise on this scene's recorded
+prior, `max|far(fg=2) − far(fg=5)|` is **3.00 unclamped, 0.00 at ceil 2.0, 0.00 at ceil 1.5**. So
+`fg2a05 + @ceilR` and `fg5a05 + @ceilR` are the *same experiment* for any `R ≤ 2`, and only the
+unclamped arms distinguish those trees (omni 11.40 vs 11.256, base 15.63 vs 15.511). To make
+`far_gain 5` do something a clamped `far_gain 2` does not, the ceiling has to sit **above** 2.
+`run_configs/live_fg5a05_ceilsweep.yaml` is written and its header carries both readings: as
+listed it is a **replication study** — four independent draws of four already-recorded
+configurations, which is the run-to-run noise floor §11.2 and §13.6 keep saying is unmeasured at
+this scene and length — and its header holds the `@ceil3`/`@ceil4` swap that probes `far_gain 5`
+proper instead.
+
+Three more readings. **Drift still ranks ATE** across all six arms, unbroken. **1.9 beats 2.0 for
+both priors**, the same "tighter is better" direction the fg2a05 tree showed, which is why round 2
+adds `@ceil1p5` (two new arms; the other six reuse from disk). And **the omni-vs-VGGT gap narrows
+here as the clamp tightens** — 3.42 unclamped → 2.98 at 1.9 → 2.97 at 2.0 — where in the fg2a05
+tree it *widened* (4.23 → 4.42 → 5.26 at ceil1p5). The clamp also helps base more than omni here
+(−2.17 vs −1.74), which is the direction §14.2's "VGGT agrees too well" hypothesis predicts; the
+fg2a05 tree runs the other way, so this is one supporting data point, not a confirmation.
+
+### 14.8 What is prepared and unrun
+
+| config | asks | cost |
+|---|---|---|
+| `live_a05_ceilsweep.yaml` | round 2: `@ceil1p5` at flat α, where 1.9 already beat 2.0 | 2 new arms, 6 reused |
+| `live_fg2a05_ceilsweep.yaml` | the fg2a05 optimum below 1.5 (`@ceil1p25`, `@ceil1p35`) — omni only, so the cheapest GPU here; its header also carries the replication recipe | 2 arms |
+| `live_fg2a05_ceil1p25_e5.yaml` | the winning live recipe at the presumptive optimum, with same-ratio references | 1 online run |
+| `live_fg2a05_frozen1p5.yaml` | does the settled adapter beat the live run that trained it? | 1 arm |
+| ~~`live_fg2a05_ceilteach_e5.yaml`~~ | **retired** — §14.6's sky probe showed the runaway far field it targets does not occur; `ceil_target` stays unexercised | — |
+
+Missing reference worth an idle GPU: `gt_oracle` (`scripts/gt_oracle_arm.py`) under the fg2a05
+config, so the 4.30 is compared against an oracle in its *own* tree rather than the flat-α 7.65.

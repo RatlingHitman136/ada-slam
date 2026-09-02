@@ -1,0 +1,29 @@
+inherit_from: config/kitti_config.yaml   # everything else identical - this file changes TWO knobs
+
+# KITTI 00 with the depth prior weighted BOTH harder and by range.
+#
+#   mono_depth_alpha    0.01 -> 0.05     the floor, applied everywhere
+#   mono_depth_far_gain 1.0  -> 5.0      multiplies it toward the far end
+#
+# The two COMPOUND (geom/ba.py: alpha_pixel = alpha * far, far in [1, far_gain]), so the effective
+# weight runs 0.05 at the frame's median disparity to 0.25 on its farthest pixels. Against the
+# damping alpha replaces where the prior is valid - eta = 0.2 * 0.01 * Softplus(.) ~ 1.4e-3 - that
+# is 36x near and 180x far. It is an aggressive setting, deliberately: on kitti_00 f0-1000 the
+# 0.01/5.0 version (0.01 -> 0.05) took omni 15.466 -> 14.667 and vggt_base 16.582 -> 15.734, the
+# only change so far that moved the headline number, and 0.1 flat also beat 0.01 flat.
+#
+# What to watch, because 180x eta is far past anything measured:
+#   * the near field now pays. BA's own depth beats the prior 3x there against Omnidata
+#     (AbsRel 0.031 vs 0.091) and 1.6x against an adapted VGGT (0.031 vs 0.051), and alpha=0.05
+#     is applied to ALL of it, not just the far band.
+#   * at 0.25 the far depth is close to being dictated by the prior rather than solved for. That
+#     is an improvement on paper - the prior is 0.099-0.254 AbsRel out there against BA's 0.430 -
+#     but the tracker stops disagreeing with a prior that may be systematically biased.
+#   * geom/ba.py's _report_alpha prints alpha against the photometric Hessian for the first three
+#     JDSA solves. Read those three lines: if alpha/C is well above 1 the prior is governing the
+#     solve, not regularising it.
+
+Tracking:
+  frontend:
+    mono_depth_alpha: 0.08     # the floor; 0.01 is upstream's, inherited from the TUM preset
+    mono_depth_far_gain: 2.0   # multiplies it toward the far end; 1.0 = flat (the default)

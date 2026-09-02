@@ -102,6 +102,13 @@ class LiveSampler:
         d[~np.isfinite(d)] = 0.0
         d = cv2.resize(d.astype(np.float32), (self.hw[1], self.hw[0]),
                        interpolation=cv2.INTER_NEAREST)
+        # the training side of the far-field ceiling (14.6): clamp the target at the same ratio
+        # the serving clamp uses, over its VALID pixels only - the median must not read the
+        # zero-filled holes, and min() cannot lift a zero, so the mask below is unaffected
+        if self.cfg.ceil_target:
+            valid = d > 0
+            if valid.any():
+                np.minimum(d, self.cfg.ceil_ratio * np.median(d[valid]), out=d)
 
         low = confidence_mask(video.poses[:n], video.disps[:n], video.intrinsics[0] * 8,
                               self.cfg, ix=[t])
