@@ -80,13 +80,33 @@ online:
                                       # applied AFTER the ceiling. null = off - NOT 1.0, which is
                                       # a real pedestal; the two knobs' off values differ.
   # sample construction
-  context_kf: 0                       # previous KEYFRAMES appended after the target; 0 = monocular
+  context_kf: 0                       # frames per VGGT forward minus one, TRAINING and SERVING
+  context_stride: 1                   # keyframes BETWEEN context frames; 1 =
+                                      # consecutive, the pre-knob behaviour
+                                      # both; 0 = monocular, the pre-knob behaviour exactly
   # optimisation
   lr: 1.0e-4                          # NOT 1e-4 - YAML reads that as a string
   weight_decay: 0.0
   grad_clip: 1.0
+  normalize_target: false             # true = divide the target by the sample's own gauge
+  gauge_clamp: 2.0                    # and stop depth_loss re-fitting a scale, so the loss
+  gauge_min_pixels: 256               # carries gradient about ABSOLUTE scale. Unread when
+  gauge_pose: false                   # gt TRANSLATIONS in the depth target's gauge, compared
+                                      # directly - VGGT's own camera term. Needs
+                                      # normalize_target and lambda_pose > 0
+                                      # normalize_target is false, but still validated
   lambda_pose: 1.0
   coupled_scale: true
+  freeze_gauge: false                 # hold the pose gauge fixed for the whole unit
+                                      # instead of recomputing it every forward
+  anchor_kf: 0                        # keyframes from the start of the sequence that
+                                      # lambda_cons measures against; 0 = the batch
+  depth_all_frames: false             # supervise depth on every frame of the sample
+                                      # under one shared scale; needs context_kf >= 1
+  lambda_cons: 0.0                    # scale-consistency penalty; pulls each sample's
+                                      # own scale toward the batch consensus. 0 = off
+  batch_scale: false                  # one scale over the WHOLE batch instead of
+                                      # one per sample; refused with coupled_scale
   min_mask_pixels: 16
   seed: 0
   log_every: 5

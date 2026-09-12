@@ -12,7 +12,8 @@ import cv2
 import numpy as np
 import torch
 
-from ..common import DEPTH_DIR, MASK_DIR, stream_resize
+from ..common import (DEPTH_DIR, MASK_DIR, camera_points, context_keyframes, gauge_scale,
+                      stream_resize, transform_points)
 
 from .config import aspect_lines
 
@@ -74,6 +75,8 @@ def training_split(kf, cfg):
 class SceneData:
     """One keyframe = one sample, placed FIRST so VGGT predicts in that keyframe's frame.
 
+    sample() returns a 6-tuple; online/target.py:sample returns the same one and they must agree.
+
     Around it, a random number of neighbouring non-keyframes, so the adapter works both monocular
     (the way prior_extractor calls it) and with context.
     """
@@ -93,6 +96,10 @@ class SceneData:
         # self.kf stays the WHOLE export: t_min/t_max and the recorded split_at are about the
         # extract window, not about which of its keyframes this run happens to train on
         self.kf = [int(t) for t in np.loadtxt(f'{scene_dir}/poses_slam.txt')[:, 0]]
+        # frame number -> its POSITION in the keyframe list, which is what context_keyframes
+        # counts in. The online path indexes the video buffer, where a slot IS a keyframe; here
+        # keyframes are frame numbers and the list has to supply the mapping.
+        self._kf_pos = {t: i for i, t in enumerate(self.kf)}
         self.train_kf, self.val_kf = training_split(self.kf, cfg)
 
         # intrinsics: stored at the tracker's resolution, rescale to the VGGT input size
@@ -117,13 +124,39 @@ class SceneData:
                          interpolation=cv2.INTER_AREA)
         return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
-    def kf_target(self, t):
+    def _depth(self, t):
+        """One keyframe's DENSE depth at VGGT's input size - no mask. Shared with gauge()."""
         d = np.load(f'{self.scene_dir}/{self.ddir}/{t:06d}.npy')
+        return cv2.resize(d, (self.hw[1], self.hw[0]), interpolation=cv2.INTER_NEAREST)
+
+    def kf_target(self, t):
+        d = self._depth(t)
         m = cv2.imread(f'{self.scene_dir}/{self.mdir}/{t:06d}.png', cv2.IMREAD_GRAYSCALE) > 127
-        d = cv2.resize(d, (self.hw[1], self.hw[0]), interpolation=cv2.INTER_NEAREST)
         m = cv2.resize(m.astype(np.uint8), (self.hw[1], self.hw[0]),
                        interpolation=cv2.INTER_NEAREST) > 0
         return torch.from_numpy(d).float(), torch.from_numpy(m & (d > 0))
+
+    def gauge(self, seq):
+        """The sample's normalization scale (common.py:gauge_scale), or None to skip the sample.
+
+        The online twin is online/target.py:_gauge and the two must agree; read its docstring for
+        why the footprint is every valid-depth pixel and NOT the supervision mask.
+
+        Only KEYFRAMES contribute: at context_kf 0 the old neighbour sampler can put arbitrary
+        non-keyframes in `seq`, and those have no depth_slam file at all. The target is always a
+        keyframe, so the list is never empty.
+        """
+        kfs = [x for x in seq if x in self._kf_pos]
+        X = [camera_points(self._depth(kfs[0]), self.K)]
+        if len(kfs) > 1:
+            t_from_w = np.linalg.inv(self.c2w[kfs[0]])
+            for x in kfs[1:]:
+                X.append(transform_points(camera_points(self._depth(x), self.K),
+                                          t_from_w @ self.c2w[x]))
+        X = np.concatenate(X) if len(X) > 1 else X[0]
+        if len(X) < self.cfg.gauge_min_pixels:
+            return None
+        return gauge_scale(X, self.cfg.gauge_clamp)
 
     def neighbours(self, t, rng, n_left, n_right):
         """Random non-keyframe neighbours within radius; edge keyframes take from the other side."""
@@ -140,18 +173,52 @@ class SceneData:
             list(rng.choice(right, n_right, replace=False))
         return sorted(int(x) for x in picks)
 
+    def context(self, t):
+        """The `context_kf` keyframes before `t`, ascending - the ONLINE mechanism (common.py).
+
+        Positions are taken in the FULL exported keyframe list, never in the kf_fraction
+        selection. At serving time end2end/prior.py:context_stack hands VGGT the keyframes the
+        tracker has most recently made, and those are consecutive in the map whatever this run
+        chose to train on; selecting context from the thinned list would fit a spacing that is
+        never served - the exact train/serve mismatch context_kf exists to remove.
+
+        Near the head of the sequence fewer than `context_kf` exist and the sequence is short, the
+        same way the online path's first keyframes are served short.
+        """
+        if t not in self._kf_pos:
+            raise KeyError(f'frame {t} is not an exported keyframe of {self.scene_dir}, so it has '
+                           f'no keyframe context; sample() is only called on keyframes')
+        return [self.kf[j] for j in context_keyframes(self._kf_pos[t], self.cfg.context_kf,
+                                                      self.cfg.context_stride)]
+
     def sample(self, rng, t=None, single=None):
         from vggt.utils.pose_enc import extri_intri_to_pose_encoding
         cfg = self.cfg
         t = int(rng.choice(self.train_kf)) if t is None else t
-        if single is None:
-            single = rng.random() < cfg.p_single_view
-        nb = [] if single else self.neighbours(t, rng, rng.integers(1, cfg.max_left + 1),
-                                               rng.integers(1, cfg.max_right + 1))
+        if cfg.context_kf:
+            # context_kf GOVERNS and `single` is not read: config.py refuses context_kf > 0
+            # together with p_single_view < 1, so the neighbour sampler is already off. That also
+            # makes eval_depth's single=True evaluate in the regime that is served, rather than
+            # reporting a monocular number for a model only ever asked for context predictions.
+            nb = self.context(t)
+        else:
+            if single is None:
+                single = rng.random() < cfg.p_single_view
+            nb = [] if single else self.neighbours(t, rng, rng.integers(1, cfg.max_left + 1),
+                                                   rng.integers(1, cfg.max_right + 1))
         seq = [t] + nb
 
         images = torch.stack([self.frame(x) for x in seq])
         gt_depth, mask = self.kf_target(t)
+        # normalize_target (config.py): the target carries its own gauge, so the loss stops
+        # re-fitting one. A sample with no usable gauge is SKIPPED - zeroing the mask is how
+        # depth_loss's min_mask_pixels branch already spells 'no depth gradient here'.
+        gauge = self.gauge(seq) if cfg.normalize_target else None
+        if cfg.normalize_target:
+            if gauge is None or not gauge > 0:
+                mask = torch.zeros_like(mask)
+            else:
+                gt_depth = gt_depth / gauge
 
         # rebase every pose so the keyframe is the world origin -> frame 0 is identity
         kf_c2w = self.c2w[t]
@@ -160,4 +227,10 @@ class SceneData:
         gt_enc = extri_intri_to_pose_encoding(
             torch.from_numpy(extr).float()[None], torch.from_numpy(K.copy()).float()[None],
             image_size_hw=self.hw)[0]
-        return images, gt_depth, mask, gt_enc, seq
+        # gauge_pose: translations into the depth target's gauge, VGGT-style. The online twin is
+        # online/target.py:sample and the two must agree. Dims 3:7 (quaternion) and 7:9 (FoV) are
+        # scale-free and untouched.
+        if cfg.gauge_pose and len(seq) > 1 and gauge:
+            gt_enc = gt_enc.clone()
+            gt_enc[:, :3] = gt_enc[:, :3] / gauge
+        return images, gt_depth, mask, gt_enc, seq, gauge

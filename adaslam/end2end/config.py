@@ -41,10 +41,22 @@ _CKPT_PREFIX = 'epoch_'
 # the spec - a transformed arm must name a different directory than its untransformed parent or
 # the two would silently overwrite each other, which is the trap 9.3 exists to prevent.
 #
+#   @ctx<N>      VGGT is fed the arriving frame + the N most recent KEYFRAMES
+#                                                                 prior.py:context_stack
 #   @ceil<tag>   depth <- min(depth, tag x frame median)          prior.py:ceil_clamp
 #   @soft<tag>   depth <- 1/hypot(1/depth, median(1/depth)/tag)   prior.py:soft_saturate
 #   @ped<tag>    depth <- 1/(1/depth + median(1/depth)/tag)       prior.py:pedestal_shift
 #   @mask<tag>   depth <- 0 where depth > tag x frame median      prior.py:mask_far
+#
+# @ctx IS THE ODD ONE OUT AND IS NOT A MEMBER OF THE FAMILY BELOW. The other four are served
+# transforms: they post-process the depth another prior produced, which is why they are objects
+# wrapping an extractor (prior.py:_ServedTransform) and why they compose in an order. @ctx
+# changes the model's INPUT - the sequence VGGT aggregates over - so it is consumed at
+# CONSTRUCTION (stage.py:make_prior passes it to VggtPrior) and its tag is an integer frame
+# count, never a 'p'-decimal ratio. It exists so a frozen replay of an adapter trained with
+# context serves with that same context: predicting monocular from a model adapted multi-frame
+# is exactly the train/serve mismatch that made OnlineConfig.context_kf useless (13.2). It is
+# meaningless on 'omnidata' - upstream's prior is single-image - and make_prior refuses it there.
 #
 # THE TAGS ARE NOT ALL THE SAME UNIT and must not be read against each other - see
 # pedestal_shift's docstring. @ceil, @soft and @mask all bound the served depth at `tag` x the
@@ -63,13 +75,34 @@ _MOD_RES = {'ceil': re.compile(r'^ceil(\d+(?:p\d+)?)$'),
             'soft': re.compile(r'^soft(\d+(?:p\d+)?)$'),
             'ped': re.compile(r'^ped(\d+(?:p\d+)?)$'),
             'mask': re.compile(r'^mask(\d+(?:p\d+)?)$')}
+# an integer count, not a ratio - no 'p'-decimal branch, so '@ctx1p5' simply does not parse.
+# The optional 's<K>' tail is the STRIDE: '@ctx2' is two consecutive keyframes, '@ctx2s5' is two
+# taken five keyframes apart. It has to be part of the spec because an adapter trained at one
+# stride and replayed at another is served a sequence it never saw (common.py:context_keyframes).
+_CTX_RE = re.compile(r'^ctx(\d+)(?:s(\d+))?$')
+_ALL_RES = {'ctx': _CTX_RE, **_MOD_RES}
+
+# Modifiers that change how the prior is GENERATED rather than the depth it serves. They carry an
+# integer, are consumed at construction, and never reach wrap_mods - which is why MOD_ORDER stays
+# exactly the served chain and prior.py's `set(_MOD_PRIORS) == set(MOD_ORDER)` assert is untouched.
+INPUT_MODS = ('ctx',)
 # ceil/soft/ped compress the tail, so they go first and in decreasing sharpness; mask is last
 # because it deletes pixels and must threshold whatever the chain before it produced.
 MOD_ORDER = ('ceil', 'soft', 'ped', 'mask')
+# The one legal spelling order for a stacked spec, input modifiers first because they act first:
+# 'vggt_base@ctx2@ceil1p5' is generated with context, then served through the ceiling.
+SPEC_ORDER = INPUT_MODS + MOD_ORDER
 
 
 def ceil_tag(ratio):
-    """The directory-safe spelling of a modifier ratio: 2.0 -> '2', 1.5 -> '1p5'."""
+    """The directory-safe spelling of a modifier value: 2.0 -> '2', 1.5 -> '1p5'.
+
+    An INPUT modifier carries a tuple rather than a ratio - @ctx's (count, stride) - and spells it
+    '2' at stride 1 and '2s5' otherwise, so an arm that never strided keeps the name it had.
+    """
+    if isinstance(ratio, tuple):
+        n, stride = ratio
+        return f'{n:g}' + (f's{stride:g}' if stride != 1 else '')
     return f'{ratio:g}'.replace('.', 'p')
 
 
@@ -89,12 +122,30 @@ def split_mods(spec):
         head, sep, tail = s.rpartition('@')
         if not sep:
             break
-        hit = next(((k, rx.match(tail)) for k, rx in _MOD_RES.items() if rx.match(tail)), None)
+        hit = next(((k, rx.match(tail)) for k, rx in _ALL_RES.items() if rx.match(tail)), None)
         if hit is None:
             break
         kind, m = hit
         if kind in found:
-            raise ValueError(f'{spec!r} carries two @{kind} modifiers; one arm has one ratio')
+            raise ValueError(f'{spec!r} carries two @{kind} modifiers; one arm has one value')
+        if kind in INPUT_MODS:
+            # an integer FRAME COUNT, not a ratio, so none of the unit reasoning below applies.
+            # @ctx0 is refused for the reason @ceil1 is: it names its own arm directory while
+            # doing nothing, so the two arms would be silent duplicates of each other.
+            value = int(m.group(1))
+            if value < 1:
+                raise ValueError(f'{spec!r}: a @{kind} count must be >= 1 - at {value} the prior '
+                                 f'is monocular and this arm is a duplicate of {head!r} under a '
+                                 f'name that says otherwise')
+            stride = int(m.group(2)) if m.lastindex and m.group(2) else 1
+            if stride < 1:
+                raise ValueError(f'{spec!r}: a @{kind} stride must be >= 1 (omit it for '
+                                 f'consecutive keyframes)')
+            value = (value, stride)
+            found[kind] = value
+            stripped.append(kind)
+            s = head
+            continue
         ratio = float(m.group(1).replace('p', '.'))
         # THE FLOORS DIFFER BECAUSE THE TAGS ARE NOT ALL IN THE SAME UNITS (pedestal_shift's
         # docstring). A ceiling at or below 1.0 clamps at the median itself and is degenerate,
@@ -122,7 +173,7 @@ def split_mods(spec):
         stripped.append(kind)
         s = head
     written = list(reversed(stripped))
-    expect = [k for k in MOD_ORDER if k in found]
+    expect = [k for k in SPEC_ORDER if k in found]
     if written != expect:
         raise ValueError(f'{spec!r}: modifiers do not commute, so they have one spelling - write '
                          f'them as {"@".join([""] + expect)[1:]!r} order, i.e. '
@@ -146,6 +197,7 @@ def arm_name(spec):
         .../lr1e4/checkpoints/epoch_005 -> lr1e4_chkp_005
         'omnidata@ceil2' -> omni_ceil2   .../lr1e4@ceil1p5 -> lr1e4_ceil1p5
         'vggt_base@ped1p3' -> base_ped1p3   'vggt_base@ceil1p5@ped2' -> base_ceil1p5_ped2
+        'vggt_base@ctx2' -> base_ctx2       'vggt_base@ctx2@ceil1p5' -> base_ctx2_ceil1p5
 
     Inferring is what makes an arm reusable: one adapter always scores into one directory.
     """
@@ -161,7 +213,7 @@ def arm_name(spec):
             name = f'{adapter}_chkp_{epoch}'
         else:
             name = tail
-    return name + ''.join(f'_{k}{ceil_tag(mods[k])}' for k in MOD_ORDER if k in mods)
+    return name + ''.join(f'_{k}{ceil_tag(mods[k])}' for k in SPEC_ORDER if k in mods)
 
 
 def adapter_path(spec):

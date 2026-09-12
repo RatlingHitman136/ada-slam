@@ -29,6 +29,15 @@ class TrackFrontend:
         self.video.mono_depth_alpha = config["mono_depth_alpha"]
         # optional, .get so every config that predates it keeps upstream's flat alpha
         self.video.mono_depth_far_gain = config.get("mono_depth_far_gain", 1.0)
+        # THE PRIOR-FREE CONTROL. False skips every JDSA call, leaving upstream DROID exactly:
+        # depth_video.py:244 runs droid_backends.ba() unconditionally and JDSA is an ADDITIONAL
+        # refinement gated on use_mono, so turning it off subtracts the prior rather than breaking
+        # the solver. mono_depth_alpha=0 would NOT do this - geom/ba.py:227 has alpha REPLACE the
+        # network's damping eta wherever the prior is valid, so at 0 those pixels lose their
+        # diagonal entirely and the dscales blocks (all proportional to alpha) become a singular
+        # system. The prior still fills disps_prior and seeds dscales here, and both go unread:
+        # disps are initialised from the previous keyframe's mean (below), never from the prior.
+        self.mono_depth_enable = config.get("mono_depth_enable", True)
 
     def __update(self, is_last):
         """ add edges, perform update """
@@ -46,7 +55,8 @@ class TrackFrontend:
         # 2), plus use_mono=True on the iters2 loop below, which upstream leaves prior-free. The
         # pair measured -0.02 m ATE on omni and -0.30 m on vggt_base - see depth_video.py.
         for itr in range(self.iters1):
-            self.graph.update(None, None, use_inactive=True, use_mono=itr>1)
+            self.graph.update(None, None, use_inactive=True,
+                              use_mono=(itr > 1) and self.mono_depth_enable)
 
         d = self.video.distance([self.t1-3], [self.t1-2], bidirectional=True)
         d_covis = self.video.distance_covis([self.t1-2])
@@ -95,7 +105,8 @@ class TrackFrontend:
         for i in range(self.t1):
             self.video.dscales[i] = self.video.disps[i].median() / self.video.disps_prior[i].median()
         for itr in range(8):
-            self.graph.update(1, use_inactive=True, use_mono=itr>2)
+            self.graph.update(1, use_inactive=True,
+                              use_mono=(itr > 2) and self.mono_depth_enable)
 
         # remove keyframes with too small motion
         while self.t1 > self.warmup-4:
@@ -110,7 +121,8 @@ class TrackFrontend:
         self.graph.rm_factors(self.graph.ii > -1)
         self.graph.add_proximity_factors(0, 0, rad=2, nms=2, thresh=self.frontend_thresh, remove=False)
         for itr in range(8):
-            self.graph.update(1, use_inactive=True, use_mono=itr>2)
+            self.graph.update(1, use_inactive=True,
+                              use_mono=(itr > 2) and self.mono_depth_enable)
         self.video.normalize()
 
         # initialization complete

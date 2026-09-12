@@ -88,10 +88,63 @@ class OnlineConfig:
     ped_ratio: Optional[float]
 
     # ---------------------------------------------------------------- sample construction
-    context_kf: int          # previous KEYFRAMES appended after the target. 0 = monocular and
-                             # depth-only; >0 also supervises poses from video.poses. Not
-                             # non-keyframes: those images are on Hi2, which the extractor cannot
-                             # reach.
+    # THE frames-per-forward knob, and it governs BOTH ends: S = 1 + context_kf for the
+    # training sample (target.py:sample) AND for the depth the prior serves
+    # (end2end/prior.py:context_stack). That is the whole point of the field - it used to control
+    # training alone while serving stayed monocular, so raising it trained the adapter in a regime
+    # it was never asked to predict in, which is why every run on disk carries 0.
+    # NOT non-keyframes: those images live on Hi2, which the extractor cannot reach.
+    # >0 also turns on the pose loss - lambda_pose below is unread at 0, where pose_loss returns
+    # zeros - so raising it changes two things at once unless lambda_pose is set to 0.0.
+    # MEASURED on a 4090 at vggt_hw 168x518 (KITTI), base VGGT-1B: the cost is nearly FLAT in
+    # S. Inference 93/92/103/90/111 ms at S=1..5, peak 4.56->4.62 GiB; one training step
+    # (forward+backward+AdamW, gradient checkpointing on) 392/387/398/401 ms at S=1..4,
+    # peak 6.19->6.48 GiB. A frame is only 12x37 = 444 patch tokens here, so the 48-block
+    # aggregator is launch-bound rather than attention-bound and the S^2 term never bites.
+    # Re-measure before assuming this holds at a larger vggt_hw.
+    context_kf: int          # 0 = monocular and depth-only, the pre-knob behaviour exactly
+    # Keyframes BETWEEN consecutive context frames (common.py:context_keyframes). 1 = the
+    # immediately preceding keyframes, which is what every run before this field did.
+    #
+    # WHY IT EXISTS. The ATE on this track is ~100% cumulative scale drift - corr(local-scale sd,
+    # ATE) = 0.997 at ~66 m per unit of sd - and that drift accrues at only -0.136% per keyframe.
+    # A stride-1 sample of 3 keyframes therefore contains -0.41% of scale change, and BOTH loss
+    # terms then remove it: depth_loss re-fits the scale inside the sample and pose_loss
+    # normalises each translation set by its own mean norm. So the objective is blind to the very
+    # quantity the arm is scored on. Striding widens the sample's baseline k-fold - stride 5
+    # carries ~1.4% and stride 10 ~2.7% - which is the cheapest way to put some of the drift where
+    # a loss can see it.
+    #
+    # The limit is visual overlap, not compute: at ~1.65 m per keyframe on KITTI 00, stride 5 is a
+    # ~16 m baseline and stride 10 ~33 m. Far past that the frames stop overlapping, VGGT's
+    # cross-frame attention has nothing to match and the pose target stops meaning anything.
+    context_stride: int      # 1 = consecutive, the pre-knob behaviour exactly
+    # TARGET NORMALIZATION (common.py:gauge_scale). True divides the target by the sample's own
+    # gauge - the mean point distance, clamped at gauge_clamp x its median, over every valid-depth
+    # pixel of every frame of the sample, in the target camera's frame - and makes depth_loss stop
+    # re-fitting a scale (scale=1.0). Two consequences, and the second is the point:
+    #   * the target lands in the gauge VGGT was PRETRAINED to emit, rather than in the tracker's
+    #     map units, which inflate ~1.97x across KITTI 00;
+    #   * the loss stops being scale-invariant, so for the first time the depth term carries
+    #     gradient about ABSOLUTE scale. Every previous attempt at the drift added a penalty on
+    #     top of the invariance instead of removing it, and all four landed at baseline.
+    # g/gauge(g) is exactly invariant to a global rescale of g, so the map's drift cancels by
+    # construction - no anchor, no window, no history.
+    normalize_target: bool
+    gauge_clamp: float       # clamp distances at this x the frame's MEDIAN distance before the
+                             # mean. Must be > 1. RELATIVE, never absolute: an absolute cut would
+                             # select a different physical set of pixels as the map inflated and
+                             # the rescale invariance above would break.
+    gauge_min_pixels: int    # below this many gauge pixels the sample is skipped rather than
+                             # divided by a statistic computed on nothing
+    # VGGT's own camera translation term (losses.py:pose_loss). True puts the ground-truth
+    # TRANSLATIONS in the same gauge as the depth target and compares them directly, instead of
+    # dividing each side by its own mean norm. That is what VGGT's training does - one avg_scale
+    # divides camera translations AND depth maps, and camera_loss_single then compares translations
+    # absolutely - and it is why VGGT needs no coupled_scale: scale agreement between the two heads
+    # is a property of the data, not a term in the loss. Requires normalize_target (there is no
+    # gauge otherwise) and lambda_pose > 0 (otherwise it computes something nothing reads).
+    gauge_pose: bool
     stream_res: int          # must equal SlamConfig.stream_res - the tracking pixel budget
 
     # ---------------------------------------------------------------- optimisation
@@ -100,6 +153,135 @@ class OnlineConfig:
     grad_clip: float
     lambda_pose: float       # unread at context_kf=0, where pose_loss returns zeros
     coupled_scale: bool      # True = the pose scale is reused by the depth loss
+    # Hold that pose scale FIXED for the whole unit instead of recomputing it every forward.
+    #
+    # THE FAULT IT FIXES. coupled_scale is the only mechanism that ever moved the ATE, because
+    # s_pose = |t_gt| / |t_pred| is built from camera MOTION rather than from the depths, so
+    # depth_loss stops being invariant to rescaling the prediction and is finally pinned to a
+    # metric that carries the tracker's drift. But recomputing it every forward makes the
+    # objective non-stationary: within a unit the target window is FIXED, yet
+    #
+    #     L_k(theta) = mean| g - s_k * p(theta) |,   s_k = s_pose(theta_k)
+    #
+    # minimises a DIFFERENT function at every step. That is a self-consistent-field iteration,
+    # not descent on one objective, and it converges only if theta -> s -> theta is contractive.
+    # Measured, it is not: last/BEST 1.114-1.167, i.e. the iterate ends worse than its own best
+    # point inside the unit, while the median_scale arms reach their minimum at the last step.
+    #
+    # Frozen, each keyframe's gauge is captured at its FIRST use in the unit and reused for the
+    # rest, so the within-unit problem is stationary and can actually be descended into - while
+    # the gauge still tracks the drift from unit to unit, which is where it has to move anyway
+    # because the targets move too. Costs nothing: the value is taken from the forward that was
+    # happening regardless, not from an extra pass.
+    #
+    # WHAT IT DOES NOT FIX. The coupling stays ONE-WAY. pose_loss returns s_pose detached
+    # (losses.py:56), so dL/dtheta drops the p * ds/dtheta term - the depth residual can chase the
+    # pose head's scale but never correct it. And l_trans normalises both translation sets by
+    # their own mean norms, so |t_pred| - whose reciprocal IS s_pose - is unsupervised. Undetaching
+    # without first anchoring that magnitude would let the depth loss shrink the translations to
+    # cut its residual, the degenerate direction median_scale's docstring warns about.
+    freeze_gauge: bool       # False = recompute every forward, the behaviour of every run so far
+    # ONE depth scale fitted over the WHOLE batch, instead of one per sample.
+    #
+    # WHY. depth_loss aligns scale INSIDE each sample before measuring the residual - verified
+    # bit-identical under a global rescale of the prediction - so disagreement BETWEEN keyframes
+    # costs the objective nothing. But the ATE is ~100% cumulative scale drift (corr(local-scale
+    # sd, ATE) = 0.997 within a seed triplet), i.e. exactly that disagreement. The objective has
+    # been blind to the quantity it is scored on.
+    #
+    # Fitting one scale across the batch puts the disagreement in the residual. At batch_size 10
+    # the batch IS the wonline window, so it spans 10 keyframes (~16 m on KITTI 00) carrying ~1.4%
+    # of the sequence's drift. Below batch_size 2 it does nothing and is ignored.
+    #
+    # The scale is DETACHED and fixed for the step, like coupled_scale's pose_scale - but unlike
+    # that one it does not move under the optimiser, which is what broke convergence there
+    # (measured: coupled_scale runs sit 6-7x higher and never reach their minimum at the last
+    # step, while median_scale runs do).
+    #
+    # COSTS ONE EXTRA FORWARD PER SAMPLE: the scale has to be known before the graph is built, so
+    # a no-grad pass over the batch precedes the gradient pass. Roughly 2x the step time.
+    #
+    # Mutually exclusive with coupled_scale - they are two different answers to "which gauge", and
+    # silently letting one win would be the kind of unstated choice 9.5's rule 1 exists to stop.
+    batch_scale: bool
+    # SCALE-CONSISTENCY penalty: lambda_cons * (log s_i - mean_j log s_j)^2 per sample, where s_i
+    # is that sample's own undetached median_scale. 0 = off.
+    #
+    # WHY THIS RATHER THAN batch_scale. Both aim at the same thing - making cross-keyframe scale
+    # disagreement cost something - but batch_scale does it by REPLACING the gauge with a detached
+    # pooled one, and that removes the exact cancellation that pins the prediction's overall
+    # scale. Measured consequence: the gauge walked smoothly over ~7 orders of magnitude
+    # (0.0004 .. 3281, lag-1 autocorrelation of its log +0.999), i.e. the network's own output
+    # scale wandered while the gauge absorbed it. Since the served prior is predict_depth's RAW
+    # output - nothing rescales it at serve time - that is manufactured scale drift, and scale
+    # drift is ~100% of the ATE here.
+    #
+    # This term leaves depth_loss alone. Each sample keeps its own undetached median_scale, so the
+    # invariance and its exactly-zero gradient along "make everything bigger" survive, and the
+    # penalty is a SEPARATE bounded term. Var of LOG scales is itself invariant to a global
+    # rescale (shifting every log s_i equally leaves it unchanged), so it charges only RELATIVE
+    # disagreement between keyframes - the drift - and cannot be reduced by moving the overall
+    # scale. It cannot blow up the effective step size either, unlike a gauge that multiplies the
+    # residual.
+    #
+    # The anchor mean_j log s_j is DETACHED and comes from a no-grad pass over the batch, so the
+    # gradient pulls each scale toward the batch consensus rather than chasing a moving mean. That
+    # costs one extra forward per sample, as batch_scale did.
+    #
+    # Needs batch_size >= 2 (one sample has nothing to be consistent WITH), and is refused
+    # together with batch_scale - running both would be two answers to one question again.
+    lambda_cons: float
+    # Supervise depth on EVERY frame of the sample, under ONE shared scale, instead of on the
+    # target frame alone.
+    #
+    # WHY. LoRAVGGT.forward runs the DPT head on frame 0 only, so a sample has always supervised
+    # one keyframe however much context it carried - which is why widening the context stride
+    # bought nothing: the depth term never saw more than one frame, and the only channel that
+    # widened was one scalar in the pose term. With this on, the head runs on all S frames,
+    # kf_target returns a target per frame, and depth_loss receives stacked (S,H,W) tensors.
+    #
+    # THE POINT IS THE SHARED SCALE, and it comes for free. median_scale pools the medians over
+    # whatever tensor it is given, so a stacked sample gets ONE scale for the whole sequence -
+    # meaning a keyframe whose scale has walked away from the others now carries a residual. That
+    # is the drift the ATE measures (corr(local-scale sd, ATE) = 0.977) and the exact quantity a
+    # per-sample gauge is blind to.
+    #
+    # AND IT NEEDS NO DETACHING, which is what killed batch_scale. median_scale stays a function
+    # of the prediction, so the loss remains exactly invariant to rescaling ALL frames together -
+    # only RELATIVE disagreement between them is charged. The output scale stays anchored.
+    #
+    # ONLINE ONLY. The offline stage cannot do this: SceneData draws its context from NON-keyframe
+    # neighbours, which have no depth_slam/ or mask_slam/ entry at all. Serving is unchanged too -
+    # predict_depth stays frame-0, which is all an arriving keyframe needs.
+    #
+    # COSTS the depth head on S frames instead of 1, forward and backward. The aggregator, which
+    # dominates, is unchanged.
+    depth_all_frames: bool
+    # Keyframes from the START of the sequence that lambda_cons measures against, instead of the
+    # current batch. 0 = the batch-derived reference, which is what every run so far used.
+    #
+    # WHY. Every attempt to put drift into the loss failed for one quantitative reason - the
+    # horizon was too short. A 2-keyframe sample spans 0.27% of scale change and a 10-keyframe
+    # window 1.36%, against a depth residual of ~1.9%: the signal sat BELOW the floor of the thing
+    # measuring it. Meanwhile dscale - JDSA's own prior-vs-tracker ratio - falls 0.74 -> 0.32 over
+    # the run, a log spread of ~0.83, some 60x larger than a window can see. Comparing against
+    # keyframes from the beginning finally spans the accumulated drift.
+    #
+    # NO CO-VISIBILITY IS NEEDED, which is what makes this different from putting an anchor in
+    # VGGT's input. Each keyframe gets its own forward with its own context; only the resulting
+    # SCALES are compared. An anchor 400 keyframes back is ~660 m away on this scene, and the
+    # measured context influence already collapses past ~33 m - so an anchor VGGT had to LOOK at
+    # would be two unrelated images, while an anchor it is merely scored against is fine.
+    #
+    # The set is chosen ONCE, the first unit with enough history, and held for the run - a literal
+    # anchor to the original gauge. It is stored as frame TIMESTAMPS, not slot indices:
+    # track_frontend.py:52 prunes a keyframe and decrements counter, shifting every index after it,
+    # so cached slots would silently re-point at different frames. Same reasoning as the unit
+    # de-dup.
+    #
+    # Costs anchor_kf extra no-grad forwards per UNIT (not per step) - about 8% at anchor_kf 4
+    # against 50 gradient forwards.
+    anchor_kf: int
     min_mask_pixels: int     # below this a sample contributes no depth gradient
     seed: int
     log_every: int           # steps between log lines; 1 = every step
@@ -180,6 +362,125 @@ class OnlineConfig:
                              f'at 1.0 is a real transform (14.9)')
         if self.context_kf < 0:
             raise ValueError(f'context_kf={self.context_kf} must be >= 0')
+        if self.gauge_clamp <= 1.0:
+            raise ValueError(f'gauge_clamp={self.gauge_clamp} must be > 1: it clamps distances at '
+                             f'that multiple of the frame MEDIAN, so <= 1 would clip at least '
+                             f'half of every frame and the statistic would stop tracking the '
+                             f'scene. 2.0 is the measured choice.')
+        if self.gauge_min_pixels < 1:
+            raise ValueError(f'gauge_min_pixels={self.gauge_min_pixels} must be >= 1')
+        if self.gauge_pose and not self.normalize_target:
+            raise ValueError('gauge_pose=True needs normalize_target=True: it puts the ground-truth '
+                             'translations in the DEPTH TARGET\'s gauge, and without '
+                             'normalize_target there is no such gauge to put them in.')
+        if self.gauge_pose and self.lambda_pose <= 0.0:
+            raise ValueError(f'gauge_pose=True with lambda_pose={self.lambda_pose} changes how a '
+                             f'term that is weighted to zero is computed. Set lambda_pose > 0, or '
+                             f'gauge_pose False.')
+        # NOT GUARDED, deliberately: lambda_pose > 0 alongside normalize_target. An earlier
+        # version refused it, reasoning that the pose term carries a different gauge. Re-reading
+        # pose_loss, that is only half true - l_t divides EACH side by its own mean translation
+        # norm and l_r is quaternions, so both are scale-free and neither conflicts with a
+        # normalized depth target. The only scale-carrying output is pose_scale, and that is
+        # consumed solely under coupled_scale, which IS refused below. Forbidding lambda_pose as
+        # well cost 2.35 m at ctx2 (_ctx2 12.881 vs _ctx2_cscale 15.231) for no principled reason.
+        #
+        # WHAT DOES CHANGE IS THE RELATIVE WEIGHT, and it is worth knowing before reusing a value
+        # from the pre-gauge sweep. Measured on the ctx2 arms, normalize_target leaves l_depth
+        # ~7.2x smaller in VALUE (0.0098 vs 0.0712) and roughly 2.8x smaller in SUBGRADIENT, since
+        # the old loss multiplied the prediction by a fitted s ~ 2.8 that this one does not. So a
+        # given lambda_pose bites harder here; the sweep's old optimum needs re-deriving rather
+        # than inheriting. (And per the campaign's own lambda_pose lesson, the LOSS ratio is a poor
+        # proxy for the gradient ratio - a term 192x smaller in loss was only 8.3x smaller in
+        # gradient - so neither number above should be used as a rescaling factor on its own.)
+        if self.normalize_target and self.coupled_scale:
+            raise ValueError(
+                'normalize_target=True with coupled_scale=True asks for two gauges at once: the '
+                'target already carries one, and coupled_scale would have depth_loss re-fit the '
+                "pose head's instead, dividing out the quantity being supervised. This is the "
+                'real conflict between the gauge and the pose head; lambda_pose itself is fine, '
+                'because pose_loss normalises each translation set by its own mean norm and is '
+                'scale-free. Set coupled_scale False.')
+        # Everything below is another answer to "which gauge", and normalize_target has already
+        # answered it. Running either together would be two answers to one question - the same
+        # class of silent conflict batch_scale/coupled_scale is already refused for.
+        for name in ('batch_scale', 'freeze_gauge'):
+            if self.normalize_target and getattr(self, name):
+                raise ValueError(f'normalize_target=True with {name}=True sets the depth gauge '
+                                 f'twice. The target already carries it; turn {name} off.')
+        for name in ('lambda_cons', 'anchor_kf'):
+            if self.normalize_target and getattr(self, name) > 0:
+                raise ValueError(
+                    f'normalize_target=True with {name}={getattr(self, name)}: {name} penalises '
+                    f'scale INCONSISTENCY on top of a scale-invariant loss, which normalize_target '
+                    f'removes outright. Set {name} to 0.')
+        # gate_lo/gate_hi are thresholds on the depth loss itself, and normalize_target changes
+        # what that loss measures - a threshold tuned in map units would gate on nothing meaningful
+        if self.normalize_target and (self.gate_lo or self.gate_hi):
+            raise ValueError(
+                f'normalize_target=True with gate_lo={self.gate_lo}/gate_hi={self.gate_hi}: the '
+                f'gate thresholds the depth loss, and normalizing the target changes that loss\'s '
+                f'units, so a threshold chosen before this change no longer means anything. Set '
+                f'both to 0, or re-derive them from a normalized run first.')
+        if self.freeze_gauge and not self.coupled_scale:
+            raise ValueError('freeze_gauge=True with coupled_scale=False does nothing: there is '
+                             'no pose gauge to hold fixed, because depth_loss fits its own '
+                             'median_scale per sample and that is already stationary within a '
+                             'unit. Turn coupled_scale on, or set freeze_gauge False.')
+        if self.depth_all_frames and self.context_kf < 1:
+            raise ValueError(f'depth_all_frames=True at context_kf={self.context_kf} does '
+                             f'nothing: the sample is one frame, so "all frames" is that frame '
+                             f'and the shared scale is the per-sample scale. Raise context_kf.')
+        if self.depth_all_frames and self.batch_scale:
+            raise ValueError('depth_all_frames and batch_scale are the same idea at two '
+                             'granularities - one pooled gauge within a sample, versus one across '
+                             'the batch. batch_scale reaches it by DETACHING a pooled scale, '
+                             'which let the served output walk over seven orders of magnitude; '
+                             'depth_all_frames gets it from median_scale undetached. Pick one.')
+        if self.depth_all_frames and self.lambda_cons > 0:
+            raise ValueError('lambda_cons penalises the spread of PER-SAMPLE scales, and under '
+                             'depth_all_frames a sample no longer has one - it has a single '
+                             'pooled scale over its S frames. The two cannot both be defined on '
+                             'the same quantity; set lambda_cons to 0.')
+        if self.lambda_cons < 0:
+            raise ValueError(f'lambda_cons={self.lambda_cons} must be >= 0 (0 = off)')
+        if self.lambda_cons > 0 and self.batch_scale:
+            raise ValueError('lambda_cons and batch_scale are two different attacks on the same '
+                             'problem - a separate bounded penalty, versus replacing the gauge. '
+                             'batch_scale is the one with evidence against it (the served scale '
+                             'walked over 7 orders of magnitude). Pick one.')
+        if self.lambda_cons > 0 and self.coupled_scale:
+            raise ValueError('lambda_cons>0 needs coupled_scale=False. The penalty is on the '
+                             "sample's OWN median_scale, which depth_loss only returns when it "
+                             'fitted one; under coupled_scale it returns the pose scale, which is '
+                             'DETACHED (losses.py:56), so the term would be a constant with no '
+                             'gradient - a knob that silently does nothing.')
+        if self.anchor_kf < 0:
+            raise ValueError(f'anchor_kf={self.anchor_kf} must be >= 0 (0 = the reference comes '
+                             f'from the batch, as it did before this field existed)')
+        if self.anchor_kf > 0 and self.lambda_cons <= 0:
+            raise ValueError(f'anchor_kf={self.anchor_kf} with lambda_cons=0 computes a reference '
+                             f'scale that nothing then uses. Set lambda_cons above 0, or '
+                             f'anchor_kf to 0.')
+        # the reference needs SOMETHING to be consistent with - either two samples in the batch,
+        # or two anchors from history. Before anchor_kf existed only the first was possible.
+        if self.lambda_cons > 0 and self.batch_size < 2 and self.anchor_kf < 2:
+            raise ValueError(f'lambda_cons>0 at batch_size={self.batch_size} and '
+                             f'anchor_kf={self.anchor_kf}: one sample per step and no history '
+                             f'anchor means there is no other scale to be consistent with. Raise '
+                             f'batch_size, or set anchor_kf >= 2.')
+        if self.batch_scale and self.coupled_scale:
+            raise ValueError('batch_scale and coupled_scale are both True, and they are two '
+                             'different gauges for the same residual: batch_scale fits one scale '
+                             'over the batch, coupled_scale takes the pose head\'s. Choose one - '
+                             'coupled_scale=False is the one with evidence behind it.')
+        if self.batch_scale and self.batch_size < 2:
+            raise ValueError(f'batch_scale=True at batch_size={self.batch_size} does nothing: one '
+                             f'sample per step means the shared scale IS the per-sample scale. '
+                             f'Raise batch_size (10 = the whole wonline window) or set it False.')
+        if self.context_stride < 1:
+            raise ValueError(f'context_stride={self.context_stride} must be >= 1 (1 = consecutive '
+                             f'keyframes, the behaviour before this field existed)')
         if self.steps_per_kf < 0:
             raise ValueError(f'steps_per_kf={self.steps_per_kf} must be >= 0 (0 = never step, the '
                              f'null-op arm)')

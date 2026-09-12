@@ -45,7 +45,12 @@ class OnlineVggtPrior(VggtPrior):
         rng_cpu, rng_cuda = torch.get_rng_state(), torch.cuda.get_rng_state_all()
         torch.manual_seed(online_cfg.seed)
         try:
-            super().__init__(cfg, adapter, stream_hw)
+            # context_kf reaches the PARENT because serving is the parent's job: it is the one
+            # knob, and it now means "frames per VGGT forward" at both ends - the sample the
+            # trainer builds (target.py:sample) and the sequence the extractor predicts from
+            # (end2end/prior.py:context_stack) are the same shape by construction.
+            super().__init__(cfg, adapter, stream_hw, context_kf=online_cfg.context_kf,
+                             context_stride=online_cfg.context_stride)
         finally:
             torch.set_rng_state(rng_cpu)
             torch.cuda.set_rng_state_all(rng_cuda)
@@ -89,7 +94,13 @@ class OnlineVggtPrior(VggtPrior):
                 print(f"             ...but warmup_prior='self' makes the fallback the very model "
                       f'being adapted, so the split changes nothing here')
         print(f'             target = 1/disps_up of keyframe counter-1-{online_cfg.lag} '
-              f'(local BA, not global), context {online_cfg.context_kf} keyframes')
+              f'(local BA, not global), context {online_cfg.context_kf} keyframes at stride '
+              f'{online_cfg.context_stride}')
+        if online_cfg.context_kf:
+            print(f'             the SERVED forward carries the same {online_cfg.context_kf} '
+                  f'keyframes, so adapting and serving see one sequence shape (S='
+                  f'{1 + online_cfg.context_kf}); monocular during terminate(), where the '
+                  f'arriving keyframe is inserted mid-sequence (end2end/prior.py:context_stack)')
 
     def extractor(self):
         """The parent's extractor with the warm-up branch and the adaptation step around it.

@@ -1,0 +1,55 @@
+inherit_from: config/kitti_fg2_a05_config.yaml   # ONE knob differs: the prior is switched off
+
+# THE PRIOR-FREE CONTROL - pure DROID, to find out where the staircase comes from.
+#
+# WHAT IT ANSWERS. Local Sim(3) scale on KITTI 00 f0-1000 falls as a STAIRCASE, not a ramp: six
+# steps carry ~64% of the total drift in ~18% of the frames, and every one of them sits on a
+# corner (heading rate 2.69x inside the step windows; 8.57x more rotation per metre of keyframe
+# baseline). Two readings are possible and this arm separates them:
+#   * the geometric front end injects the steps and the prior merely modulates them, OR
+#   * the prior injects them and the front end would not step on its own.
+# If the staircase survives with the same sign and roughly the same step sizes it is the front
+# end, and no amount of depth-prior work can touch it. If it flattens or flips, it is the prior.
+#
+# WHY mono_depth_enable AND NOT mono_depth_alpha: 0.0. They are NOT the same experiment, and the
+# second one is broken:
+#   * geom/ba.py:227 - `C = C + m*alpha*(Jd*Jd) + (1-m)*eta` - has alpha REPLACE the network's
+#     per-pixel damping wherever the prior is valid. At alpha 0 those pixels keep NO diagonal at
+#     all, which is neither DROID nor prior-free, just ill-conditioned.
+#   * the whole dscales block (Hs, Es, vs in JDSA) is multiplied by alpha, so at 0 it hands
+#     schur_solve_mono_prior a singular system.
+#   mono_depth_enable=False instead skips the JDSA call outright. depth_video.py:244 already runs
+#   droid_backends.ba() unconditionally and JDSA is an ADDITIONAL refinement gated on use_mono, so
+#   this SUBTRACTS the prior rather than damaging the solver. Upstream DROID is what is left.
+#
+# THE PRIOR DOES NOT LEAK IN ELSEWHERE, checked rather than assumed: new keyframes initialise
+# their disparity from the previous keyframe's mean (track_frontend.py:77) or a 4-keyframe mean
+# (:119), never from disps_prior. The prior only fills disps_prior (depth_video.py:84) and seeds
+# dscales (track_frontend.py:44, 96), and both go unread once JDSA is skipped. cuda_pgba, the
+# Sim3 pose-graph BA, never touches disps_prior at all.
+#
+# GAUGE FREEDOM IS FINE. Prior-free monocular reconstruction is up to an arbitrary global scale,
+# but lambda is the LOCAL Sim(3) scale divided by the GLOBAL one and both are fitted against GT,
+# so the unknown cancels exactly. Scoring uses Sim(3) alignment too (end2end/metrics.py:102), so
+# ATE stays comparable. Do not be alarmed if the raw trajectory comes out the wrong size.
+#
+# READ THE RESULT AGAINST THESE, all on the same scene and window. The step column is the one the
+# question turns on; note how little it moves across a 4x range in ATE:
+#
+#     arm         prior             ATE    lam sd    STEPS   plateaus
+#     gt_oracle   perfect depth    6.992    0.1242    0.383    -0.685
+#     base_ped1   bounded VGGT     3.788    0.0694    0.411    -0.411
+#     omni        Omnidata        11.403    0.1650    0.479    +0.127
+#     base        VGGT            15.627    0.2288    0.520    +0.296
+#     THIS ARM    none               ?         ?        ?         ?
+#
+#   steps land in 0.38-0.52  -> the front end owns them; prior work cannot reach them
+#   steps blow up            -> the prior was holding them down; its WEIGHT is the lever
+#   steps vanish             -> the prior was causing them (the surprising outcome)
+#
+# Even with PERFECT ground-truth depth the steps are still 0.383 against plain VGGT's 0.520, so
+# they are already close to prior-invariant at that end. This arm brackets the other end.
+
+Tracking:
+  frontend:
+    mono_depth_enable: false   # true (the default, and every other config) = JDSA as usual

@@ -94,6 +94,17 @@ adapt:
   max_left: 4
   max_right: 4
   radius: 8
+  context_kf: 0                       # 0 = monocular; > 0 = that many preceding KEYFRAMES
+  context_stride: 1                   # in the sample AND in the served sequence. Serve a
+                                      # context-trained adapter with '@ctx<N>' in
+                                      # END2END_PRIORS or it is replayed monocular
+  normalize_target: false             # true = divide the target by the sample's own gauge
+  gauge_clamp: 2.0                    # and stop depth_loss re-fitting a scale, so the loss
+  gauge_min_pixels: 256               # carries gradient about ABSOLUTE scale. Unread when
+  gauge_pose: false                   # gt TRANSLATIONS in the depth target's gauge, compared
+                                      # directly - VGGT's own camera term. Needs
+                                      # normalize_target and lambda_pose > 0
+                                      # normalize_target is false, but still validated
   adapt_style: wonline                # 'normal' epochs | 'online' per arrival | 'wonline' window
   epochs: 12
   batch_size: 2

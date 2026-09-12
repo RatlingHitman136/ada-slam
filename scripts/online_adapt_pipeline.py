@@ -166,13 +166,45 @@ ONLINE = P.over('online', OnlineConfig(
                                # Refused at ceil_ratio 1.0, where it would silently do nothing.
 
     # ---- sample construction ----
-    context_kf=0,              # previous KEYFRAMES appended after the target; 0 = monocular
+    context_kf=0,              # frames per VGGT forward minus one, for TRAINING and SERVING
+                               # both; 0 = monocular, the pre-knob behaviour exactly. Measured
+                               # nearly free at vggt_hw 168x518 (online/config.py), but it does
+                               # turn the pose loss on - see lambda_pose
+    context_stride=1,          # keyframes BETWEEN context frames; 1 = consecutive, the pre-knob
+                               # behaviour. >1 widens the sample's temporal baseline so some
+                               # cumulative scale drift lands inside it - see online/config.py
     stream_res=STREAM_RES,     # must equal SLAM.stream_res
 
     # ---- optimisation ----
     lr=1.2e-4,
+    gauge_pose=False,          # VGGT's own camera translation term: gt translations in the
+                               # DEPTH target's gauge, compared directly (losses.py)
+    normalize_target=False,    # true = the target carries its own gauge and depth_loss
+    gauge_clamp=2.0,           # stops re-fitting a scale (common.py:gauge_scale); the
+    gauge_min_pixels=256,      # only setting under which absolute scale gets gradient
     weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
-    coupled_scale=True, min_mask_pixels=16, seed=0,
+    coupled_scale=True,        # True = the depth loss is gauged by the pose head's scale
+    freeze_gauge=False,        # True = hold that gauge fixed for the whole unit instead of
+                               # recomputing it every forward, which is what makes the within-unit
+                               # objective non-stationary. Needs coupled_scale - see
+                               # online/config.py
+    anchor_kf=0,               # keyframes from the START of the sequence that lambda_cons
+                               # measures against, instead of the current batch. 0 = the
+                               # batch-derived reference every run so far used. Needs
+                               # lambda_cons > 0 - see online/config.py
+    depth_all_frames=False,    # True = supervise depth on EVERY frame of the sample under ONE
+                               # shared scale, so cross-keyframe scale disagreement enters the
+                               # residual. Needs context_kf >= 1; refused with batch_scale and
+                               # with lambda_cons - see online/config.py
+    lambda_cons=0.0,           # scale-CONSISTENCY penalty: pulls each sample's own scale
+                               # toward the batch consensus, so cross-keyframe disagreement (the
+                               # drift the ATE measures) costs something. 0 = off. Needs
+                               # batch_size >= 2; refused together with batch_scale
+    batch_scale=False,         # True = ONE scale over the whole batch instead of one per sample,
+                               # so cross-keyframe scale disagreement enters the residual. Refused
+                               # together with coupled_scale, and needs batch_size >= 2. Costs one
+                               # extra no-grad forward per sample - see online/config.py
+    min_mask_pixels=16, seed=0,
     log_every=5,               # every step: there are only steps_per_kf of them per keyframe
 
     # ---- supervision mask (the same knobs ExtractConfig uses for depth_slam/) ----

@@ -77,16 +77,41 @@ class LoRAVGGT:
         if self.released:
             raise RuntimeError('this LoRAVGGT was release()d; construct a new instance')
 
-    def forward(self, images):
-        """Aggregator once; depth head on frame 0 only; camera head on everything."""
+    def forward(self, images, all_frames=False):
+        """Aggregator once; depth head on frame 0 or on ALL S; camera head on everything.
+
+        `all_frames=False` returns depth (H, W) for frame 0 and is the path every caller took
+        before this argument existed - offline adapt still needs it, because SceneData draws its
+        context from NON-keyframe neighbours which have no depth target on disk at all.
+
+        `all_frames=True` returns (S, H, W), one map per input frame, which the ONLINE stage can
+        supervise because its context frames are genuine keyframe slots with disps_up. Feeding
+        those stacked into depth_loss makes median_scale fit ONE scale across the whole sequence,
+        so scale DISAGREEMENT BETWEEN keyframes lands in the residual - the quantity the ATE
+        measures (14) and the one a per-sample gauge is exactly blind to.
+
+        Frame 0's depth is the SAME COMPUTATION either way - dpt_head.py:211 reshapes to
+        (B*S, ...) and runs the convolutions per frame, with no cross-frame operation anywhere in
+        the head, which is also why it can process frames in chunks. It is not bit-identical
+        though: batched convolutions select different kernels at N=1 and N=S, so measured on real
+        KITTI frames the two disagree by 5.97e-4 mean relative in bfloat16 and 2.39e-5 in float32
+        - a 20x shrink with precision, which is the signature of accumulation order rather than of
+        a structural difference. Serving is unaffected regardless: it goes through predict_depth,
+        which is bit-identical to this method's frame-0 branch (verified 0.000e+00).
+        """
         self._ensure_live()
         tok, ps_idx = self.model.aggregator(images[None])
-        # this build caches only layers 4/11/17/23 and leaves the rest None to save memory
-        # (aggregator.py:196) - the frame slice must preserve those Nones
-        tok0 = [t[:, :1] if t is not None else None for t in tok]
-        depth, _ = self.model.depth_head(tok0, images[None][:, :1], ps_idx)
+        if all_frames:
+            depth, _ = self.model.depth_head(tok, images[None], ps_idx)
+            d = depth[0, :, :, :, 0]                          # (S, H, W)
+        else:
+            # this build caches only layers 4/11/17/23 and leaves the rest None to save memory
+            # (aggregator.py:196) - the frame slice must preserve those Nones
+            tok0 = [t[:, :1] if t is not None else None for t in tok]
+            depth, _ = self.model.depth_head(tok0, images[None][:, :1], ps_idx)
+            d = depth[0, 0, :, :, 0]                          # (H, W)
         pose_enc = self.model.camera_head(tok)[-1]
-        return depth[0, 0, :, :, 0], pose_enc[0]
+        return d, pose_enc[0]
 
     @torch.no_grad()
     def predict_depth(self, images):

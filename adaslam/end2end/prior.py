@@ -3,14 +3,58 @@
 A drop-in for MotionFilter.prior_extractor; installing and restoring it is SlamRunner's job, so
 nothing here can leak a patch into a later arm. Normals stay Omnidata: depth is the only variable.
 """
+from collections import Counter
+
 import torch
 import torch.nn.functional as F
+
+
+def context_stack(video, n_ctx, like, stride=1):
+    """The `n_ctx` most recent keyframes as (k, 3, H, W) in [0, 1], on `like`'s device and dtype.
+
+    This is what makes the SERVED forward the same shape as the one the adapter is trained in
+    (13.2): online/target.py:sample builds `[t] + context_keyframes(t, context_kf)`, and this
+    builds the identical thing for the frame that is arriving. motion_filter.py:96,120 call the
+    extractor BEFORE video.append, so the frame being predicted will land at slot `n =
+    counter.value` and its predecessors are exactly [n - n_ctx .. n - 1] - ASCENDING, oldest
+    first, with the target prepended by the caller. hislam2/ is not touched to get this: the
+    installed extractor is a plain function, so `mf` binds as arg 0 and mf.video is the whole
+    shared DepthVideo (13.1).
+
+    Returns None - a monocular forward, BIT-IDENTICAL to the pre-knob path, because nothing here
+    touches a tensor first - in four cases:
+
+      * `n_ctx` is 0. This is what keeps the null-op arm (13.6) a valid regression test for this
+        file, and every arm recorded before this knob existed comparable.
+      * there is no video at all. PriorProbe's host is a SimpleNamespace with no `video` slot
+        (slam/prior_probe.py:45-48), and the caller passes getattr(mf, 'video', None).
+      * no keyframe exists yet - the first frame of the sequence.
+      * terminate() has started. hi2.py:139-143 fills low-covisibility gaps by calling
+        video.shift(place) and THEN the extractor, so the arriving keyframe lands in the MIDDLE
+        at slot `place`, not at the end: counter-1..counter-n_ctx are then the tail of the
+        sequence rather than this frame's predecessors, and the context would be actively wrong.
+        `video.ready.value` is set only at hi2.py:107, terminate()'s first line - the same gate
+        online/prior.py:122 uses to keep adaptation out of that window.
+
+    video.images is the tracker's own buffer (depth_video.py:26): CPU uint8 RGB already at stream
+    resolution, i.e. exactly what im_tensor was built from before motion_filter.py:88-89
+    normalised it. So dividing by 255 here matches un-normalising there, pixel for pixel.
+    """
+    if video is None or n_ctx < 1 or video.ready.value != 0:
+        return None
+    from ..common import context_keyframes
+    # the SAME helper the trainer's sample goes through, so the two forwards cannot disagree
+    # about which keyframes they mean - stride included
+    ix = context_keyframes(video.counter.value, n_ctx, stride)
+    if not ix:
+        return None
+    return video.images[ix].to(device=like.device, dtype=like.dtype) / 255.0
 
 
 class VggtPrior:
     """VGGT depth + Omnidata normals. `adapter=None` is the un-adapted 'vggt_base' arm."""
 
-    def __init__(self, cfg, adapter=None, stream_hw=None):
+    def __init__(self, cfg, adapter=None, stream_hw=None, context_kf=0, context_stride=1):
         from ..adapt import LoRAVGGT, aspect_lines
 
         # from_adapter rebuilds the structure the adapter was trained in; only the un-adapted arm
@@ -19,10 +63,32 @@ class VggtPrior:
                       else LoRAVGGT(cfg.lora)).eval_mode()
         self.cfg = cfg
         self.hw = self.model.cfg.vggt_hw         # from_adapter may have overridden cfg.lora's
-        self.label = f'{"VGGT+LoRA" if adapter else "base VGGT"} depth / Omnidata normals'
+        # Frames per VGGT forward, minus the one being predicted: S = 1 + context_kf. 0 is the
+        # monocular path every arm ran before this existed. An end2end arm gets it from its
+        # '@ctx<N>' spec modifier (config.py), the live arm from OnlineConfig.context_kf - and
+        # the point of the knob is that the SAME number is used to adapt and to serve.
+        self.context_kf = int(context_kf)
+        # keyframes BETWEEN consecutive context frames (common.py:context_keyframes). 1 = the
+        # immediately preceding ones, the only spacing that existed before this. >1 widens the
+        # sample's temporal baseline so some cumulative scale drift falls inside it.
+        self.context_stride = int(context_stride)
+        # what serving actually got, keyed by realised S - the audit trail a '@ctx' arm is read
+        # with. It must be dominated by 1 + context_kf; the S = 1 bucket is the head of the
+        # sequence and terminate()'s inserted keyframes (context_stack).
+        self.served_S = Counter()
+        ctx = (f' + {self.context_kf} ctx kf'
+               + (f'/{self.context_stride}' if self.context_stride != 1 else '')
+               ) if self.context_kf else ''
+        self.label = f'{"VGGT+LoRA" if adapter else "base VGGT"} depth{ctx} / Omnidata normals'
 
         which = f'LoRA-adapted VGGT ({adapter})' if adapter else 'base VGGT-1B (no adapter)'
         print(f'depth prior: {which} at {self.hw[1]}x{self.hw[0]}')
+        if self.context_kf:
+            span = self.context_kf * self.context_stride
+            print(f'             served a {1 + self.context_kf}-frame sequence: the arriving '
+                  f'frame plus {self.context_kf} keyframes at stride {self.context_stride} '
+                  f'(spanning {span} keyframes back), so the forward that SERVES matches the one '
+                  f'that ADAPTS (13.2). Monocular during terminate().')
         print('normals    : Omnidata (unchanged, so depth is the only variable)')
 
         # covers the two cases the adapt stage's report cannot: an adapter trained on another
@@ -39,6 +105,7 @@ class VggtPrior:
         """
         prior = self
         cfg = self.cfg
+        n_ctx, stride = self.context_kf, self.context_stride
 
         @torch.amp.autocast('cuda', enabled=True)   # matches upstream prior_extractor's decorator
         @torch.no_grad()
@@ -58,6 +125,24 @@ class VggtPrior:
             # depth: motion_filter hands us an ImageNet-NORMALISED tensor; VGGT wants [0,1] and
             # normalises internally, so undo it or it sees doubly normalised input (9.3)
             rgb = (im_tensor * mf.STDV + mf.MEAN).clamp(0, 1)
+            # the keyframe context, TARGET FIRST - predict_depth runs the DPT head on frame 0
+            # only (adapt/model.py), which is the frame being asked about, so serving costs one
+            # head pass however much context it carries. predict_depth has always accepted
+            # (S, 3, H, W); it was only ever handed one frame.
+            #
+            # TRAINING may now supervise ALL S frames (OnlineConfig.depth_all_frames), so the two
+            # forwards no longer always agree in SHAPE. They still agree on this frame: the DPT
+            # head reshapes to (B*S, ...) and runs per frame with no cross-frame op, so frame 0's
+            # depth is identical whether the head saw one frame or S.
+            ctx = context_stack(getattr(mf, 'video', None), n_ctx, rgb, stride)
+            if ctx is not None:
+                rgb = torch.cat([rgb, ctx])
+            prior.served_S[int(rgb.shape[0])] += 1
+            # ONE interpolate over the whole stack, so every frame in a forward is resized the
+            # same way the mono path always resized its single one. Note this is bilinear while
+            # the trainer's LiveSampler.frame uses cv2.INTER_AREA (online/target.py:89) - a
+            # train/serve asymmetry that already existed on frame 0 and is deliberately left
+            # alone: changing the sampler would move every adapter on disk.
             rgb = F.interpolate(rgb, prior.hw, mode='bilinear', align_corners=False)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 depth = prior.model.predict_depth(rgb.cuda())

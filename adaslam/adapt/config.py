@@ -106,6 +106,40 @@ class AdaptConfig:
     max_left: int            # neighbour counts, drawn per sample
     max_right: int
     radius: int              # neighbour search radius, in frames
+    # CONTEXT is the online path's mechanism (common.py:context_keyframes), not the neighbour
+    # sampler above: the `context_kf` KEYFRAMES before the target, `context_stride` apart, placed
+    # after it so the target stays frame 0. It is one variable for BOTH ends - the trainer builds
+    # the sample with it and end2end/prior.py:context_stack builds the served sequence with it, so
+    # the adapter is fitted in the regime it is asked to predict in. 0 = monocular, bit-identical
+    # to every run recorded before this field existed.
+    context_kf: int
+    context_stride: int
+    # TARGET NORMALIZATION (common.py:gauge_scale). True divides the target by the sample's own
+    # gauge - the mean point distance, clamped at gauge_clamp x its median, over every valid-depth
+    # pixel of every frame of the sample, in the target camera's frame - and makes depth_loss stop
+    # re-fitting a scale (scale=1.0). Two consequences, and the second is the point:
+    #   * the target lands in the gauge VGGT was PRETRAINED to emit, rather than in the tracker's
+    #     map units, which inflate ~1.97x across KITTI 00;
+    #   * the loss stops being scale-invariant, so for the first time the depth term carries
+    #     gradient about ABSOLUTE scale. Every previous attempt at the drift added a penalty on
+    #     top of the invariance instead of removing it, and all four landed at baseline.
+    # g/gauge(g) is exactly invariant to a global rescale of g, so the map's drift cancels by
+    # construction - no anchor, no window, no history.
+    normalize_target: bool
+    gauge_clamp: float       # clamp distances at this x the frame's MEDIAN distance before the
+                             # mean. Must be > 1. RELATIVE, never absolute: an absolute cut would
+                             # select a different physical set of pixels as the map inflated and
+                             # the rescale invariance above would break.
+    gauge_min_pixels: int    # below this many gauge pixels the sample is skipped rather than
+                             # divided by a statistic computed on nothing
+    # VGGT's own camera translation term (losses.py:pose_loss). True puts the ground-truth
+    # TRANSLATIONS in the same gauge as the depth target and compares them directly, instead of
+    # dividing each side by its own mean norm. That is what VGGT's training does - one avg_scale
+    # divides camera translations AND depth maps, and camera_loss_single then compares translations
+    # absolutely - and it is why VGGT needs no coupled_scale: scale agreement between the two heads
+    # is a property of the data, not a term in the loss. Requires normalize_target (there is no
+    # gauge otherwise) and lambda_pose > 0 (otherwise it computes something nothing reads).
+    gauge_pose: bool
     # ---------------------------------------------------------------- optimisation
     # The styles differ ONLY in the order batches reach the loop (trainer.py:schedule). A UNIT is
     # an epoch in 'normal', one arriving keyframe in 'online' and one window in 'wonline'; the
@@ -148,6 +182,62 @@ class AdaptConfig:
     def __post_init__(self):
         if self.adapt_style not in ADAPT_STYLES:
             raise ValueError(f'adapt_style={self.adapt_style!r} is not one of {ADAPT_STYLES}')
+        if self.gauge_clamp <= 1.0:
+            raise ValueError(f'gauge_clamp={self.gauge_clamp} must be > 1: it clamps distances at '
+                             f'that multiple of the frame MEDIAN, so <= 1 would clip at least '
+                             f'half of every frame and the statistic would stop tracking the '
+                             f'scene. 2.0 is the measured choice.')
+        if self.gauge_min_pixels < 1:
+            raise ValueError(f'gauge_min_pixels={self.gauge_min_pixels} must be >= 1')
+        if self.gauge_pose and not self.normalize_target:
+            raise ValueError('gauge_pose=True needs normalize_target=True: it puts the ground-truth '
+                             'translations in the DEPTH TARGET\'s gauge, and without '
+                             'normalize_target there is no such gauge to put them in.')
+        if self.gauge_pose and self.lambda_pose <= 0.0:
+            raise ValueError(f'gauge_pose=True with lambda_pose={self.lambda_pose} changes how a '
+                             f'term that is weighted to zero is computed. Set lambda_pose > 0, or '
+                             f'gauge_pose False.')
+        # NOT GUARDED, deliberately: lambda_pose > 0 alongside normalize_target. An earlier
+        # version refused it, reasoning that the pose term carries a different gauge. Re-reading
+        # pose_loss, that is only half true - l_t divides EACH side by its own mean translation
+        # norm and l_r is quaternions, so both are scale-free and neither conflicts with a
+        # normalized depth target. The only scale-carrying output is pose_scale, and that is
+        # consumed solely under coupled_scale, which IS refused below. Forbidding lambda_pose as
+        # well cost 2.35 m at ctx2 (_ctx2 12.881 vs _ctx2_cscale 15.231) for no principled reason.
+        #
+        # WHAT DOES CHANGE IS THE RELATIVE WEIGHT, and it is worth knowing before reusing a value
+        # from the pre-gauge sweep. Measured on the ctx2 arms, normalize_target leaves l_depth
+        # ~7.2x smaller in VALUE (0.0098 vs 0.0712) and roughly 2.8x smaller in SUBGRADIENT, since
+        # the old loss multiplied the prediction by a fitted s ~ 2.8 that this one does not. So a
+        # given lambda_pose bites harder here; the sweep's old optimum needs re-deriving rather
+        # than inheriting. (And per the campaign's own lambda_pose lesson, the LOSS ratio is a poor
+        # proxy for the gradient ratio - a term 192x smaller in loss was only 8.3x smaller in
+        # gradient - so neither number above should be used as a rescaling factor on its own.)
+        if self.normalize_target and self.coupled_scale:
+            raise ValueError(
+                'normalize_target=True with coupled_scale=True asks for two gauges at once: the '
+                'target already carries one, and coupled_scale would have depth_loss re-fit the '
+                "pose head's instead, dividing out the quantity being supervised. This is the "
+                'real conflict between the gauge and the pose head; lambda_pose itself is fine, '
+                'because pose_loss normalises each translation set by its own mean norm and is '
+                'scale-free. Set coupled_scale False.')
+        if self.context_kf < 0:
+            raise ValueError(f'context_kf={self.context_kf} must be >= 0 (0 = monocular)')
+        if self.context_stride < 1:
+            raise ValueError(f'context_stride={self.context_stride} must be >= 1')
+        # TWO context mechanisms would silently mix: neighbours() draws a RANDOM number of
+        # arbitrary frames within `radius` on both sides, context_keyframes() takes a FIXED set of
+        # preceding keyframes - and only the second one is what the extractor serves. Refuse
+        # rather than let a run average over both.
+        if self.context_kf and self.p_single_view != 1.0:
+            raise ValueError(
+                f'context_kf={self.context_kf} builds the sequence from the preceding KEYFRAMES, '
+                f'but p_single_view={self.p_single_view} still lets the random-neighbour sampler '
+                f'fire on {100*(1-self.p_single_view):.0f}% of samples. Set p_single_view=1 to '
+                f'turn that mechanism off, or context_kf=0 to use it instead.')
+        if self.context_stride != 1 and not self.context_kf:
+            raise ValueError(f'context_stride={self.context_stride} is unread at context_kf=0 - '
+                             f'set context_kf > 0, or leave context_stride at 1')
         # only where it is read; whether it fits the keyframe count is data, checked in the trainer
         if self.adapt_style == 'wonline' and self.window_size < 1:
             raise ValueError(f'window_size={self.window_size} must be >= 1 in the wonline style')

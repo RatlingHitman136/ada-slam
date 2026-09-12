@@ -158,7 +158,10 @@ CONT_COLUMNS = ('arm', 'style', 'regime', 'epochs', 'window', 'lr',
                 'base_train_l1', 'train_l1', 'base_val_l1', 'val_l1', 'd_val_l1',
                 'ate_all', 'd_ate_vs_omni', 'd_ate_pct', 'exported_at')
 
-LIVE_COLUMNS = ('arm', 'style', 'steps_per_kf', 'window', 'lr', 'alpha', 'lag', 'ceil_ratio',
+LIVE_COLUMNS = ('arm', 'style', 'steps_per_kf', 'window', 'lr', 'alpha', 'lag',
+                'context_kf', 'ctx_stride', 'all_frames', 'freeze_gauge', 'batch_scale',
+                'l_cons', 'anchor_kf', 'norm_tgt', 'gauge_clamp',
+                'served_S', 'ceil_ratio',
                 'ceil_target', 'ped_ratio',
                 'warmup_kf', 'handover_kf', 'warmup_prior', 'warmup_end_frame',
                 'first_adapted_kf',
@@ -490,6 +493,18 @@ def cont_cells(cfg, n_frames):
     }
 
 
+def served_S_of(cfg):
+    """`served_S` as one compact cell: {'3': 88, '1': 14} -> '3:88 1:14', commonest first.
+
+    Blank when the key is absent, which is every adapter written before serving carried context -
+    "not measured", never "monocular", the same convention ceil_ratio uses.
+    """
+    hist = cfg.get('served_S')
+    if not hist:
+        return ''
+    return ' '.join(f'{k}:{v}' for k, v in sorted(hist.items(), key=lambda kv: -kv[1]))
+
+
 def live_cells(cfg, n_frames):
     """The columns only a live run has - warm-up, lag, and a train set that arrived as it ran.
 
@@ -512,6 +527,31 @@ def live_cells(cfg, n_frames):
         'window': num(window_of(cfg)),
         'alpha': num(cfg.get('alpha')),
         'lag': num(cfg.get('lag')),
+        # frames per VGGT forward minus one, for BOTH the training sample and the served
+        # prediction. Blank on every adapter written before serving learned to carry context, and
+        # 0 there would be a lie only in that it hides which of the two ends was monocular.
+        'context_kf': num(cfg.get('context_kf')),
+        # keyframes between context frames. Blank on adapters written before striding existed -
+        # "not measured", never 1, the same convention ceil_ratio uses.
+        'ctx_stride': num(cfg.get('context_stride')),
+        # blank on adapters written before the shared batch gauge existed - "not measured", not
+        # False, the same convention ceil_ratio uses
+        # blank on adapters written before depth supervision could cover the whole sample -
+        # "not measured", never False, the same convention ceil_ratio uses
+        'all_frames': cfg.get('depth_all_frames', ''),
+        'freeze_gauge': cfg.get('freeze_gauge', ''),
+        'batch_scale': cfg.get('batch_scale', ''),
+        'l_cons': num(cfg.get('lambda_cons')),
+        # 0 = the reference came from the batch; blank = the adapter predates the history anchor
+        'anchor_kf': num(cfg.get('anchor_kf')),
+        # blank, not 0/False, on every adapter trained before normalize_target existed
+        'norm_tgt': '' if cfg.get('normalize_target') is None
+                    else int(bool(cfg.get('normalize_target'))),
+        'gauge_clamp': num(cfg.get('gauge_clamp')) if cfg.get('normalize_target') else '',
+        # what serving actually got, as `S:count` pairs - the evidence that the two ends agreed.
+        # At context_kf=N it should read mostly `N+1:...`, with a small `1:...` for the head of
+        # the sequence and terminate()'s inserted keyframes (end2end/prior.py:context_stack).
+        'served_S': served_S_of(cfg),
         # blank on every adapter written before the far-field ceiling existed (14): no key means
         # "not measured", never "1.0". Same for ceil_target (14.6), where blank is never "False"
         'ceil_ratio': num(cfg.get('ceil_ratio')),

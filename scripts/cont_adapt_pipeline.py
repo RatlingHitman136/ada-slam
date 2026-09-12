@@ -127,9 +127,16 @@ KF_FRACTION = 1.0             # THE knob here: share of the extract's keyframes 
 ADAPT = AdaptConfig(
     stream_res=STREAM_RES,
     p_single_view=1, max_left=4, max_right=4, radius=8,
+    context_kf=0, context_stride=1,   # 0 = monocular. > 0 = the N preceding KEYFRAMES in
+                               # the sample AND in the served sequence (@ctx<N> in the arm)
     adapt_style='normal',      # 'normal' epochs | 'online' per arrival | 'wonline' sliding window
     epochs=25, batch_size=2,
     window_size=10,            # 'wonline' only
+    gauge_pose=False,          # VGGT's own camera translation term: gt translations in the
+                               # DEPTH target's gauge, compared directly (losses.py)
+    normalize_target=False,    # true = the target carries its own gauge and depth_loss
+    gauge_clamp=2.0,           # stops re-fitting a scale (common.py:gauge_scale); the
+    gauge_min_pixels=256,      # only setting under which absolute scale gets gradient
     lr=1e-4, weight_decay=0.0, grad_clip=1.0, lambda_pose=1.0,
     coupled_scale=True, min_mask_pixels=16, seed=0, log_every=20,
     # ---- which exported keyframes are trained on, and what the rest are for ----

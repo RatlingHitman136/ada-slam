@@ -26,8 +26,20 @@ def make_prior(spec, cfg):
     No stream_hw: the aspect warning belongs to a run that will feed BA. An '@ceil<tag>' (14) or
     '@ped<tag>' (14.9) modifier wraps the base prior, so a transformed generator scores here under
     the same arm name the end2end stage gives it.
+
+    '@ctx<N>' is refused: there is no keyframe history to draw on here - see below.
     """
     base, mods = split_mods(spec)
+    if mods.pop('ctx', 0):
+        # PriorProbe scores one colour file at a time against a SimpleNamespace host with no
+        # `video` slot (slam/prior_probe.py:45-48), so context_stack would return None and the
+        # arm would be served MONOCULAR under a name ending in _ctx<N>. That is a row that looks
+        # like evidence about a context arm and is not, so refuse rather than report it.
+        raise SystemExit(
+            f"{spec!r} has no meaning in the prior test: '@ctx' feeds VGGT the most recent "
+            f'KEYFRAMES, and this test runs no SLAM at all - there is no DepthVideo and so no '
+            f'keyframes. It would be served monocular and duplicate the un-modified row. Score '
+            f'the base spec here; the @ctx arm belongs in END2END_PRIORS.')
     if base == OMNIDATA_DENSE:
         # Refused for the opposite reason to end2end's: there IS no tracking here, so keyframe
         # density has nothing to act on and this would score a byte-identical duplicate of `omni`

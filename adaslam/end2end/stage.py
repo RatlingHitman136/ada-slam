@@ -28,8 +28,23 @@ def make_prior(spec, cfg, stream_hw=None):
     Any spec may carry '@ceil<tag>' (14) and/or '@ped<tag>' (14.9) modifiers: the base prior is
     built as usual and served through the wrapper chain. Plain 'omnidata' still returns None - the
     stock path stays untouched.
+
+    '@ctx<N>' is different and is handled here rather than in the chain: it changes the SEQUENCE
+    VGGT is fed, not the depth that comes back, so it is a construction argument (config.py's
+    INPUT_MODS). Popping it leaves `mods` a pure served-transform dict, which is what lets
+    wrap_mods and mods_label stay exactly as they were.
     """
     base, mods = split_mods(spec)
+    ctx, ctx_stride = mods.pop('ctx', (0, 1))
+    if ctx and base in (OMNIDATA, OMNIDATA_DENSE):
+        # upstream's prior resizes one image into a 512x512 square and runs Omnidata on it
+        # (motion_filter.py:60-73); there is no sequence axis to put keyframes on. Building it
+        # anyway would score a monocular arm into a directory named _ctx<N> - a name that lies,
+        # which is the class of silent corruption 9.3 exists to prevent.
+        raise SystemExit(
+            f"{spec!r}: '@ctx' feeds a multi-frame sequence to VGGT, and {base!r} is Omnidata, "
+            f'which is single-image by construction. Drop the modifier, or point it at '
+            f'{VGGT_BASE!r} or an adapter directory.')
     if base == OMNIDATA_DENSE:
         # NOT a prior variant: the same Omnidata prior at a different KEYFRAME DENSITY, which is a
         # property of the tracking config. Every arm here shares one arm_config (see the print at
@@ -50,7 +65,8 @@ def make_prior(spec, cfg, stream_hw=None):
         from ..slam import stock_prior_extractor
         return wrap_mods(stock_prior_extractor(), mods,
                          f'Omnidata depth{mods_label(mods)} / Omnidata normals')
-    inner = VggtPrior(cfg, None if base == VGGT_BASE else adapter_path(base), stream_hw)
+    inner = VggtPrior(cfg, None if base == VGGT_BASE else adapter_path(base), stream_hw,
+                      context_kf=ctx, context_stride=ctx_stride)
     if not mods:
         return inner
     return wrap_mods(inner.extractor(), mods, f'{inner.label}{mods_label(mods)}',

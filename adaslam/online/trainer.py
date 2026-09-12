@@ -13,7 +13,7 @@ import time
 import numpy as np
 import torch
 
-from ..adapt.losses import depth_loss, pose_loss, relative_loss
+from ..adapt.losses import depth_loss, mean_scale, median_scale, pose_loss, relative_loss
 from ..adapt.trainer import batches_of
 
 from .target import LiveSampler, unit_keyframes
@@ -42,6 +42,12 @@ class LiveTrainer:
         self.ckpt_dir, self._record = ckpt_dir, record
 
         self.log = []
+        self._unit_gauge = {}      # keyframe -> frozen pose gauge, reset every unit
+        # the history anchor (config.py:anchor_kf). Stored as frame TIMESTAMPS because keyframe
+        # SLOTS are not stable - track_frontend.py:52 prunes one and decrements counter, shifting
+        # every index after it, so a cached slot would silently become a different frame.
+        self._anchor_ts = []       # chosen once, held for the run
+        self._unit_anchor = None   # the detached reference log-scale, recomputed once per unit
         self.units = 0             # arriving keyframes adapted on
         self.visits = 0            # keyframes pushed through VGGT - 12.1's adapt_cost
         self.trained_kf = set()    # distinct FRAME indices ever trained on
@@ -94,7 +100,13 @@ class LiveTrainer:
         The model is in eval_mode here (on_keyframe enters train_mode after the gate), which is
         also the mode it serves in - so the gate measures the weights as the tracker will see them.
         """
-        images, gt, mask, _, _ = self.sampler.sample(video, t)
+        images, gt, mask, _, _, _ = self.sampler.sample(video, t)
+        # THE GATE READS FRAME 0, always, even under depth_all_frames. gate_lo/gate_hi are
+        # calibrated against this exact quantity (online/config.py's reference distributions) and
+        # every gate_log.json on disk records it, so pooling over S here would silently
+        # reinterpret every recorded threshold rather than measure a new thing.
+        if gt.dim() == 3:
+            gt, mask = gt[0], mask[0]
         images, gt, mask = images.cuda(), gt.cuda(), mask.cuda()
         if mask.sum() < self.cfg.min_mask_pixels:
             return None, None                # depth_loss would return a zero with no gradient
@@ -188,6 +200,18 @@ class LiveTrainer:
             self.first_kf = int(tstamp)      # a FRAME index, like trained_kf and the log's 'kfs'
 
         unit = self.units
+        # one gauge per keyframe per UNIT (config.py:freeze_gauge). Cleared here, filled on each
+        # keyframe's first step, reused for the rest - so the window's loss surface stops moving
+        # under the optimiser while the window itself is fixed.
+        self._unit_gauge = {}
+        # the history anchor, recomputed ONCE per unit rather than per step: per step would cost
+        # anchor_kf x len(batches) extra forwards, per unit it is anchor_kf against 50.
+        self._unit_anchor = None
+        if self.cfg.anchor_kf > 0 and self.cfg.lambda_cons > 0:
+            if not self._anchor_ts:
+                self._pick_anchors(video, kfs[-1])
+            if self._anchor_ts:
+                self._unit_anchor = self._history_anchor(video)
         self.lora.train_mode()          # also enables the aggregator's gradient checkpointing
         try:
             with torch.amp.autocast('cuda', enabled=False):
@@ -203,25 +227,188 @@ class LiveTrainer:
         self._checkpoint()
         return unit
 
+    def _batch_scale(self, samples):
+        """ONE depth scale over the whole batch, from a no-grad pass (online/config.py).
+
+        Per-sample alignment is what makes the objective blind to cross-frame scale inconsistency;
+        pooling the masked pixels and taking one median ratio puts that inconsistency into the
+        residual. Returns None when there is not enough valid depth to fit on, so the caller falls
+        back to the per-sample gauge rather than to a garbage constant.
+
+        cache_enabled=False IS LOAD-BEARING here for the same reason it is in gate_value: an
+        autocast cache filled under no_grad survives until the OUTERMOST autocast region exits -
+        motion_filter.track's - and _step's forward a few lines later would reuse those DETACHED
+        bf16 weight copies, so backward() would die on "element 0 does not require grad".
+        """
+        gts, prs = [], []
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16, cache_enabled=False):
+                for images, gt, mask, _, _ in samples:
+                    if not bool(mask.any()):
+                        continue
+                    pd, _ = self.lora.forward(images)
+                    gts.append(gt[mask])
+                    prs.append(pd.float().clamp(min=1e-3)[mask])
+        if not gts:
+            return None
+        g, p = torch.cat(gts), torch.cat(prs)
+        if g.numel() < self.cfg.min_mask_pixels:
+            return None
+        return (g.median() / p.median().clamp(min=1e-6)).detach()
+
+    def _scale_anchor(self, samples):
+        """mean of log(per-sample median scale) over the batch, DETACHED (online/config.py).
+
+        The consensus each sample's own scale is pulled toward by lambda_cons. Detached and taken
+        from a no-grad pass so it is a fixed target for the step rather than a mean that moves as
+        the samples move - the failure batch_scale had was a gauge that chased its own input.
+
+        None when fewer than two samples yield a scale: consistency needs something to be
+        consistent with, and the caller then adds no penalty at all.
+
+        cache_enabled=False is load-bearing for the same reason as in gate_value and _batch_scale.
+        """
+        ls = []
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16, cache_enabled=False):
+                for images, gt, mask, _, _ in samples:
+                    if mask.sum() < self.cfg.min_mask_pixels:
+                        continue
+                    pd, _ = self.lora.forward(images)
+                    s = median_scale(pd.float().clamp(min=1e-3), gt.clamp(min=1e-3), mask)
+                    ls.append(torch.log(s.clamp(min=1e-9)))
+        if len(ls) < 2:
+            return None
+        return torch.stack(ls).mean().detach()
+
+    def _pick_anchors(self, video, hi):
+        """Choose the anchor keyframes ONCE, as far back as the map reaches, and keep them.
+
+        Eligible slots are [0, hi - window_size] - everything the current unit's window does not
+        already cover - and `evenly` spreads anchor_kf of them across it, endpoints included
+        (adapt/data.py:28). Nothing is chosen until that range holds at least anchor_kf keyframes,
+        so the set is not built out of two barely-settled frames at the very start of the run.
+
+        Converted to timestamps immediately: slots move under pruning, frames do not.
+        """
+        from ..adapt.data import evenly
+        span = hi - self.cfg.window_size
+        if span + 1 < self.cfg.anchor_kf:
+            return
+        self._anchor_ts = [float(video.tstamp[i].item())
+                           for i in evenly(range(0, span + 1), self.cfg.anchor_kf)]
+        print(f'  [adapt] anchor set fixed at frames '
+              f'{[self.frame_offset + int(t) for t in self._anchor_ts]} - lambda_cons now measures '
+              f'against the start of the sequence, not the current window')
+
+    def _history_anchor(self, video):
+        """Reference log-scale from the anchor keyframes, DETACHED (config.py:anchor_kf).
+
+        MEAN ratio, not median. median_scale routes its gradient to the single selected element, so
+        a penalty built on it reaches the model through ONE pixel per sample - which is very likely
+        why lambda_cons did nothing even where its magnitude should have been felt. The mean ratio
+        has dense gradient over every masked pixel. depth_loss keeps median_scale untouched; the
+        two terms ask different questions and only this one needs to move the whole prediction.
+
+        Timestamps are re-resolved to slots every call; an anchor whose frame has been pruned out
+        of the map simply drops. None when fewer than two survive.
+
+        cache_enabled=False is load-bearing for the same reason as in gate_value and _batch_scale.
+        """
+        n = video.counter.value
+        ts = video.tstamp[:n]
+        ls = []
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16, cache_enabled=False):
+                for want in self._anchor_ts:
+                    hit = (ts == want).nonzero()
+                    if not len(hit):
+                        continue                       # pruned away since it was chosen
+                    images, gt, mask, _, _, _ = self.sampler.sample(video,
+                                                                   int(hit[0].item()))
+                    images, gt, mask = images.cuda(), gt.cuda(), mask.cuda()
+                    if mask.sum() < self.cfg.min_mask_pixels:
+                        continue
+                    pd, _ = self.lora.forward(images)
+                    s = mean_scale(pd.float().clamp(min=1e-3), gt.clamp(min=1e-3), mask)
+                    ls.append(torch.log(s.clamp(min=1e-9)))
+        if len(ls) < 2:
+            return None
+        return torch.stack(ls).mean().detach()
+
     def _step(self, video, unit, step, n_steps, batch):
         """One optimiser step over `batch`, the live twin of adapt/trainer.py's. Returns its loss."""
         cfg = self.cfg
         self.opt.zero_grad(set_to_none=True)
-        acc = {'loss': [], 'l_depth': [], 'l_trans': [], 'l_rot': [], 'scale_ratio': []}
+        acc = {'loss': [], 'l_depth': [], 'l_trans': [], 'l_rot': [], 'scale_ratio': [],
+               'l_cons': [], 'pred_med': [], 'gt_med': [], 'dscale': [], 'gauge': []}
         seq_lens = []
 
-        for t in batch:
-            images, gt, mask, gt_enc, seq = self.sampler.sample(video, t)
-            images, gt, mask, gt_enc = images.cuda(), gt.cuda(), mask.cuda(), gt_enc.cuda()
+        # built once, up front: the shared gauge needs every sample of the batch before any graph
+        # is built, and re-sampling for the second pass would redo the resizes and depth_filter
+        samples = [self.sampler.sample(video, t) for t in batch]
+        samples = [(im.cuda(), gt.cuda(), m.cuda(), e.cuda(), s, g)
+                   for im, gt, m, e, s, g in samples]
+        shared = self._batch_scale(samples) if cfg.batch_scale and len(samples) > 1 else None
+        # the history anchor wins when it exists: it spans the whole sequence, where the
+        # batch-derived one spans only the current window
+        anchor = self._unit_anchor
+        if anchor is None and cfg.lambda_cons > 0 and len(samples) > 1 and not cfg.anchor_kf:
+            anchor = self._scale_anchor(samples)
 
+        for images, gt, mask, gt_enc, seq, norm in samples:
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                pred_depth, pred_enc = self.lora.forward(images)
+                pred_depth, pred_enc = self.lora.forward(
+                    images, all_frames=cfg.depth_all_frames)
             pred_depth, pred_enc = pred_depth.float(), pred_enc.float()
 
-            l_t, l_r, pose_scale = pose_loss(pred_enc, gt_enc)
-            l_d, depth_scale = depth_loss(pred_depth, gt, mask, cfg,
-                                          scale=pose_scale if cfg.coupled_scale else None)
+            l_t, l_r, pose_scale = pose_loss(pred_enc, gt_enc, absolute=cfg.gauge_pose)
+            # the gauge, in precedence order: the batch-wide one, else the pose head's, else the
+            # sample's own median. config.py refuses the first two together. Under freeze_gauge
+            # the pose gauge is the one captured at this keyframe's FIRST step of the unit, so the
+            # loss surface stays put while the window does; l_t and l_r still use the CURRENT
+            # pred_enc, because only the gauge is frozen, not the pose loss.
+            # normalize_target puts the gauge in the TARGET itself (target.py:sample), so the
+            # loss must NOT re-fit one: scale=1.0 is exactly what stops depth_loss being
+            # scale-invariant, which is the whole point of the change. config.py refuses every
+            # other gauge source alongside it, so `shared` is None and coupled_scale is off here.
+            gauge = 1.0 if cfg.normalize_target else shared
+            if gauge is None and cfg.coupled_scale:
+                gauge = pose_scale
+                if cfg.freeze_gauge and gauge is not None:
+                    gauge = self._unit_gauge.setdefault(int(seq[0]), gauge)
+            l_d, depth_scale = depth_loss(pred_depth, gt, mask, cfg, scale=gauge)
             loss = l_d + cfg.lambda_pose * (l_t + l_r)
+
+            # the scale-consistency penalty. depth_scale here is the sample's OWN undetached
+            # median_scale (gauge is None when lambda_cons is on - config.py refuses the pair), so
+            # the gradient reaches the model through it; the anchor is a detached constant.
+            l_c = None
+            if anchor is not None and bool(mask.any()):
+                # the SAME mean-ratio estimator the anchor is built from - a penalty comparing a
+                # mean ratio against a median-derived reference would be measuring two things.
+                # Undetached, so the gradient reaches the model densely.
+                s_i = mean_scale(pred_depth.clamp(min=1e-3), gt.clamp(min=1e-3), mask)
+                l_c = (torch.log(s_i.clamp(min=1e-9)) - anchor) ** 2
+                loss = loss + cfg.lambda_cons * l_c
+
+            # the diagnostic that would have identified the batch_scale pathology in one look:
+            # the ratio alone cannot say whether the PREDICTION or the TARGET moved
+            if bool(mask.any()):
+                # the quantity under test: normalize_target's premise is that it does NOT
+                # ramp across the run. The anchor arm's reference was never logged and had
+                # to be reconstructed afterwards - not again.
+                if norm is not None:
+                    acc['gauge'].append(float(norm))
+                acc['pred_med'].append(float(pred_depth.detach()[mask].median()))
+                acc['gt_med'].append(float(gt[mask].median()))
+            # JDSA's OWN measurement of prior-vs-tracker disagreement: the 2x2 scale grid it must
+            # multiply this keyframe's prior by (geom/ba.py:249 updates it every BA iteration).
+            # Its spread ACROSS keyframes is the drift as the solver actually experiences it, and
+            # nothing in this track has ever looked at it. Free - the tensor is already on the GPU.
+            acc['dscale'].append(float(video.dscales[int(seq[0])].mean()))
+            if l_c is not None:
+                acc['l_cons'].append(float(l_c))
 
             # the MEAN over the batch, so grad magnitude is independent of batch_size
             (loss / len(batch)).backward()
@@ -243,6 +430,7 @@ class LiveTrainer:
         # be translated off video.tstamp, because a keyframe slot is not stable across a pruning
         rec = {'epoch': unit, 'step': step, 'S': seq_lens,
                'kfs': [self.frame(video, t) for t in batch],
+               **({'batch_scale': float(shared)} if shared is not None else {}),
                **{k: float(np.mean(v)) for k, v in acc.items() if v}}
         self.log.append(rec)
 
@@ -287,7 +475,34 @@ class LiveTrainer:
                 'steps': len(self.log), 'lr': cfg.lr,
                 'weight_decay': cfg.weight_decay, 'grad_clip': cfg.grad_clip,
                 'lambda_pose': cfg.lambda_pose, 'coupled_scale': cfg.coupled_scale,
-                'context_kf': cfg.context_kf, 'lag': cfg.lag, 'seed': cfg.seed,
+                # one depth scale over the whole batch instead of one per sample. Absent on every
+                # adapter written before it existed, which the export reads as blank, not False.
+                'batch_scale': cfg.batch_scale,
+                # the scale-consistency penalty's weight; 0 = off. Absent on adapters written
+                # before it existed, which the export reads as blank rather than as 0.
+                'lambda_cons': cfg.lambda_cons,
+                # depth supervised on every frame of the sample under one shared scale. Absent on
+                # every adapter written before it existed, which the export reads as blank.
+                'depth_all_frames': cfg.depth_all_frames,
+                # keyframes from the start of the sequence lambda_cons measures against; 0 = the
+                # batch-derived reference. Absent on adapters written before it existed.
+                'anchor_kf': cfg.anchor_kf,
+                # the pose gauge held fixed for the unit rather than recomputed every forward
+                'freeze_gauge': cfg.freeze_gauge,
+                # the target carries its own gauge and depth_loss stops re-fitting a scale, which
+                # is the only setting under which the depth term sees ABSOLUTE scale
+                # (common.py:gauge_scale). Absent on every adapter written before it existed,
+                # which the export reads as blank rather than as False.
+                'normalize_target': cfg.normalize_target,
+                'gauge_clamp': cfg.gauge_clamp,
+                'gauge_min_pixels': cfg.gauge_min_pixels,
+                # frames per VGGT forward minus one, for the training sample AND for the
+                # served prediction - one number, both ends (online/config.py)
+                'context_kf': cfg.context_kf,
+                # keyframes between context frames; 1 = consecutive. Absent on every adapter
+                # written before striding existed, which the export reads as blank, not as 1.
+                'context_stride': cfg.context_stride,
+                'lag': cfg.lag, 'seed': cfg.seed,
                 'stream_res': cfg.stream_res,
                 # the far-field ceiling on the SERVED depth (14); 1.0 = off. Pre-knob adapters
                 # have no such key, which the export reads as blank rather than as 1.0. Same

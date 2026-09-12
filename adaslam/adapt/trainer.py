@@ -17,7 +17,12 @@ from .losses import depth_loss, pose_loss
 
 @torch.no_grad()
 def eval_depth(lora, data, kfs, cfg):
-    """Scale-aligned masked depth L1 over a keyframe subset - the export table's metric."""
+    """Scale-aligned masked depth L1 over a keyframe subset - the export table's metric.
+
+    single=True is honoured only at cfg.context_kf 0; with context the sequence is the fixed one
+    data.sample builds either way, so this number is measured in the regime that is served. That
+    makes it NOT comparable to the monocular figure of a context_kf 0 run.
+    """
     if not kfs:
         return None
     if cfg.eval_max_kf:
@@ -27,7 +32,7 @@ def eval_depth(lora, data, kfs, cfg):
     rng = np.random.default_rng(cfg.seed)
     errs = []
     for t in kfs:
-        images, gt, mask, _, _ = data.sample(rng, t=t, single=True)
+        images, gt, mask, _, _, _ = data.sample(rng, t=t, single=True)
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             pred, _ = lora.forward(images.cuda())
         l, _ = depth_loss(pred.float(), gt.cuda(), mask.cuda(), cfg)
@@ -165,8 +170,13 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
                'steps_per_epoch': steps_per_unit, 'samples_per_epoch': len(data.train_kf),
                'lr': cfg.lr, 'weight_decay': cfg.weight_decay, 'grad_clip': cfg.grad_clip,
                'lambda_pose': cfg.lambda_pose, 'coupled_scale': cfg.coupled_scale,
+               'normalize_target': cfg.normalize_target, 'gauge_clamp': cfg.gauge_clamp,
+               'gauge_min_pixels': cfg.gauge_min_pixels,
                'p_single_view': cfg.p_single_view, 'max_left': cfg.max_left,
                'max_right': cfg.max_right, 'radius': cfg.radius, 'scene': scene_dir,
+               # what the SERVED sequence must match: an adapter trained at context_kf 2 and
+               # replayed monocular is asked for a prediction it was never fitted for
+               'context_kf': cfg.context_kf, 'context_stride': cfg.context_stride,
                # the END OF THE EXTRACT WINDOW, not of the training data: priortest reads it HERE,
                # not from the extract dir, which may be deleted long before the adapter is. Under
                # val_source='rest' the training keyframes span the whole window, so `train_end`
@@ -200,19 +210,24 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
         for step, batch in enumerate(batches):
             opt.zero_grad(set_to_none=True)
             acc = {'loss': [], 'l_depth': [], 'l_trans': [], 'l_rot': [], 'scale_ratio': [],
-                   'S': []}
+                   'gauge': [], 'S': []}
 
             for t in batch:
-                images, gt, mask, gt_enc, seq = data.sample(rng, t=t)
+                images, gt, mask, gt_enc, seq, norm = data.sample(rng, t=t)
                 images, gt, mask, gt_enc = (images.cuda(), gt.cuda(), mask.cuda(), gt_enc.cuda())
 
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                     pred_depth, pred_enc = lora.forward(images)
                 pred_depth, pred_enc = pred_depth.float(), pred_enc.float()
 
-                l_t, l_r, pose_scale = pose_loss(pred_enc, gt_enc)
-                l_d, depth_scale = depth_loss(pred_depth, gt, mask, cfg,
-                                              scale=pose_scale if cfg.coupled_scale else None)
+                l_t, l_r, pose_scale = pose_loss(pred_enc, gt_enc,
+                                                 absolute=cfg.gauge_pose)
+                # normalize_target puts the gauge in the TARGET itself (data.py:sample), so the
+                # loss must NOT re-fit one: scale=1.0 is exactly what stops depth_loss being
+                # scale-invariant, which is the whole point of the change.
+                gauge = 1.0 if cfg.normalize_target else \
+                    (pose_scale if cfg.coupled_scale else None)
+                l_d, depth_scale = depth_loss(pred_depth, gt, mask, cfg, scale=gauge)
                 loss = l_d + cfg.lambda_pose * (l_t + l_r)
 
                 # the MEAN over the batch, so grad magnitude is independent of batch_size
@@ -223,6 +238,10 @@ def run_training(lora, scene_dir, image_dir, out_dir, cfg, ckpt_dir=None):
                 acc['l_trans'].append(l_t.item())
                 acc['l_rot'].append(l_r.item())
                 acc['S'].append(len(seq))
+                # the quantity under test: normalize_target's premise is that it does NOT ramp
+                # across the run, so it is logged per step rather than reconstructed afterwards
+                if norm is not None:
+                    acc['gauge'].append(float(norm))
                 # they agreed to 1% on the pretrained model; divergence = broken depth/pose
                 # consistency
                 if pose_scale is not None and depth_scale is not None:

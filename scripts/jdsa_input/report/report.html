@@ -216,6 +216,56 @@ ul{margin:0 0 15px; padding-left:20px;} li{margin-bottom:7px;}
   </div>
 
   <div class="col">
+    <h3>And it is drift, not jitter</h3>
+    <p>That one number hides a decomposition worth making, because the two halves are not equally
+    guilty. Split each arm's local scale into a slow trend and the residual around it, then take
+    each component out of the trajectory — rescale the incremental translations, re-integrate, and
+    re-measure. No model, the same path with one error mode removed:</p>
+  </div>
+
+  <div class="figure">
+    <div class="tablewrap"><table>
+      <thead><tr><th>arm</th><th>ATE</th><th>drift <span class="dim">last tenth / first</span></th>
+        <th>jitter</th><th>ATE without the drift</th><th>without the jitter</th></tr></thead>
+      <tbody>
+        <tr><td>omni</td><td>11.40</td><td class="lose">0.596</td><td>0.0295</td>
+          <td class="win">0.75</td><td>11.51</td></tr>
+        <tr><td>omni@ceil1p45</td><td>3.83</td><td class="win">0.981</td><td>0.0318</td>
+          <td class="win">0.96</td><td>3.37</td></tr>
+        <tr><td>omni@ped1p8</td><td>3.94</td><td class="win">0.995</td><td>0.0321</td>
+          <td class="win">0.99</td><td>3.42</td></tr>
+        <tr><td>omni@ped1 <span class="dim">over-bounded</span></td><td>11.01</td>
+          <td class="lose">1.510</td><td>0.0364</td><td class="win">1.61</td><td>10.29</td></tr>
+        <tr><td>base</td><td>15.63</td><td class="lose">0.505</td><td>0.0287</td>
+          <td class="win">0.71</td><td>15.69</td></tr>
+        <tr><td>base_ped1</td><td>3.79</td><td class="win">1.016</td><td>0.0324</td>
+          <td class="win">0.96</td><td>3.27</td></tr>
+        <tr><td>base_ceil1p45</td><td>9.14</td><td class="lose">0.665</td><td>0.0294</td>
+          <td class="win">0.77</td><td>9.28</td></tr>
+        <tr><td>f1k–2k base</td><td>15.81</td><td class="lose">0.520</td><td>0.0313</td>
+          <td class="win">1.10</td><td>15.93</td></tr>
+        <tr><td>f1k–2k base_ped0p8</td><td>3.46</td><td class="win">1.033</td><td>0.0356</td>
+          <td class="win">1.35</td><td>2.79</td></tr>
+      </tbody></table></div>
+    <p class="cap">Flattening the slow trend removes <b>82%</b> of the ATE on average; removing the
+    fast jitter removes 6%, and on the raw arms slightly less than nothing. corr(ATE, |log drift|)
+    = <b>+0.98</b>; corr(ATE, jitter) = −0.42, the wrong sign. The jitter sits at 0.029–0.036 in
+    every arm while the ATE spans 3.5–15.8 m.</p>
+  </div>
+
+  <div class="finding col"><p><b>So "wobble" was the drift all along.</b> The scatter above measures
+  the standard deviation of the local scale over the whole run, which is dominated by the trend
+  rather than by frame-to-frame noise — it predicts the ATE because it is mostly measuring the
+  drift. The fast component is nearly free. What a bound buys is not a steadier gauge from keyframe
+  to keyframe; it is a gauge that does not walk away over the run.</p></div>
+
+  <div class="finding col"><p><b>And R is exactly the drift knob.</b> Under-bound and the drift
+  sits below 1 (0.596 raw omni, 0.505 raw VGGT — the map's scale shrinks along the run);
+  over-bound and it overshoots (1.510 at <code>omni@ped1</code>). Every arm at its own optimum lands
+  on 1.0: 0.981, 0.995, 1.016, 1.033. The ATE minimum is the drift crossing, on both windows and
+  all three families.</p></div>
+
+  <div class="col">
     <p>The same thing in KITTI's own terms: the mean 100&nbsp;m chord ratio is 0.98&ndash;0.99 for
     every arm, good and bad alike. What separates them is its spread &mdash; &plusmn;0.056 for the best
     arm against &plusmn;0.186 for the worst. Nothing here is a bias that a better global scale would
@@ -258,6 +308,119 @@ ul{margin:0 0 15px; padding-left:20px;} li{margin-bottom:7px;}
   an affine relation to the lidar agrees: every prior wants a <em>negative</em> disparity offset
   (&minus;0.21 median disparity for omni, &minus;0.085 for VGGT base, &minus;0.024 adapted). Every
   knob that helps the trajectory pushes the other way.</p></div>
+</section>
+
+<section>
+  <div class="col">
+    <h2><span class="n">The map</span>The prior does not shape the map. BA does.</h2>
+    <p>Five extract runs — <code>omni</code>, <code>omni@ceil1.5</code>, <code>vggt</code>,
+    <code>vggt@ped1</code>, <code>vggt-adapted</code> — same scene, same window, same tracking
+    config, priors that disagree wildly. Each run's depth is put into metres by its <em>own</em>
+    Sim(3) scale to GT, so nobody borrows anyone's gauge, and they are compared on the 257
+    keyframes all five share.</p>
+    <p>What went in against what came out, as a pairwise median |log ratio|: the served priors
+    differ by <b>14.2%</b> on average (worst pair 23.4%), the finished maps by <b>8.1%</b> (worst
+    14.8%). So the tracker absorbs 43% of the disagreement it was handed — which is the boring
+    reading, and the wrong one.</p>
+  </div>
+
+  <div class="figure">
+    <div class="tablewrap"><table>
+      <thead><tr><th>fused depth vs lidar</th><th>omni</th><th>omni@ceil1.5</th><th>vggt</th>
+        <th>vggt@ped1</th><th>adapted</th></tr></thead>
+      <tbody>
+        <tr><td>0–10 m <span class="dim">one scale per run</span></td><td>14.6%</td>
+          <td class="win">7.2%</td><td>19.8%</td><td class="win">6.8%</td><td>17.0%</td></tr>
+        <tr><td>10–20 m</td><td>15.2%</td><td class="win">7.8%</td><td>20.5%</td>
+          <td class="win">7.3%</td><td>17.7%</td></tr>
+        <tr><td>20–40 m</td><td>16.5%</td><td class="win">10.2%</td><td>21.3%</td>
+          <td class="win">9.9%</td><td>18.6%</td></tr>
+        <tr><td>40–80 m</td><td>20.9%</td><td class="win">15.2%</td><td>25.3%</td>
+          <td class="win">15.2%</td><td>22.8%</td></tr>
+        <tr><td>0–10 m <span class="dim">one scale per frame</span></td><td>2.8%</td><td>2.9%</td>
+          <td>2.7%</td><td>3.0%</td><td>2.7%</td></tr>
+        <tr><td>10–20 m</td><td>3.8%</td><td>3.8%</td><td>3.9%</td><td>3.8%</td><td>3.9%</td></tr>
+        <tr><td>20–40 m</td><td>7.7%</td><td>7.7%</td><td>7.7%</td><td>7.8%</td><td>7.7%</td></tr>
+        <tr><td>40–80 m</td><td>13.6%</td><td>13.5%</td><td>13.6%</td><td>13.6%</td><td>13.4%</td></tr>
+      </tbody></table></div>
+    <p class="cap">Median |log ratio| against lidar, on the shared keyframes. The top half is
+    measured under one Sim(3) scale for the whole run; the bottom half re-fits a scale per frame.</p>
+  </div>
+
+  <div class="finding col"><p><b>Where the lidar can see, the five maps are the same map.</b> Take the gauge out and the shapes agree to within 0.1–0.3 percentage points at every range — 2.8% near, 13.6% far, in all
+  five arms, including the one whose prior asserts 40–80 m structure at a third of its true depth.
+  The error profile is BA's own and the prior does not move it. Everything that looked like a
+  difference between these maps, up to a factor of three, was the per-frame scale.</p></div>
+
+  <div class="col">
+    <h3>Where the maps <em>do</em> differ — and why that is consistent with JDSA being gauge-blind</h3>
+    <p>That comparison lives on lidar-valid pixels: 56% of the frame, none of it sky. Repeating it
+    against no reference at all — arm against arm, per-frame scale removed, binned by the tracker's
+    own depth — shows where the disagreement actually went.</p>
+  </div>
+
+  <div class="figure">
+    <div class="tablewrap"><table>
+      <thead><tr><th>pair (fused depth, per-frame scale removed)</th><th>0–1×</th><th>1–1.5×</th>
+        <th>1.5–2.5×</th><th>2.5–5×</th><th>&gt;5×</th></tr></thead>
+      <tbody>
+        <tr><td>omni vs omni@ceil1.5</td><td>0.3%</td><td>0.4%</td><td>0.9%</td><td>2.0%</td><td class="lose">15.8%</td></tr>
+        <tr><td>vggt vs vggt@ped1</td><td>0.7%</td><td>0.9%</td><td>1.4%</td><td>2.4%</td><td class="lose">34.0%</td></tr>
+        <tr><td>omni vs vggt</td><td>0.5%</td><td>0.6%</td><td>1.2%</td><td>2.2%</td><td class="lose">26.5%</td></tr>
+        <tr><td><b>omni@ceil1.5 vs vggt@ped1</b> <span class="dim">both bounded</span></td><td>0.5%</td>
+          <td>0.6%</td><td>1.0%</td><td>1.7%</td><td class="win">4.5%</td></tr>
+        <tr><td>vggt vs vggt-adapted <span class="dim">both unbounded</span></td><td>0.3%</td><td>0.4%</td>
+          <td>0.8%</td><td>1.4%</td><td>9.5%</td></tr>
+        <tr><td><b>share of pixels</b></td><td>50.0%</td><td>19.1%</td><td>11.9%</td><td>8.6%</td>
+          <td>10.4%</td></tr>
+      </tbody></table></div>
+    <p class="cap">Bands are the tracker's own depth in multiples of its frame median. The maps
+    agree to under 1% over the 69% of the frame nearer than 1.5× median — and disagree by up to 36%
+    in the 10% beyond 5×, which is exactly where BA has no parallax and the lidar has no returns.
+    Note which pair agrees out there: the two <em>bounded</em> arms, from different priors (4.5%),
+    each disagreeing with its own unbounded version by 16% and 34%.</p>
+  </div>
+
+  <div class="finding col"><p><b>So JDSA being gauge-blind is not a contradiction.</b> A per-frame
+  scale <em>is</em> free — scale the frame's depths and its grid together and the residual is
+  unchanged, which the fitted grids confirm to the digit. The prior therefore never says what scale
+  a frame is at. It says what the frame's <em>shape</em> is, and it is heard only where the
+  photometric term has nothing to say: the 10% of pixels past 5× the median depth, where the
+  tracker's own 99th percentile runs to 250–325× its median. The gauge follows from the shape, not
+  from the prior directly — and the bound, not the network, is what decides that shape.</p></div>
+
+  <div class="col">
+    <h3>In-frame scale versus cross-frame scale</h3>
+    <p>Which raises the obvious question: is one scale per frame the right model at all, or does a
+    frame need a range-dependent correction? Measured — the signed residual after a per-frame
+    scale, by band:</p>
+  </div>
+
+  <div class="figure">
+    <div class="tablewrap"><table>
+      <thead><tr><th></th><th>omni</th><th>omni@ceil1.5</th><th>vggt</th><th>vggt@ped1</th>
+        <th>adapted</th></tr></thead>
+      <tbody>
+        <tr><td>signed bias 0–10 m</td><td>−0.2%</td><td>−0.1%</td><td>−0.3%</td><td>−0.1%</td><td>−0.3%</td></tr>
+        <tr><td>10–20 m</td><td>+0.5%</td><td>+0.5%</td><td>+0.7%</td><td>+0.4%</td><td>+0.7%</td></tr>
+        <tr><td>20–40 m</td><td>+1.3%</td><td>+1.3%</td><td>+1.6%</td><td>+1.2%</td><td>+1.6%</td></tr>
+        <tr><td>40–80 m</td><td>−1.5%</td><td>−1.7%</td><td>−1.2%</td><td>−1.7%</td><td>−1.3%</td></tr>
+        <tr><td><b>scale spread across frames</b></td><td class="lose">15.9%</td>
+          <td class="win">7.0%</td><td class="lose">21.5%</td><td class="win">6.4%</td>
+          <td class="lose">18.1%</td></tr>
+        <tr><td>its p5–p95</td><td>0.81–1.28</td><td>0.91–1.11</td><td>0.76–1.38</td>
+          <td>0.91–1.10</td><td>0.78–1.31</td></tr>
+      </tbody></table></div>
+    <p class="cap">In-frame, across bands: a systematic wiggle of at most 1.7%, identical in every
+    arm. Across frames: 6.4% to 21.5%, and that is the only axis on which the arms differ.</p>
+  </div>
+
+  <div class="finding col"><p><b>One scale per frame is the right model; the frames disagreeing
+  with each other is the entire problem.</b> Within a frame, a single scale leaves a range-dependent
+  bias of at most 1.7% — an order of magnitude under the cross-frame spread, and the same in every
+  arm, so nothing about the prior touches it. Between frames the scales differ by 6.4% (the best
+  arm) to 21.5% (the worst), which is the wobble, which is the ATE. A prior cannot make the map
+  better shaped. It can only make the frames agree with each other.</p></div>
 </section>
 
 <section>

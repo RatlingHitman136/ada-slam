@@ -94,6 +94,12 @@ def run_online_adapt(runner, online_cfg, e2e_cfg, adapt_out, ckpt_dir, arm_out, 
         trainer = prior.trainer
         extra = make_record(arm_out, split_at)(trainer, max(trainer.units - 1, 0))
         extra['label'] = label
+        # what SERVING actually got, keyed by realised sequence length. The evidence that the two
+        # ends agree: at context_kf=N this must be dominated by N+1, with a small 1 bucket for the
+        # head of the sequence and terminate()'s inserted keyframes. Only the final save carries
+        # it - it is a whole-run count, and a mid-run checkpoint's would be a prefix, so
+        # make_record (which checkpoints share) deliberately does not.
+        extra['served_S'] = {str(k): v for k, v in sorted(prior.served_S.items())}
         print(f'saved adapter to {prior.save(adapt_out, extra=extra)}')
         json.dump(trainer.log, open(f'{adapt_out}/{TRAIN_LOG}', 'w'))
         print(f'training log in {adapt_out}/{TRAIN_LOG}')

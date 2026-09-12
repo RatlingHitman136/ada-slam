@@ -1437,14 +1437,59 @@ prior_extractor(mf, im_tensor)                    n = mf.video.counter.value
   +- n > warmup_kf and not in terminate() ?  ->   LiveTrainer.on_keyframe(video)
   |                                                 target  = counter - 1 - lag   (target.py)
   |                                                 sample  = image + 1/disps_up + depth_filter mask
+  |                                                           + context_kf preceding KEYFRAMES
   |                                                 steps   = steps_per_kf, through adapt/losses.py
   |
   +- n <  warmup_kf ?  ->  the FALLBACK prior's depth
      n >= warmup_kf ?  ->  VGGT's depth, from the weights the step above just produced
+                           over the arriving frame + the SAME context_kf preceding keyframes
 ```
 
 Normals stay Omnidata on **both** branches (`end2end/prior.py`'s job, inherited unchanged), so depth
 remains the only variable between this arm and the baselines.
+
+**`context_kf` governs both ends, and that is the whole reason it is usable.** It sets the sequence
+length `S = 1 + context_kf` for the training sample (`target.py:sample`) *and* for the depth the
+prior serves (`end2end/prior.py:context_stack`). It did not always: serving was hard-wired
+monocular, so raising `context_kf` fitted the adapter in a regime it was never asked to predict in
+— which is why every run recorded before this carries `context_kf: 0`, and why the one attempt at
+raising it lost ground. The serving side needs **no `hislam2/` edit**: the installed extractor is a
+plain function, so `mf.video.images` — the tracker's own CPU uint8 buffer at stream resolution
+(`depth_video.py:26`) — is reachable from inside it, and `motion_filter.py:96,120` call the
+extractor *before* `video.append`, so the arriving frame's predecessors are exactly
+`[counter-context_kf .. counter-1]`. That is the identical construction `target.py:context_keyframes`
+uses, which is what makes "the same number of keyframes adapts and serves" true by construction
+rather than by two hand-kept-in-sync code paths.
+
+Two things follow and are worth stating. `LoRAVGGT.predict_depth` needed no change — it always
+accepted `(S, 3, H, W)` and always ran the DPT head on frame 0 (`adapt/model.py:91-98`), exactly
+where `forward` puts the training target; it was simply never handed more than one frame. And
+`context_kf > 0` applies to **every** prior extraction, not only the adapted ones — but measured,
+that costs almost nothing. On a 4090 at `vggt_hw` 168×518 with base VGGT-1B the forward runs
+93/92/103/90/111 ms at S = 1…5 (peak 4.56 → 4.62 GiB) and one training step — forward, backward
+and the AdamW step, gradient checkpointing on — runs 392/387/398/401 ms at S = 1…4 (peak
+6.19 → 6.48 GiB). Both are flat to within noise, at roughly **+0.1 GiB per extra frame**. The
+reason is that a frame is only 12×37 = 444 patch tokens at this size, so the 48-block aggregator
+is launch-bound rather than attention-bound and the `S²` term in the global attention never comes
+to dominate. That is a statement about *this* resolution: re-measure before assuming it at a
+larger `vggt_hw`.
+
+**A frozen arm spells it `@ctx<N>`** — `'vggt_base@ctx2'`, or an adapt directory with the tag
+appended. Without it, replaying this run's saved adapter as an ordinary `END2END_PRIORS` entry
+would serve it monocular and reintroduce the very mismatch the knob exists to remove. It is
+parsed by `split_mods` like the §14 modifiers and names its own arm directory the same way
+(`base_ctx2`, `base_ctx2_ceil1p5`), but it is **not** a member of that family and is deliberately
+kept out of `MOD_ORDER`: those four are *served* transforms that post-process the depth a prior
+produced, so they are objects wrapping an extractor and compose in an order; `@ctx` changes the
+model's **input**, so it is consumed at construction (`make_prior` pops it and passes
+`context_kf=` to `VggtPrior`) and its tag is an integer frame count, never a `p`-decimal ratio.
+`config.py` keeps the two apart as `INPUT_MODS` and `MOD_ORDER`, with `SPEC_ORDER = INPUT_MODS +
+MOD_ORDER` fixing the one legal spelling — input first, because it acts first. Two refusals go
+with it: `'omnidata@ctx<N>'`, because upstream's prior squashes one image into a 512×512 square
+and has no sequence axis at all, and **any** `@ctx` spec in the **prior test**, because
+`PriorProbe` runs frame by frame against a `SimpleNamespace` host with no `DepthVideo` — it would
+be served monocular under a name ending `_ctx<N>`, a row that looks like evidence about a context
+arm and is not.
 
 `lag` defaults to 2 because that is the repo's own line: `track_frontend.__update` returns
 `arange(graph.ii.min(), t1-1)` (`track_frontend.py:65`), so `counter-2` is the newest index
@@ -1474,7 +1519,7 @@ of independent fits — the moments carry from the first keyframe to the last.
 | `adaslam/online/config.py` | `OnlineConfig` — frozen, no field carries a default (§9.5 rule 1). Its own config rather than `AdaptConfig`: that one carries a dozen fields this run never reads (`kf_fraction`, `val_source`, `train_frac`, `eval_*`, `keep_best`) whose `__post_init__` would force meaningless choices. Names that mean the same thing are spelled the same. `ceil_ratio` is the far-field ceiling on the *served* depth (§14) — the live arm's spelling of what a frozen arm spells `@ceil` in its spec — and `ceil_target` extends the same clamp to the training target (§14.4). |
 | `adaslam/online/target.py` | `settled` / `unit_keyframes` / `context_keyframes` / `LiveSampler` — the online counterpart of `adapt/data.py:SceneData`, returning **exactly** its 5-tuple so `adapt/losses.py` is reused unchanged. |
 | `adaslam/online/trainer.py` | `LiveTrainer` — the optimiser, `on_keyframe`, the checkpoint cadence, and `stats()`, whose key names are the offline ones wherever they mean the same thing. |
-| `adaslam/online/prior.py` | `OnlineVggtPrior(VggtPrior)` — the parent's extractor with the warm-up branch and the adaptation step around it. Still a plain function, never a bound method (§9.3's descriptor reasoning). |
+| `adaslam/online/prior.py` | `OnlineVggtPrior(VggtPrior)` — the parent's extractor with the warm-up branch and the adaptation step around it. Still a plain function, never a bound method (§9.3's descriptor reasoning). It passes `context_kf` **down to the parent**, because serving is the parent's job — so the live arm and a frozen `@ctx<N>` replay of it go through one implementation. |
 | `adaslam/online/stage.py` | `run_online_adapt` — build → run SLAM → save adapter → `evaluate` → release, with the same two-level cache `end2end/stage.py` uses. |
 | `adaslam/slam/stock_prior.py` | `stock_prior_extractor()`. Only `adaslam/slam/` may import `motion_filter`, and the stock prior *is* a `MotionFilter` method — the same reason `prior_probe.py` lives there. |
 
@@ -1527,6 +1572,19 @@ free from `evo/error_array.npy`.
   what §12.1's `adapt_cost` assumes. `LiveTrainer.on_keyframe` therefore keys a unit on the target's
   **frame timestamp**, not its index — indices shift under that pruning, timestamps do not. The same
   applies to `n_train_kf`.
+- **`terminate()` inserts keyframes in the MIDDLE, so "the last N keyframes" is not the context
+  there.** `hi2.py:139-143` fills low-covisibility gaps by calling `video.shift(place)` and *then*
+  the extractor, and `shift` copies `[place:counter]` up by one and increments `counter` — so the
+  arriving keyframe lands at slot `place`, not at the end, and `counter-1 … counter-N` are the tail
+  of the sequence rather than this frame's predecessors. Serving those as context would be actively
+  wrong, not merely stale, so `context_stack` returns `None` while `video.ready.value != 0` and
+  those keyframes are served **monocular**. It is the same gate the trainer already uses, and the
+  `served_S` histogram makes the cost visible: an `S = 1` bucket alongside the `S = 1 + context_kf`
+  one, holding the head of the sequence plus however many gaps `terminate()` filled. The
+  alternative — recovering `place` from the duplicated `tstamp` that `shift` leaves behind — was
+  considered and rejected: it couples `adaslam/` to `DepthVideo.shift`'s internals to fix a handful
+  of frames.
+
 - **Seeding the adapter inside an arm moves the trajectory, and the RNG state must be restored.**
   §9.5's rule is that the seed belongs to the constructor, because `LoRALinear.A` is
   kaiming-initialised at injection. Offline that is harmless: `adapt` is its own stage and no SLAM
