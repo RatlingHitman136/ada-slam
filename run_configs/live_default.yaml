@@ -118,6 +118,12 @@ online:
   gate_metric: raw                    # 'rel' = flat across a run | 'raw' = drifts with it
   gate_lo: 0.0                      # 0 = off; skip BELOW this - the target already fits
   gate_hi: 0.0                        # 0 = off; skip ABOVE this - the target is broken, not hard
+  gate_scope: arrival                 # 'arrival' = the band on the newest keyframe, once per unit | 'sample' = on every training sample
+  # the unit breaker: skip a unit whose whole window has gone bad (online/config.py)
+  breaker_k: 0.0                      # 0 = off; else > 1 - window median loss > k x the recent median
+  breaker_window: 100                 # untripped units the reference median spans
+  breaker_warmup: 40                  # units that only feed the reference
+  breaker_serve: adapted              # 'adapted' | 'base' - what the tracker is served while the breaker is tripped
   # output
   checkpoint_every_kf: 0              # 0 = off; N = a loadable adapter dir every N
                                       # adapted keyframes

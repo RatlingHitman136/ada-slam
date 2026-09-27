@@ -20,6 +20,20 @@ WARMUP_PRIORS = ('omnidata',   # upstream's own prior - a genuinely different mo
 # the sounder one - see gate_metric below.
 GATE_METRICS = ('rel', 'raw')
 
+# WHERE the band (gate_lo, gate_hi) is read. 'arrival' reads the newest keyframe once, before its unit -
+# the only behaviour before this field existed; a refusal skips the whole unit. 'sample' reads EVERY
+# training sample inside every step, off the forward the step already runs; a refused sample gets no
+# gradient and the rest of its batch still trains. The difference matters under 'wonline', where a
+# keyframe is re-trained for window_size arrivals and its target can go bad AFTER it arrived: over
+# M2DGR street_02's five full-route gauge runs, 58-83% of the keyframes whose loss later exceeded 1.0
+# were below it on arrival, so an arrival gate at that threshold would have blocked only 15-30% of the
+# corrupted exposures. At 'sample' the floor also changes meaning: it stops re-fitting window samples
+# that already fit (a keyframe's loss falls to ~0.44x its arrival value over its 10 units there).
+GATE_SCOPES = ('arrival', 'sample')
+
+# What the tracker is served while the unit breaker is tripped - see OnlineConfig.breaker_serve.
+BREAKER_SERVES = ('adapted', 'base')
+
 
 @dataclass(frozen=True)
 class OnlineConfig:
@@ -310,8 +324,51 @@ class OnlineConfig:
                                  #   rel  median 0.023-0.029, p98 ~0.056, outliers 0.9-55
                                  #   raw  median 0.015-0.026, p98 ~0.083, outliers 0.56-11
                                  # measured over five live runs on rellis_00000.
+                                 # Under normalize_target the loss is in the target's own gauge,
+                                 # so NONE of those carry over. M2DGR gauge runs (gate_01 and
+                                 # street_02; per-keyframe losses recovered from train_log.json),
+                                 # 'raw':
+                                 #   hi  newest keyframe per arrival median 0.013-0.019, p99
+                                 #       0.06-0.13; 6 of 54334 clean training samples exceed 1.0,
+                                 #       the corrupted street_02 stretch (full routes past
+                                 #       ~900 m) reaches 1-559 - a clean gap, gate_hi 1.0
+                                 #   lo  per training sample p5/p25/p50 street_02 0.0045/0.0074/
+                                 #       0.0101, gate_01 0.0027/0.0051/0.0073 - no gap, and the
+                                 #       scale is scene-dependent: derive a floor per scene
+                                 # 'rel' separates worse there (clean tail to ~8).
     gate_lo: float               # 0 = off; skip below this. Already-fit frames.
     gate_hi: float               # 0 = off; skip above this. Broken/degenerate targets.
+    gate_scope: str              # 'arrival' | 'sample' - where the band is read, see GATE_SCOPES
+
+    # ---------------------------------------------------------------- the unit breaker
+    # SKIP an arrival's whole unit when its window has gone bad AS A WHOLE: the median loss over the
+    # window's keyframes, measured before the unit trains (gate_value - eval mode, no grad, one forward
+    # per keyframe), exceeds breaker_k x the median of the last breaker_window units that did train.
+    # gate_metric picks the quantity. Not latching: a later window that measures clean again trains,
+    # so adaptation can resume if the map recovers.
+    #
+    # Why a UNIT breaker and not a sample gate. On M2DGR street_02's full route the tracker fails at
+    # ~850 m and the whole window goes moderately wrong (unit median losses 0.08-25 against a settled
+    # 0.010), while depth_loss's L1 caps what any single sample can pull. gate_hi 1.0 per sample
+    # refused 941 extreme samples and the run collapsed exactly as without it (ATE 121.5 vs 121.4 m),
+    # the adapter still ending at 4.3x raw VGGT's lidar AbsRel. Replayed on the four full-route train
+    # logs (window 100, warm-up 40): settled unit medians p50 0.010, p99 0.014-0.017; k=2 tripped
+    # falsely once in ~1600 clean units and first at 872-967 m, ahead of the harm at 1161 m; k=3 never
+    # falsely, first at 877-977 m.
+    breaker_k: float             # 0 = off; else > 1 - trip when the window median > k x reference
+    breaker_window: int          # untripped units the reference median spans
+    breaker_warmup: int          # units that only FEED the reference - the first ones carry the
+                                 # untrained adapter's loss (~0.3 on street_02, not ~0.01)
+    # WHAT THE TRACKER IS SERVED while the breaker's latest check has tripped. 'adapted' keeps serving the
+    # adapter - the only behaviour before this field existed. 'base' serves VGGT-base instead: every
+    # LoRALinear's scaling is zeroed for that one served forward and restored straight after, so training,
+    # the gates and the breaker itself keep measuring the adapter, and serving returns to it if the
+    # breaker re-opens. Why: on street_02's full route three frozen VGGT runs recover from the ~850 m
+    # collapse at 1261-1283 m, while the k=2 breaker runs - which stopped training at 833-922 m and kept
+    # the adapter within 19-32% of raw VGGT's lidar AbsRel - recover at 1315-1443 m and score
+    # 136.8 +/- 5.7 m on the last 792 m against frozen VGGT's 70.1 +/- 8.9. With training already stopped,
+    # the model SERVED through the collapse is what is left between those arms.
+    breaker_serve: str           # 'adapted' | 'base'
 
     # ---------------------------------------------------------------- output
     checkpoint_every_kf: int     # 0 = off; N = a full loadable adapter dir every N adapted units
@@ -414,14 +471,10 @@ class OnlineConfig:
                     f'normalize_target=True with {name}={getattr(self, name)}: {name} penalises '
                     f'scale INCONSISTENCY on top of a scale-invariant loss, which normalize_target '
                     f'removes outright. Set {name} to 0.')
-        # gate_lo/gate_hi are thresholds on the depth loss itself, and normalize_target changes
-        # what that loss measures - a threshold tuned in map units would gate on nothing meaningful
-        if self.normalize_target and (self.gate_lo or self.gate_hi):
-            raise ValueError(
-                f'normalize_target=True with gate_lo={self.gate_lo}/gate_hi={self.gate_hi}: the '
-                f'gate thresholds the depth loss, and normalizing the target changes that loss\'s '
-                f'units, so a threshold chosen before this change no longer means anything. Set '
-                f'both to 0, or re-derive them from a normalized run first.')
+        # gate_lo/gate_hi are thresholds on the depth loss itself, and normalize_target changes what
+        # that loss measures, so a threshold tuned in map units gates on nothing meaningful here. Both
+        # bounds are allowed under it because normalized references now exist (gate_metric above) -
+        # read those, not the RELLIS ones, when choosing a band for a normalized run.
         if self.freeze_gauge and not self.coupled_scale:
             raise ValueError('freeze_gauge=True with coupled_scale=False does nothing: there is '
                              'no pose gauge to hold fixed, because depth_loss fits its own '
@@ -489,6 +542,24 @@ class OnlineConfig:
                              f'(0 = off)')
         if self.gate_metric not in GATE_METRICS:
             raise ValueError(f'gate_metric={self.gate_metric!r} is not one of {GATE_METRICS}')
+        if self.gate_scope not in GATE_SCOPES:
+            raise ValueError(f'gate_scope={self.gate_scope!r} is not one of {GATE_SCOPES}')
+        if self.gate_scope == 'sample' and self.gate_lo <= 0 and self.gate_hi <= 0:
+            raise ValueError('gate_scope=sample with gate_lo=0 and gate_hi=0 gates nothing - a '
+                             'silent no-op arm. Set a bound, or gate_scope arrival (the gates-off '
+                             'default).')
+        if self.breaker_k < 0 or 0 < self.breaker_k <= 1:
+            raise ValueError(f'breaker_k={self.breaker_k} must be 0 (off) or > 1: at k <= 1 about half '
+                             f'of all ordinary units sit above their own running median and would trip')
+        if self.breaker_window < 1 or self.breaker_warmup < 1:
+            raise ValueError(f'breaker_window={self.breaker_window} and breaker_warmup='
+                             f'{self.breaker_warmup} must both be >= 1: the reference median needs at '
+                             f'least one untripped unit before anything can trip')
+        if self.breaker_serve not in BREAKER_SERVES:
+            raise ValueError(f'breaker_serve={self.breaker_serve!r} is not one of {BREAKER_SERVES}')
+        if self.breaker_serve == 'base' and self.breaker_k <= 0:
+            raise ValueError("breaker_serve='base' with breaker_k=0 does nothing: the breaker never trips, "
+                             "so VGGT-base is never served. Set breaker_k, or breaker_serve 'adapted'.")
         for name in ('gate_lo', 'gate_hi'):
             if getattr(self, name) < 0:
                 raise ValueError(f'{name}={getattr(self, name)} must be >= 0 (0 = off)')

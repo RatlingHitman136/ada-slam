@@ -220,7 +220,16 @@ ONLINE = P.over('online', OnlineConfig(
                                # NOTE both bounds were calibrated on RELLIS, and 'raw' carries the
                                # tracker's own depth unit - which KITTI does not share. Read
                                # gate_log.json after the first run and re-derive them; the band can
-                               # be re-chosen from one run's log without re-running.
+                               # be re-chosen from one run's log without re-running. Under
+                               # normalize_target use online/config.py's normalized references.
+    gate_scope='arrival',      # 'arrival' = the band on the newest keyframe, once per unit |
+                               # 'sample' = on every training sample of every step
+
+    # ---- the unit breaker: skip a unit whose whole window has gone bad (online/config.py) ----
+    breaker_k=0.0,             # 0 = off; else > 1 - window median loss > k x the recent median
+    breaker_window=100,        # untripped units the reference median spans
+    breaker_warmup=40,         # units that only feed the reference
+    breaker_serve='adapted',   # 'adapted' | 'base' - what the tracker is served while the breaker is tripped
 
     # ---- output ----
     checkpoint_every_kf=0),  # 0 = off; N = a loadable adapter dir every N adapted keyframes

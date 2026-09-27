@@ -26,7 +26,9 @@ from ..runtime import free_vram
 from .prior import OnlineVggtPrior
 
 TRAIN_LOG = 'train_log.json'
-GATE_LOG = 'gate_log.json'      # every arrival the loss gate saw, trained or skipped
+GATE_LOG = 'gate_log.json'      # every arrival (gate_scope arrival) or training sample (sample) the
+                                # loss gate saw, trained or skipped
+BREAKER_LOG = 'breaker_log.json'  # every unit the breaker measured: window median, reference, tripped
 
 
 def make_record(arm_out, split_at):
@@ -89,6 +91,7 @@ def run_online_adapt(runner, online_cfg, e2e_cfg, adapt_out, ckpt_dir, arm_out, 
                           gtdepthdir=None, prior=prior).n_kf
         print(f'\nSLAM done in {time.time()-t0:.0f}s, {n_kf} keyframes')
         print(prior.trainer.summary())
+        print(f'  served after handover: {dict(prior.served_source)}')
 
         # save() before release(), always: it goes through _ensure_live()
         trainer = prior.trainer
@@ -100,16 +103,22 @@ def run_online_adapt(runner, online_cfg, e2e_cfg, adapt_out, ckpt_dir, arm_out, 
         # it - it is a whole-run count, and a mid-run checkpoint's would be a prefix, so
         # make_record (which checkpoints share) deliberately does not.
         extra['served_S'] = {str(k): v for k, v in sorted(prior.served_S.items())}
+        # which model served each post-handover call: breaker_serve 'base' switches to VGGT-base while the
+        # breaker is tripped (online/config.py)
+        extra['served_source'] = dict(prior.served_source)
         print(f'saved adapter to {prior.save(adapt_out, extra=extra)}')
         json.dump(trainer.log, open(f'{adapt_out}/{TRAIN_LOG}', 'w'))
         print(f'training log in {adapt_out}/{TRAIN_LOG}')
         # separate file, not a row in train_log.json: that log's record shape is a contract shared
         # with adapt/trainer.py, and a reader there would trip over a record with no 'loss'.
-        # Written whenever the gate ran at all, INCLUDING the arrivals it let through - which is
+        # Written whenever the gate ran at all, INCLUDING the arrivals/samples it let through - which is
         # what makes a threshold re-choosable without re-running.
         if trainer.gate_log:
             json.dump(trainer.gate_log, open(f'{adapt_out}/{GATE_LOG}', 'w'))
             print(f'gate log in {adapt_out}/{GATE_LOG}')
+        if trainer.breaker_log:
+            json.dump(trainer.breaker_log, open(f'{adapt_out}/{BREAKER_LOG}', 'w'))
+            print(f'breaker log in {adapt_out}/{BREAKER_LOG}')
     finally:
         prior.release()          # in a finally: a crashed run otherwise strands ~2.5 GB
     free_vram('online adapt')

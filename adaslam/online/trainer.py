@@ -59,6 +59,14 @@ class LiveTrainer:
         # can be re-chosen from one run instead of re-running per candidate value.
         self.gate_log = []
         self.skipped = {'low': 0, 'high': 0, 'empty': 0}
+        self.n_opt_steps = 0       # optimiser steps actually taken - below len(log) only when
+                                   # gate_scope 'sample' refused a whole batch
+        # the unit breaker (online/config.py:breaker_k): every arrival it measured, tripped or not,
+        # and the window medians of the units that did train - the reference it trips against
+        self.breaker_log = []
+        self._breaker_ref = []
+        self.breaker_tripped = False  # the LATEST verdict - OnlineVggtPrior serves VGGT-base on it under
+                                      # breaker_serve 'base'; False until the breaker first trips
         self.t0 = time.time()
 
     # ---------------------------------------------------------------- frames
@@ -141,6 +149,8 @@ class LiveTrainer:
         lo, hi = cfg.gate_lo, cfg.gate_hi
         if lo <= 0 and hi <= 0:
             return True                      # gate off - do not spend the forward
+        if cfg.gate_scope == 'sample':
+            return True                      # _step reads the band on every sample instead
         rel, raw = self.gate_value(video, kfs[-1])
         val = rel if cfg.gate_metric == 'rel' else raw
         if val is None:
@@ -154,13 +164,82 @@ class LiveTrainer:
         # both metrics are recorded whichever one decided, so gate_log.json can be re-thresholded
         # on either axis afterwards without another run
         self.gate_log.append({'frame': frame, 'rel': rel, 'raw': raw, 'metric': cfg.gate_metric,
-                              'verdict': verdict, 'unit': self.units})
+                              'verdict': verdict, 'unit': self.units, 'scope': 'arrival'})
         if verdict == 'train':
             return True
         self.skipped[verdict] += 1
         print(f'  [adapt] SKIP kf frame {frame}: {cfg.gate_metric} '
               f'{"n/a" if val is None else f"{val:.4f}"} ({verdict})')
         return False
+
+    def breaker(self, video, kfs, frame):
+        """breaker_k: may this arrival's unit train, or has its whole window gone bad? Logged either way.
+
+        One gate_value per window keyframe - the arrival gate's own measurement (eval mode, no grad,
+        frame 0), so the two read the same quantity - and the MEDIAN of them against the median of the
+        last breaker_window units that trained. The median is the point: one broken keyframe must not
+        trip it, a window whose targets have ALL drifted must. A tripped unit never enters the
+        reference, so a long bad stretch cannot drag the reference up and switch the breaker off; the
+        first breaker_warmup units only feed it.
+        """
+        cfg = self.cfg
+        if cfg.breaker_k <= 0:
+            return True                      # off - do not spend the forwards
+        vals = []
+        for t in kfs:
+            rel, raw = self.gate_value(video, t)
+            v = rel if cfg.gate_metric == 'rel' else raw
+            if v is not None:
+                vals.append(v)
+        ref = float(np.median(self._breaker_ref[-cfg.breaker_window:])) if self._breaker_ref else None
+        armed = len(self._breaker_ref) >= cfg.breaker_warmup
+        if not vals:
+            med, tripped = None, False       # nothing measurable: train, leave the reference alone
+        else:
+            med = float(np.median(vals))
+            tripped = armed and med > cfg.breaker_k * ref
+            if not tripped:
+                self._breaker_ref.append(med)
+        self.breaker_tripped = tripped
+        self.breaker_log.append({'frame': frame, 'unit': self.units, 'median': med, 'ref': ref,
+                                 'n_kf': len(vals), 'armed': armed, 'tripped': tripped,
+                                 'metric': cfg.gate_metric})
+        if not tripped:
+            return True
+        print(f'  [adapt] BREAKER kf frame {frame}: window median {cfg.gate_metric} {med:.4f} > '
+              f'{cfg.breaker_k:g} x {ref:.4f} - unit skipped')
+        return False
+
+    def _sample_gate(self, video, unit, step, t, l_d, gt, mask):
+        """gate_scope 'sample': the band (gate_lo, gate_hi) on ONE training sample. Returns the verdict.
+
+        The same two quantities gate_value measures, the same gate_metric choice and the same verdict
+        order as gate(), but read off the step's own TRAIN-mode forward instead of an extra eval-mode
+        one - free, and the quantity the normalized M2DGR references were derived from
+        (online/config.py). Every check is logged, trained or not, so the band stays re-choosable
+        from one run's gate_log.json.
+        """
+        cfg = self.cfg
+        raw = float(l_d.detach())
+        rel = relative_loss(raw, gt, mask)
+        val = rel if cfg.gate_metric == 'rel' else raw
+        if val is None or mask.sum() < cfg.min_mask_pixels:
+            verdict = 'empty'                # depth_loss returned pred.sum() * 0 - nothing to learn
+        elif cfg.gate_lo > 0 and val < cfg.gate_lo:
+            verdict = 'low'
+        elif cfg.gate_hi > 0 and val > cfg.gate_hi:
+            verdict = 'high'
+        else:
+            verdict = 'train'
+        frame = self.frame(video, t)
+        self.gate_log.append({'frame': frame, 'rel': rel, 'raw': raw, 'metric': cfg.gate_metric,
+                              'verdict': verdict, 'unit': unit, 'step': step, 'scope': 'sample'})
+        if verdict != 'train':
+            self.skipped[verdict] += 1
+        if verdict == 'high':                # the rare one worth a line; 'low' can be most samples
+            print(f'  [adapt] GATE kf frame {frame} in kf{unit} s{step}: {cfg.gate_metric} '
+                  f'{val:.4f} > {cfg.gate_hi} - no gradient')
+        return verdict
 
     # ---------------------------------------------------------------- the step
 
@@ -190,6 +269,10 @@ class LiveTrainer:
         # and BEFORE first_kf is claimed, so first_adapted_kf stays "the first frame actually
         # trained on" rather than the first one merely looked at.
         if not self.gate(video, kfs, int(tstamp)):
+            return None
+        # the unit breaker: after the arrival gate (an arrival it skipped is never measured here) and,
+        # for the same reason as the gate, before first_kf is claimed
+        if not self.breaker(video, kfs, int(tstamp)):
             return None
 
         batches = self.batches(kfs)
@@ -356,7 +439,8 @@ class LiveTrainer:
         if anchor is None and cfg.lambda_cons > 0 and len(samples) > 1 and not cfg.anchor_kf:
             anchor = self._scale_anchor(samples)
 
-        for images, gt, mask, gt_enc, seq, norm in samples:
+        gated = {'low': 0, 'high': 0, 'empty': 0}
+        for t, (images, gt, mask, gt_enc, seq, norm) in zip(batch, samples):
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 pred_depth, pred_enc = self.lora.forward(
                     images, all_frames=cfg.depth_all_frames)
@@ -410,8 +494,17 @@ class LiveTrainer:
             if l_c is not None:
                 acc['l_cons'].append(float(l_c))
 
-            # the MEAN over the batch, so grad magnitude is independent of batch_size
-            (loss / len(batch)).backward()
+            # gate_scope 'sample' (online/config.py): the band is read here, BEFORE backward, so a
+            # refused sample contributes no gradient. It is still accumulated below, so train_log
+            # keeps showing what was refused.
+            verdict = (self._sample_gate(video, unit, step, t, l_d, gt, mask)
+                       if cfg.gate_scope == 'sample' else 'train')
+            if verdict == 'train':
+                # the MEAN over the batch, so grad magnitude is independent of batch_size - a refused
+                # sample stays in the divisor, so the one left keeps its usual weight
+                (loss / len(batch)).backward()
+            else:
+                gated[verdict] += 1
             self.visits += 1
 
             seq_lens.append(len(seq))
@@ -422,8 +515,12 @@ class LiveTrainer:
             if pose_scale is not None and depth_scale is not None:
                 acc['scale_ratio'].append((depth_scale / pose_scale).item())
 
-        torch.nn.utils.clip_grad_norm_(self.trainable, cfg.grad_clip)
-        self.opt.step()
+        # a batch with no sample left to train takes NO optimiser step - AdamW's momentum would
+        # otherwise keep moving the weights on a step whose every sample was refused
+        if sum(gated.values()) < len(batch):
+            torch.nn.utils.clip_grad_norm_(self.trainable, cfg.grad_clip)
+            self.opt.step()
+            self.n_opt_steps += 1
 
         # same shape as adapt/trainer.py:233, so one reader serves both logs - and 'kfs' means the
         # same thing in both, FRAME indices: offline they come from poses_slam.txt, live they must
@@ -431,6 +528,7 @@ class LiveTrainer:
         rec = {'epoch': unit, 'step': step, 'S': seq_lens,
                'kfs': [self.frame(video, t) for t in batch],
                **({'batch_scale': float(shared)} if shared is not None else {}),
+               **({f'n_gated_{k}': v for k, v in gated.items()} if cfg.gate_scope == 'sample' else {}),
                **{k: float(np.mean(v)) for k, v in acc.items() if v}}
         self.log.append(rec)
 
@@ -527,6 +625,20 @@ class LiveTrainer:
                 # reached the gate, so n_gate_checks - sum(skipped) is what n_units should equal.
                 'gate_metric': cfg.gate_metric,
                 'gate_lo': cfg.gate_lo, 'gate_hi': cfg.gate_hi,
+                # 'arrival' = the band on the newest keyframe before its unit; 'sample' = on every
+                # training sample, where n_gate_checks and n_skipped_* count SAMPLES, not arrivals,
+                # and n_opt_steps (steps that actually stepped) can fall below `steps`
+                'gate_scope': cfg.gate_scope,
+                'n_opt_steps': self.n_opt_steps,
+                # the unit breaker and what it did: every arrival that passed the arrival gate is
+                # checked, and the untripped ones went on to train
+                'breaker_k': cfg.breaker_k, 'breaker_window': cfg.breaker_window,
+                'breaker_warmup': cfg.breaker_warmup,
+                'breaker_serve': cfg.breaker_serve,
+                'n_breaker_checks': len(self.breaker_log),
+                'n_breaker_trips': sum(b['tripped'] for b in self.breaker_log),
+                'first_breaker_trip_frame': next((b['frame'] for b in self.breaker_log if b['tripped']),
+                                                 None),
                 'n_gate_checks': len(self.gate_log),
                 'n_skipped_low': self.skipped['low'],
                 'n_skipped_high': self.skipped['high'],
@@ -550,10 +662,14 @@ class LiveTrainer:
                f'  target, so this tracks how hard the scene got as much as how well it fits')
         if self.gate_log:
             n = sum(self.skipped.values())
-            out += (f'\n  gate on {self.cfg.gate_metric} ({self.cfg.gate_lo}, {self.cfg.gate_hi}): '
-                    f'{len(self.gate_log)} arrivals checked, {n} skipped '
+            what = 'samples' if self.cfg.gate_scope == 'sample' else 'arrivals'
+            out += (f'\n  gate on {self.cfg.gate_metric} ({self.cfg.gate_lo}, {self.cfg.gate_hi}), '
+                    f'scope {self.cfg.gate_scope}: {len(self.gate_log)} {what} checked, {n} skipped '
                     f'(low {self.skipped["low"]}, high {self.skipped["high"]}, '
                     f'empty {self.skipped["empty"]})')
+            if self.cfg.gate_scope == 'sample':
+                out += (f'\n  {len(self.log) - self.n_opt_steps} of {len(self.log)} steps refused every '
+                        f'sample and took no optimiser step')
             # BOTH metrics, so the run also reports what the OTHER threshold should have been
             for key in ('rel', 'raw'):
                 v = [g[key] for g in self.gate_log if g[key] is not None]
@@ -562,6 +678,17 @@ class LiveTrainer:
                     out += (f'\n    {key:<3} p25 {q[0]:.4f}  median {q[1]:.4f}  p90 {q[2]:.4f}  '
                             f'p98 {q[3]:.4f}  max {q[4]:.4f}')
             out += '\n  retune either axis off gate_log.json - it needs no second run'
+        if self.breaker_log:
+            trips = [b for b in self.breaker_log if b['tripped']]
+            meds = [b['median'] for b in self.breaker_log if b['median'] is not None]
+            out += (f'\n  breaker k={self.cfg.breaker_k:g} on {self.cfg.gate_metric} (window '
+                    f'{self.cfg.breaker_window}, warm-up {self.cfg.breaker_warmup}): '
+                    f'{len(self.breaker_log)} units checked, {len(trips)} tripped'
+                    + (f', first at frame {trips[0]["frame"]}' if trips else ''))
+            if meds:
+                q = np.percentile(meds, [50, 90, 99, 100])
+                out += (f'\n    window median p50 {q[0]:.4f}  p90 {q[1]:.4f}  p99 {q[2]:.4f}  '
+                        f'max {q[3]:.4f}')
         return out
 
     def release(self):

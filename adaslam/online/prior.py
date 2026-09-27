@@ -19,8 +19,11 @@ already worth serving. handover_kf == warmup_kf is the old single-gate behaviour
 Normals stay Omnidata on BOTH branches (the parent's job), so depth remains the only variable
 between this arm and the baselines.
 """
+from collections import Counter
+
 import torch
 
+from ..adapt.lora import LoRALinear
 from ..end2end.prior import VggtPrior
 
 from .trainer import LiveTrainer
@@ -59,6 +62,12 @@ class OnlineVggtPrior(VggtPrior):
         # records must be absolute (trainer.py:frame)
         self.trainer = LiveTrainer(self.model, online_cfg, ckpt_dir=ckpt_dir, record=record,
                                    frame_offset=frame_offset)
+        # breaker_serve 'base' (online/config.py): every LoRALinear of the served model, zeroed for one
+        # served forward while the breaker is tripped. served_source counts which model served each
+        # post-handover call; the stage records it beside served_S.
+        self._lora_layers = [m for m in self.model.model.modules() if isinstance(m, LoRALinear)]
+        self.served_source = Counter()
+        self._serving_base = False
 
         # CAPTURED HERE, NOT AT CALL TIME. SlamRunner.run overwrites
         # MotionFilter.prior_extractor with ours (runner.py:81-83) before the first frame, so
@@ -149,10 +158,31 @@ class OnlineVggtPrior(VggtPrior):
                 trainer.warmup_end_frame = trainer.frame(video, n - 1) + 1
                 print(f'  [online] handover at keyframe {n}, frame '
                       f'{trainer.warmup_end_frame}: VGGT is the depth prior from here')
-            depth, normal = vggt_fn(mf, im_tensor)
+            base = cfg.breaker_serve == 'base' and trainer.breaker_tripped
+            if base != self._serving_base:
+                # printed at the switch, not per call; the frame is the newest keyframe in the map
+                print(f'  [online] frame {trainer.frame(video, max(n - 1, 0))}: breaker '
+                      + ('tripped - serving VGGT-base' if base else 're-opened - serving the adapter again'))
+                self._serving_base = base
+            self.served_source['base' if base else 'adapted'] += 1
+            depth, normal = self._base_forward(vggt_fn, mf, im_tensor) if base else vggt_fn(mf, im_tensor)
             return serve(depth), normal
 
         return prior_extractor
+
+    def _base_forward(self, vggt_fn, mf, im_tensor):
+        """One served forward as VGGT-base. (B A x) * 0 is exactly zero, so zeroing every LoRALinear's
+        scaling IS the stock model, with no second copy of the weights on the GPU. Restored in a finally,
+        so the next training step, gate and breaker measurement see the adapter whatever happened here.
+        """
+        saved = [m.scaling for m in self._lora_layers]
+        for m in self._lora_layers:
+            m.scaling = 0.0
+        try:
+            return vggt_fn(mf, im_tensor)
+        finally:
+            for m, s in zip(self._lora_layers, saved):
+                m.scaling = s
 
     def save(self, out_dir, extra=None):
         """The adapter this run produced, in the normal handoff shape (adapt/stage.py's).
