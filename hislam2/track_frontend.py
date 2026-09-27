@@ -30,7 +30,7 @@ class TrackFrontend:
         # optional, .get so every config that predates it keeps upstream's flat alpha
         self.video.mono_depth_far_gain = config.get("mono_depth_far_gain", 1.0)
         # THE PRIOR-FREE CONTROL. False skips every JDSA call, leaving upstream DROID exactly:
-        # depth_video.py:244 runs droid_backends.ba() unconditionally and JDSA is an ADDITIONAL
+        # depth_video.cuda_ba runs droid_backends.ba() unconditionally and JDSA is an ADDITIONAL
         # refinement gated on use_mono, so turning it off subtracts the prior rather than breaking
         # the solver. mono_depth_alpha=0 would NOT do this - geom/ba.py:227 has alpha REPLACE the
         # network's damping eta wherever the prior is valid, so at 0 those pixels lose their
@@ -38,6 +38,14 @@ class TrackFrontend:
         # system. The prior still fills disps_prior and seeds dscales here, and both go unread:
         # disps are initialised from the previous keyframe's mean (below), never from the prior.
         self.mono_depth_enable = config.get("mono_depth_enable", True)
+        # Depth prior INSIDE droid_backends.ba (DROID RGB-D style, droid_kernels.cu ba_cuda): where the prior is
+        # valid ba_prior_alpha replaces eta in the disparity block and pulls disps towards the prior, so unlike
+        # JDSA (which runs after BA and never moves a pose) it reaches the pose solve. Same calls as JDSA
+        # (use_mono), JDSA still runs after it. 0 = off = upstream. Mode 'aligned' pulls towards
+        # disps_prior x bilinear(dscales) (JDSA's target), 'raw' towards disps_prior in its own units.
+        self.video.ba_prior_alpha = float(config.get("ba_prior_alpha", 0.0))
+        self.video.ba_prior_mode = config.get("ba_prior_mode", "aligned")
+        assert self.video.ba_prior_mode in ("aligned", "raw"), self.video.ba_prior_mode
 
     def __update(self, is_last):
         """ add edges, perform update """

@@ -7,7 +7,7 @@ from torch.multiprocessing import Value
 
 from modules.droid_net import cvx_upsample
 import geom.projective_ops as pops
-from geom.ba import JDSA
+from geom.ba import JDSA, get_prior_depth_aligned
 from pgo_buffer import global_relative_posesim3_constraints
 
 class DepthVideo:
@@ -240,7 +240,20 @@ class DepthVideo:
             target = target.view(-1, ht, wd, 2).permute(0,3,1,2).contiguous()
             weight = weight.view(-1, ht, wd, 2).permute(0,3,1,2).contiguous()
 
-            droid_backends.ba(self.poses, self.disps, self.intrinsics[0], target, weight, eta, ii, jj, t0, t1, itrs, lm, ep, motion_only)
+            alpha = getattr(self, 'ba_prior_alpha', 0.0)
+            if use_mono and alpha > 0 and not motion_only:
+                # depth prior INSIDE the BA (ba_prior_alpha/ba_prior_mode, track_frontend.py); JDSA still follows
+                p = self.disps_prior[:t1]
+                if getattr(self, 'ba_prior_mode', 'aligned') == 'aligned':
+                    p = get_prior_depth_aligned(p, self.dscales[:t1])[0]
+                prior_disp = torch.zeros_like(self.disps)
+                prior_disp[:t1] = p
+                prior_w = torch.zeros_like(self.disps)
+                prior_w[:t1] = alpha * (self.disps_prior[:t1] > 0).float()
+                droid_backends.ba_prior(self.poses, self.disps, self.intrinsics[0], target, weight, eta, ii, jj,
+                                        t0, t1, itrs, lm, ep, motion_only, prior_disp, prior_w)
+            else:
+                droid_backends.ba(self.poses, self.disps, self.intrinsics[0], target, weight, eta, ii, jj, t0, t1, itrs, lm, ep, motion_only)
 
             if use_mono:
                 poses = lietorch.SE3(self.poses[:t1][None])
