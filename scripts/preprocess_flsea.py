@@ -11,13 +11,31 @@ Produces preprocess_tum.py's shape:
     calib.txt         "fx fy cx cy"   (no distortion terms - undistorted here, not at runtime)
     preprocess_info.txt
 
-WHY THIS SCRIPT LEADS WITH --inspect. FLSea VI ships 12 dives of forward-looking shallow-water
-(<10 m) imagery with photogrammetry depth and pose, but the published papers do not document the
-delivered file names, the pose file's columns, or the depth maps' units - and the Kaggle page is
-JavaScript-rendered, so none of that could be read before writing this. Rather than guess a layout
-and fail silently, --inspect walks the source, reports every extension, sample file names, the head
-of every small text/CSV file, and the dtype/range of one image and one depth map, then PROPOSES a
-mapping. Confirm or override it with the flags below and only then convert.
+THE DELIVERED LAYOUT, read off the dataset itself rather than the papers (the Kaggle listing and
+single-file download both work WITHOUT credentials, which is how this was established):
+
+    canyons/           flatiron, horse_canyon, tiny_canyon, u_canyon          + calibration/
+    red_sea/           big_dice_loop, coral_table_loop, cross_pyramid_loop,
+                       dice_path                                             + calibration/
+    <dive>/imgs/<ts>.tiff                        968x608 uint8 RGB, the RAW frame
+    <dive>/seaErra/<ts>_SeaErra.tiff             968x608 uint8 RGB, colour-RESTORED
+    <dive>/depth/<ts>_SeaErra_abs_depth.tif      968x608 float32, ALREADY IN METRES
+    <dive>/imu.txt, <dive>/notes.txt
+    <location>/calibration/...kalibr-results-imucam.txt
+
+`<ts>` is a 17-digit timestamp (unix seconds x 1e7) and is IDENTICAL across imgs/, seaErra/ and
+depth/, which is what makes the three associable by stem. All stems are the same length, so a
+lexical sort is a chronological sort.
+
+THERE IS NO POSE FILE. The 52,000-file listing contains exactly two text files per dive - imu.txt
+and notes.txt - and the depth TIFFs carry only standard image tags, no geo-referencing. The paper
+advertises "ground truth depth maps as well as pose", but the VI download ships depth and IMU only.
+See the warning this script prints when --poses is empty: without traj_tum.txt there is no ATE, no
+local-scale lambda and no drift analysis, which is the whole evaluation methodology of this repo.
+What DOES work is the depth side: the extract accuracy table and the entire `prior` stage.
+
+--inspect is still the first thing to run on any dive, because it reports the actual counts, the
+depth range that sets --depth-png-scale, and any per-dive deviation from the above.
 
 THREE INVARIANTS THIS SCRIPT ENFORCES, because each is silent when wrong (preprocess_tum.py:15):
   * colors/ is renumbered %06d. slam/runner.py:save_trajectory parses the timestamp out of the
@@ -48,6 +66,14 @@ import numpy as np
 IMG_EXT = ('.tif', '.tiff', '.png', '.jpg', '.jpeg')
 TXT_EXT = ('.txt', '.csv', '.yaml', '.yml', '.json', '.md')
 DEFAULT_DEPTH_SCALE = 1000.0
+
+# Kalibr `calibration/...kalibr-results-imucam.txt`, pinhole + radtan. Kalibr's radtan order is
+# [k1, k2, r1, r2], which is OpenCV's [k1, k2, p1, p2] - the same thing under another name.
+KALIBR = {
+    'canyons': (1175.3913431656817, 1174.2805075232263, 466.2595428966926, 271.2116633091501,
+                (-0.13280386913948822, 0.09799479194607102,
+                 -0.004731205238184176, 0.0007132375646502103)),
+}
 
 
 # ---------------------------------------------------------------- inspection
@@ -161,13 +187,17 @@ def main():
     ap.add_argument('--inspect', action='store_true', help='report the layout and stop')
     ap.add_argument('--images', default='imgs', help='image subdirectory, relative to --src')
     ap.add_argument('--depths', default='depth', help='depth subdirectory; "" = no GT depth')
+    ap.add_argument('--depth-suffix', default='_SeaErra_abs_depth',
+                    help='appended to the image stem to find its depth map')
     ap.add_argument('--poses', default='', help='pose file, relative to --src')
     ap.add_argument('--pose-cols', default='t,tx,ty,tz,qx,qy,qz,qw',
                     help='column order actually present in the pose file')
     ap.add_argument('--pose-invert', action='store_true',
                     help='the file stores world-to-camera; this repo wants camera-to-world')
     ap.add_argument('--calib', default='',
-                    help='"fx fy cx cy k1 k2 p1 p2 [k3]" for the RAW images')
+                    help='"fx fy cx cy k1 k2 p1 p2 [k3]" for the RAW images; overrides --location')
+    ap.add_argument('--location', choices=sorted(KALIBR), default=None,
+                    help='use the shipped Kalibr intrinsics for that location')
     ap.add_argument('--depth-in-scale', type=float, default=1.0,
                     help='divide the source depth by this to get METRES (1.0 = already metres)')
     ap.add_argument('--depth-png-scale', type=float, default=DEFAULT_DEPTH_SCALE,
@@ -190,9 +220,13 @@ def main():
                   if os.path.splitext(p)[1].lower() in IMG_EXT)
     if not imgs:
         raise SystemExit(f'no images under {a.src}/{a.images} - run --inspect and set --images')
+    if not a.calib and a.location:
+        f_, g_, cx_, cy_, d_ = KALIBR[a.location]
+        a.calib = ' '.join(str(x) for x in (f_, g_, cx_, cy_, *d_))
+        print(f'calibration: shipped Kalibr values for {a.location!r}')
     if not a.calib:
-        raise SystemExit('--calib is required: "fx fy cx cy k1 k2 p1 p2 [k3]" for the RAW images. '
-                         'Run --inspect to find the calibration file.')
+        raise SystemExit('give --location, or --calib "fx fy cx cy k1 k2 p1 p2" for the RAW '
+                         'images. The values are in <location>/calibration/*kalibr-results*.txt.')
     c = [float(x) for x in a.calib.replace(',', ' ').split()]
     K = np.array([[c[0], 0, c[2]], [0, c[1], c[3]], [0, 0, 1]], np.float64)
     dist = np.array(c[4:], np.float64) if len(c) > 4 else np.zeros(5)
@@ -219,6 +253,11 @@ def main():
         poses = T[j]
     if not keep:
         raise SystemExit('no image matched a pose inside --max-assoc')
+    if poses is None:
+        print('\n  !! NO POSES. FLSea VI ships none, so traj_tum.txt is not written and this\n'
+              '     scene cannot be scored: no ATE, no local-scale lambda, no drift analysis.\n'
+              '     Set GT_TRAJ: null in the run config. The depth side still works - the\n'
+              '     extract accuracy table and the whole prior stage read depths/ only.\n')
 
     os.makedirs(f'{a.dst}/colors', exist_ok=True)
     dep_dir = f'{a.src}/{a.depths}' if a.depths else None
@@ -238,7 +277,10 @@ def main():
         cv2.imwrite(f'{a.dst}/colors/{n:06d}.png', cv2.remap(img, mx, my, cv2.INTER_LINEAR))
         if dep_dir:
             stem = os.path.splitext(os.path.basename(imgs[k]))[0]
-            cand = [p for e in IMG_EXT for p in (f'{dep_dir}/{stem}{e}',) if os.path.exists(p)]
+            if a.images.rstrip('/').endswith('seaErra'):        # seaErra stems already carry it
+                stem = stem.replace('_SeaErra', '')
+            cand = [p for e in IMG_EXT
+                    for p in (f'{dep_dir}/{stem}{a.depth_suffix}{e}',) if os.path.exists(p)]
             if not cand:
                 raise SystemExit(f'no depth map for {stem} under {dep_dir} - names must match the '
                                  f'image stems, or pass --depths "" to skip GT depth')
