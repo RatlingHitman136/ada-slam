@@ -1,0 +1,169 @@
+# THE PRIOR-FREE CONTROL: pure DROID, no depth prior in BA. Where does the staircase come from?
+#
+#   python scripts/online_adapt_pipeline.py -c kitti/live_nomono
+#
+# ONE ARM, ONE VARIABLE. Everything matches the `base` arm of kitti_00_fg2a05_f0-1000 except the
+# tracking config, which is config/kitti_fg2_a05_nomono_config.yaml - identical to
+# kitti_fg2_a05_config.yaml apart from `mono_depth_enable: false`. Read that file's header: it
+# explains why this is NOT mono_depth_alpha: 0.0 (which would strip the solver's damping wherever
+# the prior is valid AND hand the dscales block a singular system) and why the prior cannot leak
+# in through disparity initialisation.
+#
+# WHY IT HAS ITS OWN SCENE KEY. The arm this produces is named `base` - the same name the existing
+# VGGT arm already has in kitti_00_fg2a05_f0-1000 - so writing it into that tree would collide, or
+# with SKIP_EXISTING be silently skipped. Encoding a tracking-config variant in the SCENE is this
+# project's established convention: kitti_00_fg2a05, kitti_00_fg5, kitti_00_a05 and kitti_00_jdsa4
+# are all KITTI 00 under different tracking configs. This is one more.
+#   -> outputs/test/end2end/kitti_00_fg2a05nomono_f0-1000/base/
+#
+# STAGES IS [end2end] ONLY. There is no adapter here and nothing to train; ONLINE_NAME and the
+# whole `online:` block below are unread. They are present because the run-config reader is
+# deliberately all-or-nothing.
+#
+# END2END_PRIORS IS JUST vggt_base, deliberately. `omnidata` is not listed because it would cost a
+# second full SLAM run for an arm that answers nothing here. The VGGT prior IS still generated and
+# still fills disps_prior and seeds dscales - it simply never reaches BA, which is what makes this
+# a subtraction of one term rather than a different pipeline.
+#
+# VGGT_HW IS null (derived, 168x518) AND IT DOES NOT MATTER, because the solver never reads the
+# prior. It is left derived rather than pinned so nobody reads the number as meaningful.
+#
+# WHAT TO DO WITH THE RESULT. Run the same decomposition used on every other arm: lambda over a
+# +/-25-frame window, the six turn windows f100-125 / 200-225 / 425-450 / 550-600 / 725-750 /
+# 950-975, and the step-vs-plateau split. The reference table and the three possible outcomes are
+# written into the tracking config's header. In one line: if the steps land near 0.38-0.52 the
+# geometric front end owns them and depth-prior work cannot reach them.
+#
+# EXPECT A DIFFERENT-SIZED TRAJECTORY. Prior-free monocular reconstruction is up to an arbitrary
+# global scale. lambda divides the local Sim(3) scale by the global one, and evo aligns with Sim(3)
+# too, so both lambda and ATE stay comparable - but the raw numbers in traj_full.txt need not be in
+# metres, and a keyframe count different from `base` is expected rather than alarming.
+
+# ---------------------------------------------------------------- data (preprocessing is NOT here)
+SCENE: kitti_00_fg2a05nomono
+DATA: data/KITTI/00                   # preprocess_kitti.py's output layout
+COLORS: data/KITTI/00/colors          # the four paths below are spelled out rather than derived
+DEPTHS: null                          # from DATA - change them together. KITTI ships no GT depth
+GT_TRAJ: data/KITTI/00/traj_tum.txt
+CALIB: data/KITTI/00/calib.txt
+CONFIG: config/kitti_fg2_a05_nomono_config.yaml   # alpha 0.05 * far_gain 5 -> 0.05 near .. 0.25 far.
+                                      # config/kitti_config.yaml is upstream's flat 0.01
+DROID_WEIGHTS: pretrained_models/droid.pth
+UNDISTORT: false                      # undistort offline in the preprocess script instead (10.1)
+CROP_BORDER: 0
+
+# ---------------------------------------------------------------- run control
+STAGES: [end2end]
+SKIP_EXISTING: true
+MIN_FREE_VRAM_MB: 15000               # raise with BUFFER on a bigger card
+GPU_WAIT_MIN: 120                     # minutes to WAIT for that much VRAM instead of
+                                      # refusing; 0 = refuse immediately. Polls every 60 s
+LENGTH: 100000
+START: 0
+STOP: 1000                            # exclusive; null = to the end of the sequence
+STREAM_RES: 218240                    # 341 * 640 - a pixel budget, not a shape (9.6)
+BUFFER: 1500                          # keyframe buffer; a HARD CAP with no overflow guard. At
+                                      # ~2.5 MiB GPU + 4.8 MiB CPU per slot this is 6.1 + 11.6 GiB
+RENDER_EVAL: false                    # hi2.py's eval_rendering -> renders/ + psnr/ (11)
+
+# ---------------------------------------------------------------- names and lineage
+OUT_ROOT: outputs
+ONLINE_NAME: nomono_unused          # unread: STAGES has no online stage
+ADAPT_INIT_NAME: null                 # an adapt experiment in this scene to CONTINUE from
+VGGT_HW: null             # MATCHES THE BASELINE ARM. Its adapter config.json records
+                                # vggt_hw [196, 518]; note its own saved run_config.yaml says
+                                # [210, 518], so that file was copied by a later invocation
+                                # that skipped the existing run. The adapter is the record of
+                                # what the model actually was. Deriving would give [168, 518]
+                                # (9.6), which every recent arm used - so the baseline is NOT
+                                # at the same resolution as the b10 family either.
+
+# ---------------------------------------------------------------- reference arms (stage 2)
+END2END_PRIORS: [vggt_base]   # [0] is the baseline column
+SPLIT_AT: null                          # null = the whole run, so [unseen] is empty (12.2)
+
+# ---------------------------------------------------------------- the adapter structure
+lora:
+  weights: pretrained_models/vggt
+  rank: 8
+  alpha: 16
+  targets: [attn.qkv, attn.proj, mlp.fc1, mlp.fc2]
+  patch_embed: false                  # false = adapt only the alternating-attention stack
+
+# ---------------------------------------------------------------- online adaptation (stage 1)
+online:
+  # warm-up: TWO gates - when the adapter starts LEARNING, and when it starts SERVING
+  warmup_kf: 12                       # keyframes before the first optimiser step, which lands at +1
+  handover_kf: 12                     # keyframes served by the FALLBACK prior; must be >= warmup_kf
+  warmup_prior: omnidata              # 'omnidata' = upstream's prior | 'self' = the adapting VGGT
+  # schedule
+  adapt_style: wonline                # 'online' = the arrival alone | 'wonline' = a sliding window
+  steps_per_kf: 5                     # 5 passes x window 10 / batch 2
+                                      # = 25 steps per unit, the baseline
+  window_size: 10                     # 'wonline' ONLY
+  batch_size: 2                       # 'wonline' ONLY
+  lag: 5                              # keyframes back from the end the target is taken
+  # serving
+  ceil_ratio: 1.0                     # far-field ceiling on the SERVED depth (14):
+                                      # clamp at this x the frame median, warm-up
+                                      # branch included; 1.0 = off
+  ceil_target: false                  # true = clamp the TRAINING target at ceil_ratio too (14.6);
+                                      # refused at ceil_ratio 1.0, where it would do nothing
+  ped_ratio: null                     # far-field PEDESTAL on the SERVED depth (14.9): the served
+                                      # depth saturates at this x the frame's PRE-SHIFT median,
+                                      # applied AFTER the ceiling. null = off - NOT 1.0, which is
+                                      # a real pedestal; the two knobs' off values differ.
+  # sample construction
+  context_kf: 2                       # frames per VGGT forward minus one, TRAINING and SERVING
+  context_stride: 1                   # keyframes BETWEEN context frames; 1 =
+                                      # consecutive, the pre-knob behaviour
+                                      # both; 0 = monocular, the pre-knob behaviour exactly
+  # optimisation
+  lr: 1.0e-4                          # NOT 1e-4 - YAML reads that as a string
+  weight_decay: 0.0
+  grad_clip: 1.0
+  normalize_target: true              # THE VARIABLE: divide the target by the sample's gauge
+  gauge_clamp: 2.0                    # and stop depth_loss re-fitting a scale, so the loss
+  gauge_min_pixels: 256               # carries gradient about ABSOLUTE scale. Unread when
+  gauge_pose: false                   # gt TRANSLATIONS in the depth target's gauge, compared
+                                      # directly - VGGT's own camera term. Needs
+                                      # normalize_target and lambda_pose > 0
+                                      # normalize_target is false, but still validated
+  lambda_pose: 0.0                    # refused above 0 with normalize_target; inert at ctx0
+  coupled_scale: false                # required by lambda_cons, and
+                                      # numerically inert at ctx0
+  freeze_gauge: false                 # hold the pose gauge fixed for the whole unit
+                                      # instead of recomputing it every forward
+  anchor_kf: 0                        # off - normalize_target replaces it, and the two
+                                      # are refused together
+  depth_all_frames: false             # supervise depth on every frame of the sample
+                                      # under one shared scale; needs context_kf >= 1
+  lambda_cons: 0.0                    # off - it penalised inconsistency ON TOP of the
+                                      # scale invariance normalize_target removes outright
+  batch_scale: false                  # one scale over the WHOLE batch instead of
+                                      # one per sample; refused with coupled_scale
+  min_mask_pixels: 16
+  seed: 0
+  log_every: 5
+  # supervision mask (the same knobs ExtractConfig uses for depth_slam/)
+  mask_filter_thresh: 0.005
+  mask_min_count: 2
+  mask_min_disp_ratio: 0.5
+  # the loss gate: skip an arrival whose newest keyframe is not worth training on
+  gate_metric: raw                    # 'rel' = flat across a run | 'raw' = drifts with it
+  gate_lo: 0.0                      # 0 = off; skip BELOW this - the target already fits
+  gate_hi: 0.0                        # 0 = off; skip ABOVE this - the target is broken, not hard
+  gate_scope: arrival                 # 'arrival' = the band on the newest keyframe, once per unit | 'sample' = on every training sample
+  # the unit breaker: skip a unit whose whole window has gone bad (online/config.py)
+  breaker_k: 0.0                      # 0 = off; else > 1 - window median loss > k x the recent median
+  breaker_window: 100                 # untripped units the reference median spans
+  breaker_warmup: 40                  # units that only feed the reference
+  breaker_serve: adapted              # 'adapted' | 'base' - what the tracker is served while the breaker is tripped
+  # output
+  checkpoint_every_kf: 0              # 0 = off; N = a loadable adapter dir every N
+                                      # adapted keyframes
+
+# ---------------------------------------------------------------- what scores the arms
+end2end:
+  omni_normal_ckpt: pretrained_models/omnidata_dpt_normal_v2.ckpt
+  omni_normal_hw: [512, 512]

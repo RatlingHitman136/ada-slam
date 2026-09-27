@@ -1,0 +1,168 @@
+# ctx2 with the pose supervision REMOVED - context, and nothing else.
+#
+# lambda_pose 0.0 zeroes the (l_trans + l_rot) term, and coupled_scale false sends depth_loss back
+# to its own median_scale. What is left of ctx2 is exactly the multi-frame aggregation: VGGT sees
+# S = 3 at both ends and the loss is pure depth, as it was at context_kf 0.
+#
+# If the ATE stays near ctx2's 12.881, multi-frame depth inference is doing the work. If it falls
+# back toward the ctx0 arm's 15.423, the pose supervision was, and context was only the switch
+# that turned it on - which is the outcome I would bet on, because 'vggt_base@ctx2' frozen is
+# WORSE than plain 'vggt_base'.
+#
+# A BONUS DIAGNOSTIC, only available in this arm. With coupled_scale false both scales are
+# computed but only the median one is used, so train_log's scale_ratio records
+# median_scale / pose_scale - i.e. HOW FAR APART the two gauges actually are. In ctx2 that column
+# is identically 1.0 by construction and says nothing. Read it here before designing the next arm.
+#
+# THE FAMILY. ctx2 bundled three changes; these split them. All four share one schedule (wonline,
+# 5 steps, window 10, batch 2, lag 5, warm-up/handover 12) and one tracking config, and differ
+# ONLY in the three fields below, so the deltas are readable as a path:
+#
+#   arm                  context_kf  lambda_pose  coupled_scale   ATE      what it isolates
+#   ..._base   (done)         0          1.0 *        true *      15.423   neither - the ctx0 ref
+#   ..._ctx2   (done)         2          1.0          true        12.881   all three at once
+#   ..._ctx2_nopose             2          0.0          false      ?        CONTEXT ALONE
+#   ..._ctx2_cscale             2          0.0          true       ?        context + coupled scale
+#
+#   * inert at context_kf 0: pose_loss returns zeros below two frames and pose_scale is None, so
+#     depth_loss falls back to median_scale. Verified in the logs - the ctx0 run has l_trans and
+#     l_rot exactly 0 across all 10620 steps and records no scale_ratio at all.
+#
+# READ IT AS: nopose - base = what multi-frame inference is worth on its own.
+#             cscale - nopose = what the coupled scale is worth.
+#             ctx2 - cscale  = what the pose GRADIENT term is worth.
+#
+# Why this matters: ATE on this scene is scale drift and nothing else - across the five arms
+# scored so far corr(local-scale sd, ATE) = 1.000 at 65.7 m per unit of sd, reproducing the
+# ~66x law on arms it had not seen. ctx2 recovered 63-66% of the ctx0->omni gap on all three of
+# ATE, scale sd and drift span. And the frozen 'vggt_base@ctx2' arm is WORSE than plain
+# 'vggt_base' (16.535 vs 15.627), so multi-frame inference alone hurts an unadapted model - the
+# whole ctx2 gain is an interaction with training. These two arms say which half of the training
+# change did it.
+#
+#   python scripts/online_adapt_pipeline.py -c kitti/live_ctx2_nopose
+
+# ---------------------------------------------------------------- data (preprocessing is NOT here)
+SCENE: kitti_00_fg2a05
+DATA: data/KITTI/00                   # preprocess_kitti.py's output layout
+COLORS: data/KITTI/00/colors          # the four paths below are spelled out rather than derived
+DEPTHS: null                          # from DATA - change them together. KITTI ships no GT depth
+GT_TRAJ: data/KITTI/00/traj_tum.txt
+CALIB: data/KITTI/00/calib.txt
+CONFIG: config/kitti_fg2_a05_config.yaml   # alpha 0.05 * far_gain 5 -> 0.05 near .. 0.25 far.
+                                      # config/kitti_config.yaml is upstream's flat 0.01
+DROID_WEIGHTS: pretrained_models/droid.pth
+UNDISTORT: false                      # undistort offline in the preprocess script instead (10.1)
+CROP_BORDER: 0
+
+# ---------------------------------------------------------------- run control
+STAGES: [online, end2end]
+SKIP_EXISTING: true
+MIN_FREE_VRAM_MB: 15000               # raise with BUFFER on a bigger card
+GPU_WAIT_MIN: 120                     # minutes to WAIT for that much VRAM instead of
+                                      # refusing; 0 = refuse immediately. Polls every 60 s
+LENGTH: 100000
+START: 0
+STOP: 1000                            # exclusive; null = to the end of the sequence
+STREAM_RES: 218240                    # 341 * 640 - a pixel budget, not a shape (9.6)
+BUFFER: 1500                          # keyframe buffer; a HARD CAP with no overflow guard. At
+                                      # ~2.5 MiB GPU + 4.8 MiB CPU per slot this is 6.1 + 11.6 GiB
+RENDER_EVAL: false                    # hi2.py's eval_rendering -> renders/ + psnr/ (11)
+
+# ---------------------------------------------------------------- names and lineage
+OUT_ROOT: outputs
+ONLINE_NAME: live_fg2a05_e5_w10_a16_w12_lag5_ctx2_nopose   # unique within its scene only
+ADAPT_INIT_NAME: null                 # an adapt experiment in this scene to CONTINUE from
+VGGT_HW: null                   # null = derive | [378, 518] TUM | [294, 518] Replica
+
+# ---------------------------------------------------------------- reference arms (stage 2)
+END2END_PRIORS: [omnidata, vggt_base, vggt_base@ctx2]   # [0] is the baseline column
+SPLIT_AT: null                          # null = the whole run, so [unseen] is empty (12.2)
+
+# ---------------------------------------------------------------- the adapter structure
+lora:
+  weights: pretrained_models/vggt
+  rank: 8
+  alpha: 16
+  targets: [attn.qkv, attn.proj, mlp.fc1, mlp.fc2]
+  patch_embed: false                  # false = adapt only the alternating-attention stack
+
+# ---------------------------------------------------------------- online adaptation (stage 1)
+online:
+  # warm-up: TWO gates - when the adapter starts LEARNING, and when it starts SERVING
+  warmup_kf: 12                       # keyframes before the first optimiser step, which lands at +1
+  handover_kf: 12                     # keyframes served by the FALLBACK prior; must be >= warmup_kf
+  warmup_prior: omnidata              # 'omnidata' = upstream's prior | 'self' = the adapting VGGT
+  # schedule
+  adapt_style: wonline                # 'online' = the arrival alone | 'wonline' = a sliding window
+  steps_per_kf: 5
+  window_size: 10                     # 'wonline' ONLY
+  batch_size: 2                       # 'wonline' ONLY
+  lag: 5                              # keyframes back from the end the target is taken
+  # serving
+  ceil_ratio: 1.0                     # far-field ceiling on the SERVED depth (14):
+                                      # clamp at this x the frame median, warm-up
+                                      # branch included; 1.0 = off
+  ceil_target: false                  # true = clamp the TRAINING target at ceil_ratio too (14.6);
+                                      # refused at ceil_ratio 1.0, where it would do nothing
+  ped_ratio: null                     # far-field PEDESTAL on the SERVED depth (14.9): the served
+                                      # depth saturates at this x the frame's PRE-SHIFT median,
+                                      # applied AFTER the ceiling. null = off - NOT 1.0, which is
+                                      # a real pedestal; the two knobs' off values differ.
+  # sample construction
+  context_kf: 2                       # frames per VGGT forward minus one, TRAINING and SERVING
+  context_stride: 1                   # keyframes BETWEEN context frames; 1 =
+                                      # consecutive, the pre-knob behaviour
+                                      # both -> S = 3. THE one change against live_default
+  # optimisation
+  lr: 1.0e-4                          # NOT 1e-4 - YAML reads that as a string
+  weight_decay: 0.0
+  grad_clip: 1.0
+  normalize_target: false             # true = divide the target by the sample's own gauge
+  gauge_clamp: 2.0                    # and stop depth_loss re-fitting a scale, so the loss
+  gauge_min_pixels: 256               # carries gradient about ABSOLUTE scale. Unread when
+  gauge_pose: false                   # gt TRANSLATIONS in the depth target's gauge, compared
+                                      # directly - VGGT's own camera term. Needs
+                                      # normalize_target and lambda_pose > 0
+                                      # normalize_target is false, but still validated
+  lambda_pose: 0.0                        # 0.0 = the pose term contributes no
+                                      # gradient (l_trans/l_rot are still
+                                      # computed and logged, just unweighted)
+  coupled_scale: false              # true = depth_loss is normalised by the
+  freeze_gauge: false                 # hold the pose gauge fixed for the whole unit
+                                      # instead of recomputing it every forward
+  anchor_kf: 0                        # keyframes from the start of the sequence that
+                                      # lambda_cons measures against; 0 = the batch
+  depth_all_frames: false             # supervise depth on every frame of the sample
+                                      # under one shared scale; needs context_kf >= 1
+  lambda_cons: 0.0                    # scale-consistency penalty; pulls each sample's
+                                      # own scale toward the batch consensus. 0 = off
+  batch_scale: false                  # one scale over the WHOLE batch instead of
+                                      # one per sample; refused with coupled_scale
+                                      # pose-derived scale; false = by the
+                                      # frame's own median ratio
+  min_mask_pixels: 16
+  seed: 0
+  log_every: 5
+  # supervision mask (the same knobs ExtractConfig uses for depth_slam/)
+  mask_filter_thresh: 0.005
+  mask_min_count: 2
+  mask_min_disp_ratio: 0.5
+  # the loss gate: skip an arrival whose newest keyframe is not worth training on
+  gate_metric: raw                    # 'rel' = flat across a run | 'raw' = drifts with it
+  gate_lo: 0.0                      # 0 = off; skip BELOW this - the target already fits
+  gate_hi: 0.0                        # 0 = off; skip ABOVE this - the target is broken, not hard
+  gate_scope: arrival                 # 'arrival' = the band on the newest keyframe, once per unit | 'sample' = on every training sample
+  # the unit breaker: skip a unit whose whole window has gone bad (online/config.py)
+  breaker_k: 0.0                      # 0 = off; else > 1 - window median loss > k x the recent median
+  breaker_window: 100                 # untripped units the reference median spans
+  breaker_warmup: 40                  # units that only feed the reference
+  breaker_serve: adapted              # 'adapted' | 'base' - what the tracker is served while the breaker is tripped
+  # output
+  checkpoint_every_kf: 0              # 0 = off; N = a loadable adapter dir every N
+                                      # adapted keyframes
+
+# ---------------------------------------------------------------- what scores the arms
+end2end:
+  omni_normal_ckpt: pretrained_models/omnidata_dpt_normal_v2.ckpt
+  omni_normal_hw: [512, 512]

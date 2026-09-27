@@ -1,0 +1,152 @@
+# OFFLINE adaptation with CONTEXT - the counterpart to this session's online ctx2 arms.
+#
+#   python scripts/init_adapt_pipeline.py -c kitti/init_fg2a05_ctx2_kf40_b10_e20_s0
+#
+# WHAT IS NEW. Until now `context_kf` existed only on the online path; the offline sampler's own
+# multi-view mechanism (p_single_view / max_left / max_right / radius) draws a RANDOM number of
+# ARBITRARY frames around the target, which is not what the extractor serves. This arm uses the
+# online mechanism instead - adapt/data.py:context - so the training sequence and the served
+# sequence are built by the same function (common.py:context_keyframes) and the adapter is fitted
+# in the regime it is asked to predict in. p_single_view stays 1 so the old sampler is off; the
+# config refuses the two together.
+#
+# THE DESIGN, in one line each:
+#   normal extract   outputs/extract/kitti_00_fg2a05_f0-1000/normal_vggt, ALREADY ON DISK: 436
+#                    keyframes over frames 0..1000, tracked under stock VGGT-1B. STAGES omits
+#                    `extract` because of that - nothing re-runs the SLAM.
+#   kf_fraction 0.4  174 of the 436 keyframes, equidistant over the keyframe LIST (every ~2.5th).
+#                    train_frac 0.9 splits that into 157 train / 17 val, val being the contiguous
+#                    tail, so val measures generalising FORWARD.
+#   context_kf 2     S = 3 per forward: the target first, then the 2 keyframes before it IN THE
+#                    FULL EXPORT (not in the 0.4 selection - the tracker serves consecutive
+#                    keyframes whatever this run trained on).
+#   normal / e20     a unit is an epoch. 157 train kf / batch 10 = 16 steps x 20 = 320 optimiser
+#                    steps, each keyframe seen 20 times.
+#
+# READ IT AGAINST, all already scored in this scene and reused from disk at no cost:
+#   base       15.627   stock VGGT-1B, served monocular
+#   base_ctx2  16.535   stock VGGT-1B, served with the SAME context - so context at serving alone
+#                       COSTS 0.9 m, and this arm has to beat 16.535 before context is the reason
+#                       for anything. That is the comparison that matters, not the 15.627 one.
+#
+# lambda_pose is LIVE here (it returns zeros at context_kf 0, where a sample is one frame), and
+# coupled_scale is therefore live too. Both are at init_default's values.
+#
+# NO TAIL TRANSFORM: ceil/ped are online-serving knobs and END2END_PRIORS carries no '@ceil'/
+# '@ped'. The far-field family reaches ~3.7 on this scene and this arm will not - it is a
+# mechanism test against base_ctx2, not a bid for the scene's best ATE.
+#
+# THE ONE SPELLING TRAP: an adapter trained with context MUST be served with '@ctx2' in
+# END2END_PRIORS. Without it the arm is replayed monocular and measures a mismatch, not the model.
+# The adapter's config.json records context_kf, so it can always be checked after the fact.
+
+# ---------------------------------------------------------------- data (preprocessing is NOT here)
+SCENE: kitti_00_fg2a05                       # names the outputs/ tree
+DATA: data/KITTI/00                   # preprocess_kitti.py's output layout
+COLORS: data/KITTI/00/colors          # the four below are spelled out rather than derived from
+DEPTHS: data/KITTI/00/depths          # DATA - change them together. null disables the accuracy
+                                      # table and the prior stage; it never reaches Hi2 (9.3)
+GT_TRAJ: data/KITTI/00/traj_tum.txt
+CALIB: data/KITTI/00/calib.txt
+CONFIG: config/kitti_fg2_a05_config.yaml   # alpha 0.05 x far_gain 2 - the campaign tree
+DROID_WEIGHTS: pretrained_models/droid.pth
+UNDISTORT: false                      # undistort offline in the preprocess script instead (10.1)
+CROP_BORDER: 0
+
+# ---------------------------------------------------------------- run control
+STAGES: [adapt, end2end]              # extract is ALREADY on disk (normal_vggt) - not re-run
+SKIP_EXISTING: true                   # reuse a stage's output if it is already on disk
+MIN_FREE_VRAM_MB: 10000               # checked once at the top of main()
+FRACTION: 100                         # % of the WINDOW the adapter trains on, NOT of the sequence
+START: 0
+STOP: 1000                            # exclusive; null = to the end. Re-keys the outputs tree
+STREAM_RES: 218240                    # 341 * 640 - a pixel budget, not a shape (9.6)
+DEPTH_PNG_SCALE: 256.0                # metres = px / this; KITTI's convention (TUM is 6553.5)
+RENDER_EVAL: false                    # hi2.py's eval_rendering -> renders/ + psnr/ (11)
+
+# ---------------------------------------------------------------- names and lineage
+OUT_ROOT: outputs
+EXTRACT_NAME: normal_vggt             # the export this adapts on; must already exist
+ADAPT_NAME: normal_ctx2_kf40_b10_e20_s0
+EXTRACT_PRIOR: vggt_base              # the prior the EXTRACT tracks under; null = stock Omnidata
+ADAPT_INIT_NAME: null                 # an adapt experiment in this scene to CONTINUE from
+VGGT_HW: null                         # null = derive | [378, 518] TUM | [294, 518] Replica
+
+# ---------------------------------------------------------------- prior generators
+END2END_PRIORS: [omnidata, vggt_base, vggt_base@ctx2,
+                 outputs/adapt/kitti_00_fg2a05_f0-1000/normal_ctx2_kf40_b10_e20_s0@ctx2]
+PRIOR_PRIORS: [omnidata, vggt_base]   # the prior stage is not in STAGES
+
+# ---------------------------------------------------------------- extract (stage 1)
+extract:
+  kf_motion_thresh: 2.4               # motion_filter.thresh; any threshold may be null = inherit
+  kf_init_thresh: 4.0                 # the same gate before initialisation
+  kf_redundant_thresh: 4.0            # the one that actually moves the keyframe count
+  kf_covis_thresh: 0.2                # extras inserted in terminate(); LOWER -> more
+  buffer: 1500                        # hard cap; MUST exceed the count (no overflow guard)
+  mask_filter_thresh: 0.005           # depth_filter disparity agreement
+  mask_min_count: 2                   # min agreeing neighbours out of 6
+  mask_min_disp_ratio: 0.5            # drop pixels below this fraction of the frame's mean disp
+
+# ---------------------------------------------------------------- the adapter structure
+lora:
+  weights: pretrained_models/vggt
+  rank: 8
+  alpha: 16
+  targets: [attn.qkv, attn.proj, mlp.fc1, mlp.fc2]
+  patch_embed: false                  # false = adapt only the alternating-attention stack
+
+# ---------------------------------------------------------------- adapt (stage 2)
+adapt:
+  p_single_view: 1
+  max_left: 4
+  max_right: 4
+  radius: 8
+  context_kf: 2                       # 0 = monocular; > 0 = that many preceding KEYFRAMES
+  context_stride: 1                   # in the sample AND in the served sequence. Serve a
+                                      # context-trained adapter with '@ctx<N>' in
+                                      # END2END_PRIORS or it is replayed monocular
+  normalize_target: false             # true = divide the target by the sample's own gauge
+  gauge_clamp: 2.0                    # and stop depth_loss re-fitting a scale, so the loss
+  gauge_min_pixels: 256               # carries gradient about ABSOLUTE scale. Unread when
+  gauge_pose: false                   # gt TRANSLATIONS in the depth target's gauge, compared
+                                      # directly - VGGT's own camera term. Needs
+                                      # normalize_target and lambda_pose > 0
+                                      # normalize_target is false, but still validated
+  adapt_style: normal                 # a unit is an EPOCH over the training keyframes
+  epochs: 20
+  batch_size: 10
+  window_size: 10                     # 'wonline' only
+  lr: 1.0e-4                          # NOT 1e-4 - YAML reads that as a string
+  weight_decay: 0.0
+  grad_clip: 1.0
+  lambda_pose: 1.0
+  coupled_scale: true
+  min_mask_pixels: 16
+  seed: 0
+  log_every: 5                        # printing only - the JSON log has every step
+  kf_fraction: 0.4                    # 174 of 436 keyframes, equidistant over the LIST
+  val_source: tail                    # 'tail' = the selection's tail | 'rest' = what it skipped
+  train_frac: 0.9                     # 'tail' ONLY
+  eval_on_val: true
+  eval_on_train: true
+  eval_every_epoch: false
+  eval_max_kf: 100                    # 0 = no cap
+  keep_best: false
+  checkpoint_every: 0                 # 0 = off
+
+# ---------------------------------------------------------------- end2end test (stage 3)
+end2end:
+  length: 100000                      # 100000 = whole sequence
+  buffer: 1500                        # a hard cap with no overflow guard
+  omni_normal_ckpt: pretrained_models/omnidata_dpt_normal_v2.ckpt
+  omni_normal_hw: [512, 512]
+
+# ---------------------------------------------------------------- prior test (stage 4)
+prior:
+  eval_min_depth: 1.0                 # m
+  eval_max_depth: 50.0                # m; these six fields are the frames.csv cache key
+  eval_samples_per_frame: 20000       # 0 = all valid (needs the RAM)
+  seed: 0
+  omni_normal_ckpt: pretrained_models/omnidata_dpt_normal_v2.ckpt
+  omni_normal_hw: [512, 512]

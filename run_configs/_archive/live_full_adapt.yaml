@@ -1,0 +1,180 @@
+# FULL-SEQUENCE ARM 3 of 3: ONLINE ADAPTATION - the overnight run.
+#
+#   python scripts/online_adapt_pipeline.py -c live_full_adapt
+#
+# The configuration is live_gauge_ctx0's, unchanged apart from the window and the buffer: the
+# gauge at context_kf 0, which is the best REPLICATED adapted arm the campaign has (14.594 +/-0.171
+# over seeds 0/2/3, against the ctx0 baseline's 15.423 and frozen 15.627). It is chosen over the
+# single-run arms that score better - _ctx2 at 12.881, r16a32 at 9.991 - precisely because those
+# come from a family whose measured seed sd is 1.735 m and are therefore samples rather than
+# levels.
+#
+# THIS RUNS TWO FULL SLAM PASSES: the online stage tracks and adapts simultaneously, then the
+# end2end stage re-runs the sequence serving the frozen adapter. That is why it is ~15x the frozen
+# arms rather than ~2x, and why it is the one to leave overnight.
+#
+# VRAM is the highest of the three: video buffer + VGGT-1B + LoRA + AdamW state + training
+# activations. The f0-1000 configs reserved 15000 MiB at BUFFER 1500; this adds 2.7 GiB of video.
+#
+# THE FULL SEQUENCE. KITTI 00 is 4541 frames; every arm in this campaign so far has been f0-1000.
+#
+# BUFFER IS 2600, NOT 1500, AND THAT IS THE ONE THING THAT MUST NOT BE LOWERED. The keyframe
+# buffer is a HARD CAP with NO OVERFLOW GUARD - the run does not degrade, it corrupts. The
+# f0-1000 extract produced 436 keyframes, i.e. 2.29 frames per keyframe, which projects to ~1979
+# over 4541 frames. 2600 is that plus ~31% headroom, because keyframe rate is not uniform: the
+# f0-1000 window is mostly open road, and the rest of KITTI 00 has denser urban stretches where
+# the motion threshold fires more often. Watch the keyframe count the run prints at the end; if it
+# lands above ~2300, raise BUFFER before running anything else against this tree.
+#
+# VRAM, measured from the buffer allocations rather than guessed (depth_video.py __init__ at
+# 256x848, ht//8 x wd//8 = 32x106):
+#     per keyframe slot   GPU 2.510 MiB   CPU 4.762 MiB
+#       of which fmaps / nets / inps are 0.828 MiB each in fp16 - they are 99% of it
+#     BUFFER 2600      -> GPU  6.38 GiB   CPU 12.09 GiB   just for the video
+#   on top of the video: DROID (~1 GB), plus the prior's own model. MIN_FREE_VRAM_MB below is set
+#   per arm accordingly. NOTE the CPU figure too - 12 GiB of pinned host buffers is not free on a
+#   shared box.
+#
+# WHAT IS DIFFERENT ABOUT THE FULL SEQUENCE, and it is not a detail: KITTI 00 CLOSES LOOPS. The
+# f0-1000 window does not, which is why its drift is a clean monotone staircase. Over 4541 frames
+# the backend's proximity factors will tie revisited places together and pull accumulated scale
+# back. So the drift curve here is NOT comparable to the f0-1000 curves - expect saw-teeth where a
+# loop closes rather than a monotone descent, and read ATE as the headline instead of lambda sd.
+# If the goal is to extend the drift analysis, the honest comparison is f0-1000 against the first
+# ~1000 frames of this run, not against its whole curve.
+#
+# RUN THESE IN ORDER, and let SKIP_EXISTING do the sharing: all three write into the same tree
+# (kitti_00_fg2a05), each declaring exactly ONE arm in END2END_PRIORS, so no SLAM run is repeated.
+#     1. live_full_omni    ~30 min   (frozen, ~6 min at f0-1000 x 4.5)
+#     2. live_full_vggt    ~30 min   (frozen)
+#     3. live_full_adapt   ~7-8 h    (~95 min at f0-1000 x 4.5) <- the overnight one
+# Timings are scaled from scripts/replicate_arm.py's own measured figures and are estimates.
+
+# ---------------------------------------------------------------- data (preprocessing is NOT here)
+SCENE: kitti_00_fg2a05
+DATA: data/KITTI/00                   # preprocess_kitti.py's output layout
+COLORS: data/KITTI/00/colors          # the four paths below are spelled out rather than derived
+DEPTHS: null                          # from DATA - change them together. KITTI ships no GT depth
+GT_TRAJ: data/KITTI/00/traj_tum.txt
+CALIB: data/KITTI/00/calib.txt
+CONFIG: config/kitti_fg2_a05_config.yaml   # alpha 0.05 * far_gain 5 -> 0.05 near .. 0.25 far.
+                                      # config/kitti_config.yaml is upstream's flat 0.01
+DROID_WEIGHTS: pretrained_models/droid.pth
+UNDISTORT: false                      # undistort offline in the preprocess script instead (10.1)
+CROP_BORDER: 0
+
+# ---------------------------------------------------------------- run control
+STAGES: [online, end2end]
+SKIP_EXISTING: true
+MIN_FREE_VRAM_MB: 18000               # raise with BUFFER on a bigger card
+GPU_WAIT_MIN: 120                     # minutes to WAIT for that much VRAM instead of
+                                      # refusing; 0 = refuse immediately. Polls every 60 s
+LENGTH: 100000
+START: 0
+STOP: null                              # exclusive; null = to the end of the sequence
+STREAM_RES: 218240                    # 341 * 640 - a pixel budget, not a shape (9.6)
+BUFFER: 3000                          # keyframe buffer; a HARD CAP with no overflow guard. At
+                                      # ~2.5 MiB GPU + 4.8 MiB CPU per slot this is 6.1 + 11.6 GiB
+RENDER_EVAL: false                    # hi2.py's eval_rendering -> renders/ + psnr/ (11)
+
+# ---------------------------------------------------------------- names and lineage
+OUT_ROOT: outputs
+ONLINE_NAME: live_full_gauge_ctx0
+ADAPT_INIT_NAME: null                 # an adapt experiment in this scene to CONTINUE from
+VGGT_HW: [196, 518]             # MATCHES THE BASELINE ARM. Its adapter config.json records
+                                # vggt_hw [196, 518]; note its own saved run_config.yaml says
+                                # [210, 518], so that file was copied by a later invocation
+                                # that skipped the existing run. The adapter is the record of
+                                # what the model actually was. Deriving would give [168, 518]
+                                # (9.6), which every recent arm used - so the baseline is NOT
+                                # at the same resolution as the b10 family either.
+
+# ---------------------------------------------------------------- reference arms (stage 2)
+END2END_PRIORS: [outputs/adapt/kitti_00_fg2a05/live_full_gauge_ctx0]   # [0] is the baseline column
+SPLIT_AT: null                          # null = the whole run, so [unseen] is empty (12.2)
+
+# ---------------------------------------------------------------- the adapter structure
+lora:
+  weights: pretrained_models/vggt
+  rank: 8
+  alpha: 16
+  targets: [attn.qkv, attn.proj, mlp.fc1, mlp.fc2]
+  patch_embed: false                  # false = adapt only the alternating-attention stack
+
+# ---------------------------------------------------------------- online adaptation (stage 1)
+online:
+  # warm-up: TWO gates - when the adapter starts LEARNING, and when it starts SERVING
+  warmup_kf: 12                       # keyframes before the first optimiser step, which lands at +1
+  handover_kf: 12                     # keyframes served by the FALLBACK prior; must be >= warmup_kf
+  warmup_prior: omnidata              # 'omnidata' = upstream's prior | 'self' = the adapting VGGT
+  # schedule
+  adapt_style: wonline                # 'online' = the arrival alone | 'wonline' = a sliding window
+  steps_per_kf: 5                     # 5 passes x window 10 / batch 2
+                                      # = 25 steps per unit, the baseline
+  window_size: 10                     # 'wonline' ONLY
+  batch_size: 2                       # 'wonline' ONLY
+  lag: 5                              # keyframes back from the end the target is taken
+  # serving
+  ceil_ratio: 1.0                     # far-field ceiling on the SERVED depth (14):
+                                      # clamp at this x the frame median, warm-up
+                                      # branch included; 1.0 = off
+  ceil_target: false                  # true = clamp the TRAINING target at ceil_ratio too (14.6);
+                                      # refused at ceil_ratio 1.0, where it would do nothing
+  ped_ratio: null                     # far-field PEDESTAL on the SERVED depth (14.9): the served
+                                      # depth saturates at this x the frame's PRE-SHIFT median,
+                                      # applied AFTER the ceiling. null = off - NOT 1.0, which is
+                                      # a real pedestal; the two knobs' off values differ.
+  # sample construction
+  context_kf: 0                       # frames per VGGT forward minus one, TRAINING and SERVING
+  context_stride: 1                   # keyframes BETWEEN context frames; 1 =
+                                      # consecutive, the pre-knob behaviour
+                                      # both; 0 = monocular, the pre-knob behaviour exactly
+  # optimisation
+  lr: 1.0e-4                          # NOT 1e-4 - YAML reads that as a string
+  weight_decay: 0.0
+  grad_clip: 1.0
+  normalize_target: true              # THE VARIABLE: divide the target by the sample's gauge
+  gauge_clamp: 2.0                    # and stop depth_loss re-fitting a scale, so the loss
+  gauge_min_pixels: 256               # carries gradient about ABSOLUTE scale. Unread when
+  gauge_pose: false                   # gt TRANSLATIONS in the depth target's gauge, compared
+                                      # directly - VGGT's own camera term. Needs
+                                      # normalize_target and lambda_pose > 0
+                                      # normalize_target is false, but still validated
+  lambda_pose: 0.0                    # refused above 0 with normalize_target; inert at ctx0
+  coupled_scale: false                # required by lambda_cons, and
+                                      # numerically inert at ctx0
+  freeze_gauge: false                 # hold the pose gauge fixed for the whole unit
+                                      # instead of recomputing it every forward
+  anchor_kf: 0                        # off - normalize_target replaces it, and the two
+                                      # are refused together
+  depth_all_frames: false             # supervise depth on every frame of the sample
+                                      # under one shared scale; needs context_kf >= 1
+  lambda_cons: 0.0                    # off - it penalised inconsistency ON TOP of the
+                                      # scale invariance normalize_target removes outright
+  batch_scale: false                  # one scale over the WHOLE batch instead of
+                                      # one per sample; refused with coupled_scale
+  min_mask_pixels: 16
+  seed: 0
+  log_every: 5
+  # supervision mask (the same knobs ExtractConfig uses for depth_slam/)
+  mask_filter_thresh: 0.005
+  mask_min_count: 2
+  mask_min_disp_ratio: 0.5
+  # the loss gate: skip an arrival whose newest keyframe is not worth training on
+  gate_metric: raw                    # 'rel' = flat across a run | 'raw' = drifts with it
+  gate_lo: 0.0                      # 0 = off; skip BELOW this - the target already fits
+  gate_hi: 0.0                        # 0 = off; skip ABOVE this - the target is broken, not hard
+  gate_scope: arrival                 # 'arrival' = the band on the newest keyframe, once per unit | 'sample' = on every training sample
+  # the unit breaker: skip a unit whose whole window has gone bad (online/config.py)
+  breaker_k: 0.0                      # 0 = off; else > 1 - window median loss > k x the recent median
+  breaker_window: 100                 # untripped units the reference median spans
+  breaker_warmup: 40                  # units that only feed the reference
+  breaker_serve: adapted              # 'adapted' | 'base' - what the tracker is served while the breaker is tripped
+  # output
+  checkpoint_every_kf: 0              # 0 = off; N = a loadable adapter dir every N
+                                      # adapted keyframes
+
+# ---------------------------------------------------------------- what scores the arms
+end2end:
+  omni_normal_ckpt: pretrained_models/omnidata_dpt_normal_v2.ckpt
+  omni_normal_hw: [512, 512]

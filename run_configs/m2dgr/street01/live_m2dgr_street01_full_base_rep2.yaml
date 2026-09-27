@@ -1,0 +1,143 @@
+# M2DGR street_01, FULL SEQUENCE - keyframe_thresh test. FROZEN VGGT, REPEAT 2 at the default keyframe_thresh 4.0 - the noise floor every comparison below needs (street_01's
+# frozen arm is a single run). Elsewhere frozen VGGT repeated to +/-0.13 m (street_04) and +/-1.5 m (street_02).
+#
+#   python scripts/online_adapt_pipeline.py -c m2dgr/street01/live_m2dgr_street01_full_base_rep2
+#
+# WHY. Adapted runs keep fewer keyframes; does that cause their worse scale at corners, or is it the adapted prior?
+# street_01 so far: frozen VGGT 37.7 m ATE with 1,210 keyframes (single run); plain adaptation 35.3 +/- 2.6 m with
+# 903-911 keyframes (-25 %). The deficit starts as soon as adaptation starts (~-20 % in the first 150 m, before the maps
+# drift apart) and deepens as the adapted map shrinks more. At 11 corners, adapted runs lose more scale across a corner
+# (0.53 vs 0.36 log2) but not more rotation (2.5 vs 2.8 deg), and corner by corner the extra scale loss does NOT follow
+# the keyframe deficit (r -0.42).
+#
+# READ: keyframes (traj_kf.txt), ATE full and halves, map shrink along the route, and the corner scale / rotation
+# errors (job tmp kf_corners.py). If frozen VGGT with ~900 keyframes loses scale at corners like the adapted runs
+# (0.53 log2), the keyframe count matters; if it stays near 0.36, the adapted prior itself is the cause.
+#
+# Settings below: live_m2dgr_street01_full_gauge_ctx0_warmvggt with SCENE, CONFIG, STAGES, END2END_PRIORS and ONLINE_NAME changed.
+
+# ---------------------------------------------------------------- data (preprocessing is NOT here)
+SCENE: m2dgr_street01_a01fg1_rep2     # own outputs tree - see the header
+DATA: data/M2DGR/street_01            # preprocess_m2dgr.py's output layout
+COLORS: data/M2DGR/street_01/colors   # the four paths below are spelled out rather than derived
+DEPTHS: data/M2DGR/street_01/depths   # from DATA - change them together. Velodyne VLP-32C
+                                      # projected into the camera, uint16 / 256 = metres; unread
+                                      # by this driver, but check_sequence asserts it is 1:1 with
+                                      # colors, which is a free guard against a half-written
+                                      # preprocess
+GT_TRAJ: data/M2DGR/street_01/traj_tum.txt   # camera-to-world in a local ENU frame, RTK/INS with
+                                      # the 0.409 m body->camera lever arm applied
+CALIB: data/M2DGR/street_01/calib.txt # fx fy cx cy; distortion is removed from the IMAGES offline
+CONFIG: config/m2dgr_config.yaml      # keyframe_thresh 4.0 (default)
+DROID_WEIGHTS: pretrained_models/droid.pth
+UNDISTORT: false                      # already undistorted by the preprocess (10.1)
+CROP_BORDER: 0
+
+# ---------------------------------------------------------------- run control
+STAGES: [end2end]                     # reference arm only - no adapter is trained
+SKIP_EXISTING: true
+MIN_FREE_VRAM_MB: 20000               # VGGT runs at 1036 patch tokens per frame on this 4:3
+                                      # stream against KITTI's 444, so the 6.19 GiB training peak
+                                      # measured there does not hold; with a 3.7 GiB keyframe
+                                      # buffer on top, 20 GiB of a 24 GiB card is the honest ask
+GPU_WAIT_MIN: 480                     # minutes to WAIT for that much VRAM rather than refuse;
+                                      # 0 = refuse immediately. Polls every 60 s. Longer than the
+                                      # gate_01 arms because this run is ~6 h and worth queuing
+LENGTH: 100000
+START: 0
+STOP: null                            # THE WHOLE SEQUENCE: 15150 frames, 725 m (camera path), ends 323 m from its start; 15 camera gaps of up to ~1 s, 12 of them between 418 and 530 m (street_02 had 15 such gaps and tracked through them)
+STREAM_RES: 218240                    # 341 * 640, a pixel budget, not a shape (9.6). On this
+                                      # 640x480 source it resolves to a 400x536 stream - almost
+                                      # exactly KITTI's 256x848 = 217088 px, so the per-keyframe
+                                      # buffer cost carries over unchanged
+BUFFER: 2400                          # keyframe buffer, a HARD CAP - see the header for the estimate
+RENDER_EVAL: false                    # hi2.py's eval_rendering -> renders/ + psnr/ (11)
+
+# ---------------------------------------------------------------- names and lineage
+OUT_ROOT: outputs
+ONLINE_NAME: live_base_rep2           # unused (no online stage); unique
+ADAPT_INIT_NAME: null                 # an adapt experiment in this scene to CONTINUE from
+VGGT_HW: null                         # null = DERIVE from the stream's aspect. A 400x536 stream
+                                      # is 0.746, inside VGGT's trained band, so it maps to
+                                      # 392x518 with the field of view intact and nothing squashed
+
+# ---------------------------------------------------------------- reference arms (stage 2)
+END2END_PRIORS: [vggt_base]             # frozen VGGT only - Omnidata is not re-run
+SPLIT_AT: null                          # null = the whole run, so [unseen] is empty (12.2)
+
+# ---------------------------------------------------------------- the adapter structure
+lora:
+  weights: pretrained_models/vggt
+  rank: 8                             # the KITTI gauge family's rank, and gate_01's; kept so
+  alpha: 16                           # this stays a one-variable transfer test
+  targets: [attn.qkv, attn.proj, mlp.fc1, mlp.fc2]
+  patch_embed: false                  # false = adapt only the alternating-attention stack
+
+# ---------------------------------------------------------------- online adaptation (stage 1)
+online:
+  # warm-up: TWO gates - when the adapter starts LEARNING, and when it starts SERVING
+  warmup_kf: 12                       # keyframes before the first optimiser step, which lands at +1
+  handover_kf: 12                     # keyframes served by the FALLBACK prior; must be >= warmup_kf
+  warmup_prior: self                  # CHANGED from omnidata: the VGGT this run adapts,
+                                      # which is VGGT-base until the first optimiser
+                                      # step (LoRA B starts at zero) - see the header
+  # schedule
+  adapt_style: wonline                # 'online' = the arrival alone | 'wonline' = a sliding window
+  steps_per_kf: 5                     # 5 passes x window 10 / batch 2 = 25 steps per unit
+  window_size: 10                     # 'wonline' ONLY
+  batch_size: 2                       # 'wonline' ONLY
+  lag: 5                              # keyframes back from the end the target is taken
+  # serving
+  ceil_ratio: 1.0                     # far-field ceiling on the SERVED depth (14); 1.0 = off.
+                                      # OFF on purpose - the ceiling/pedestal family is a separate
+                                      # axis from adaptation and was explicitly scoped out
+  ceil_target: false                  # refused at ceil_ratio 1.0, where it would do nothing
+  ped_ratio: null                     # far-field PEDESTAL (14.9). null = off - NOT 1.0, which is
+                                      # a real pedestal; the two knobs' off values differ
+  # sample construction
+  context_kf: 0                       # ctx0: monocular and depth-only, the pre-knob behaviour
+  context_stride: 1                   # inert at context_kf 0
+  # optimisation
+  lr: 1.0e-4                          # NOT 1e-4 - YAML reads that as a string
+  weight_decay: 0.0
+  grad_clip: 1.0
+  normalize_target: true              # THE VARIABLE: divide the target by the sample's own gauge
+  gauge_clamp: 2.0                    # and hand depth_loss scale=1.0 instead of letting it fit
+  gauge_min_pixels: 256               # one, so the loss carries gradient about ABSOLUTE scale
+  gauge_pose: false                   # needs lambda_pose > 0; inert here
+  lambda_pose: 0.0                    # no pose. Also forced: config.py refuses lambda_pose > 0
+                                      # alongside normalize_target, and at context_kf 0 pose_loss
+                                      # returns zeros anyway, so 0.0 and 1.0 are identical here
+  coupled_scale: false                # required by lambda_cons; numerically inert at ctx0
+  freeze_gauge: false                 # hold the pose gauge fixed for the whole unit
+  anchor_kf: 0                        # off - normalize_target replaces it, and the two are
+                                      # refused together
+  depth_all_frames: false             # needs context_kf >= 1
+  lambda_cons: 0.0                    # off - it penalised inconsistency ON TOP of the scale
+                                      # invariance normalize_target removes outright
+  batch_scale: false                  # refused with coupled_scale
+  min_mask_pixels: 16
+  seed: 0
+  log_every: 5
+  # supervision mask (the same knobs ExtractConfig uses for depth_slam/)
+  mask_filter_thresh: 0.005
+  mask_min_count: 2
+  mask_min_disp_ratio: 0.5
+  # the loss gate: skip an arrival whose newest keyframe is not worth training on
+  gate_metric: raw                    # 'rel' = flat across a run | 'raw' = drifts with it
+  gate_lo: 0.0                        # 0 = off; skip BELOW this - the target already fits
+  gate_hi: 0.0                        # 0 = off; skip ABOVE this - the target is broken, not hard
+  gate_scope: arrival                 # 'arrival' = the band on the newest keyframe, once per unit | 'sample' = on every training sample
+  # the unit breaker: skip a unit whose whole window has gone bad (online/config.py)
+  breaker_k: 0.0                      # 0 = off; else > 1 - window median loss > k x the recent median
+  breaker_window: 100                 # untripped units the reference median spans
+  breaker_warmup: 40                  # units that only feed the reference
+  breaker_serve: adapted              # 'adapted' | 'base' - what the tracker is served while the breaker is tripped
+  # output
+  checkpoint_every_kf: 0              # 0 = off; N = a loadable adapter dir every N adapted
+                                      # keyframes
+
+# ---------------------------------------------------------------- what scores the arms
+end2end:
+  omni_normal_ckpt: pretrained_models/omnidata_dpt_normal_v2.ckpt
+  omni_normal_hw: [512, 512]

@@ -1,0 +1,167 @@
+# lr 5e5 at r16/a32 ctx2 lambda_pose 2 - HALF the 1.0e-4 every arm so far has run.
+#
+# WHY LR AND NOT MORE STEPS. The obvious reading of rank 16 underperforming was "more capacity
+# needs more epochs". The logs say the opposite. Inside one unit the target window is FIXED
+# (wonline: the same 10 keyframes shuffled into 25 steps), so loss-vs-step there IS a true
+# learning curve - and it is flat or rising:
+#
+#   run             s0     s8    s16    s24   last/first  last/BEST
+#   ctx0 r8       0.041  0.041  0.037  0.036     0.861      1.002
+#   r8  lp2       0.227  0.207  0.219  0.218     0.960      1.119
+#   r16 lp2 s0    0.404  0.376  0.403  0.406     1.004      1.163
+#   r16 lp2 s1    0.263  0.322  0.276  0.300     1.139      1.262
+#   r16 lp2 s2    0.201  0.163  0.147  0.183     0.910      1.326
+#
+# Twenty-five steps on a fixed window remove ~nothing, and last/BEST > 1 everywhere the pose term
+# is on: the final step is WORSE than the best step of the same unit. That is an optimiser
+# oscillating, not one running out of budget - so more steps have nothing to converge toward.
+#
+# And rank 16 is not under-trained. B is zero-initialised, so ||B|| is how far the adapter
+# travelled from identity: ctx0 1.044, r8 lp2 1.603, r16 lp2 2.342 (max 6.13). Rank 16 moves 46%
+# FURTHER than rank 8 while converging less. Capacity is being spent, not left idle.
+#
+# So the hypothesis this arm tests: the step size is too large for a target that moves. Halving or
+# decimating lr should let the adapter track the SLAM depth instead of chasing it.
+#
+# WHAT TO READ, AND IN WHICH ORDER.
+#   1 last/BEST inside a unit. Near 1.00 means the oscillation is gone - that is the direct test,
+#     and it is readable from train_log.json without caring about the ATE at all.
+#   2 ||B|| in the adapter. If it collapses toward ctx0's 1.044 the adapter has stopped moving and
+#     lr is now too small - the failure mode at the other end.
+#   3 ATE, LAST. A single run cannot settle it: three seeds of this exact configuration scored
+#     9.991 / 12.886 / 14.107, sd 2.114 m, range 4.115 m - which is 97% of the spread of the
+#     entire rank x lambda grid. So treat any ATE here as one draw from a 2 m-wide distribution,
+#     and do not rank it against another single run. The seed triplet's MEAN was 12.328, worse
+#     than omni's 11.403; that is the number a new lr has to beat, and beating it needs seeds.
+#
+# Everything else is the r16 lp2 run's config verbatim: rank 16 / alpha 32 (scaling 2.0), ctx2,
+# lambda_pose 2, coupled_scale true, wonline 5 steps / window 10 / batch 2, lag 5, no tail
+# transform, gate OFF.
+#
+#   python scripts/online_adapt_pipeline.py -c live_ctx2_r16_lp2_lr5e5
+
+# ---------------------------------------------------------------- data (preprocessing is NOT here)
+SCENE: kitti_00_fg2a05
+DATA: data/KITTI/00                   # preprocess_kitti.py's output layout
+COLORS: data/KITTI/00/colors          # the four paths below are spelled out rather than derived
+DEPTHS: null                          # from DATA - change them together. KITTI ships no GT depth
+GT_TRAJ: data/KITTI/00/traj_tum.txt
+CALIB: data/KITTI/00/calib.txt
+CONFIG: config/kitti_fg2_a05_config.yaml   # alpha 0.05 * far_gain 5 -> 0.05 near .. 0.25 far.
+                                      # config/kitti_config.yaml is upstream's flat 0.01
+DROID_WEIGHTS: pretrained_models/droid.pth
+UNDISTORT: false                      # undistort offline in the preprocess script instead (10.1)
+CROP_BORDER: 0
+
+# ---------------------------------------------------------------- run control
+STAGES: [online, end2end]
+SKIP_EXISTING: true
+MIN_FREE_VRAM_MB: 15000               # raise with BUFFER on a bigger card
+GPU_WAIT_MIN: 120                     # minutes to WAIT for that much VRAM instead of
+                                      # refusing; 0 = refuse immediately. Polls every 60 s
+LENGTH: 100000
+START: 0
+STOP: 1000                            # exclusive; null = to the end of the sequence
+STREAM_RES: 218240                    # 341 * 640 - a pixel budget, not a shape (9.6)
+BUFFER: 1500                          # keyframe buffer; a HARD CAP with no overflow guard. At
+                                      # ~2.5 MiB GPU + 4.8 MiB CPU per slot this is 6.1 + 11.6 GiB
+RENDER_EVAL: false                    # hi2.py's eval_rendering -> renders/ + psnr/ (11)
+
+# ---------------------------------------------------------------- names and lineage
+OUT_ROOT: outputs
+ONLINE_NAME: live_fg2a05_e5_w10_r16a32_w12_lag5_ctx2_lp2_lr5e5   # unique within its scene only
+ADAPT_INIT_NAME: null                 # an adapt experiment in this scene to CONTINUE from
+VGGT_HW: null                   # null = derive | [378, 518] TUM | [294, 518] Replica
+
+# ---------------------------------------------------------------- reference arms (stage 2)
+END2END_PRIORS: [omnidata, vggt_base, vggt_base@ctx2]   # [0] is the baseline column
+SPLIT_AT: null                          # null = the whole run, so [unseen] is empty (12.2)
+
+# ---------------------------------------------------------------- the adapter structure
+lora:
+  weights: pretrained_models/vggt
+  rank: 16                            # 8 -> 16: ~6.29 M -> ~12.6 M trainable
+  alpha: 32                           # MOVES WITH RANK - LoRALinear scales by
+                                      # alpha/rank (lora.py:18), so 32/16 keeps
+                                      # the 2.0 the rank-8 arms ran. Capacity is
+                                      # then the only variable.
+  targets: [attn.qkv, attn.proj, mlp.fc1, mlp.fc2]
+  patch_embed: false                  # false = adapt only the alternating-attention stack
+
+# ---------------------------------------------------------------- online adaptation (stage 1)
+online:
+  # warm-up: TWO gates - when the adapter starts LEARNING, and when it starts SERVING
+  warmup_kf: 12                       # keyframes before the first optimiser step, which lands at +1
+  handover_kf: 12                     # keyframes served by the FALLBACK prior; must be >= warmup_kf
+  warmup_prior: omnidata              # 'omnidata' = upstream's prior | 'self' = the adapting VGGT
+  # schedule
+  adapt_style: wonline                # 'online' = the arrival alone | 'wonline' = a sliding window
+  steps_per_kf: 5
+  window_size: 10                     # 'wonline' ONLY
+  batch_size: 2                       # 'wonline' ONLY
+  lag: 5                              # keyframes back from the end the target is taken
+  # serving
+  ceil_ratio: 1.0                     # far-field ceiling on the SERVED depth (14):
+                                      # clamp at this x the frame median, warm-up
+                                      # branch included; 1.0 = off
+  ceil_target: false                  # true = clamp the TRAINING target at ceil_ratio too (14.6);
+                                      # refused at ceil_ratio 1.0, where it would do nothing
+  ped_ratio: null                     # far-field PEDESTAL on the SERVED depth (14.9): the served
+                                      # depth saturates at this x the frame's PRE-SHIFT median,
+                                      # applied AFTER the ceiling. null = off - NOT 1.0, which is
+                                      # a real pedestal; the two knobs' off values differ.
+  # sample construction
+  context_kf: 2                       # frames per VGGT forward minus one, TRAINING and SERVING
+  context_stride: 1                   # keyframes BETWEEN context frames; 1 =
+                                      # consecutive, the pre-knob behaviour
+                                      # both -> S = 3. THE one change against live_default
+  # optimisation
+  lr: 5.0e-5                          # NOT 5e-5 - YAML 1.1 reads that as a
+                                      # STRING; the reader type-checks and
+                                      # would refuse it at parse time
+  weight_decay: 0.0
+  grad_clip: 1.0
+  normalize_target: false             # true = divide the target by the sample's own gauge
+  gauge_clamp: 2.0                    # and stop depth_loss re-fitting a scale, so the loss
+  gauge_min_pixels: 256               # carries gradient about ABSOLUTE scale. Unread when
+  gauge_pose: false                   # gt TRANSLATIONS in the depth target's gauge, compared
+                                      # directly - VGGT's own camera term. Needs
+                                      # normalize_target and lambda_pose > 0
+                                      # normalize_target is false, but still validated
+  lambda_pose: 2.0
+  coupled_scale: true
+  freeze_gauge: false                 # hold the pose gauge fixed for the whole unit
+                                      # instead of recomputing it every forward
+  anchor_kf: 0                        # keyframes from the start of the sequence that
+                                      # lambda_cons measures against; 0 = the batch
+  depth_all_frames: false             # supervise depth on every frame of the sample
+                                      # under one shared scale; needs context_kf >= 1
+  lambda_cons: 0.0                    # scale-consistency penalty; pulls each sample's
+                                      # own scale toward the batch consensus. 0 = off
+  batch_scale: false                  # one scale over the WHOLE batch instead of
+                                      # one per sample; refused with coupled_scale
+  min_mask_pixels: 16
+  seed: 0
+  log_every: 5
+  # supervision mask (the same knobs ExtractConfig uses for depth_slam/)
+  mask_filter_thresh: 0.005
+  mask_min_count: 2
+  mask_min_disp_ratio: 0.5
+  # the loss gate: skip an arrival whose newest keyframe is not worth training on
+  gate_metric: raw                    # 'rel' = flat across a run | 'raw' = drifts with it
+  gate_lo: 0.0                      # 0 = off; skip BELOW this - the target already fits
+  gate_hi: 0.0                        # 0 = off; skip ABOVE this - the target is broken, not hard
+  gate_scope: arrival                 # 'arrival' = the band on the newest keyframe, once per unit | 'sample' = on every training sample
+  # the unit breaker: skip a unit whose whole window has gone bad (online/config.py)
+  breaker_k: 0.0                      # 0 = off; else > 1 - window median loss > k x the recent median
+  breaker_window: 100                 # untripped units the reference median spans
+  breaker_warmup: 40                  # units that only feed the reference
+  breaker_serve: adapted              # 'adapted' | 'base' - what the tracker is served while the breaker is tripped
+  # output
+  checkpoint_every_kf: 0              # 0 = off; N = a loadable adapter dir every N
+                                      # adapted keyframes
+
+# ---------------------------------------------------------------- what scores the arms
+end2end:
+  omni_normal_ckpt: pretrained_models/omnidata_dpt_normal_v2.ckpt
+  omni_normal_hw: [512, 512]
