@@ -1,0 +1,10 @@
+inherit_from: config/m2dgr_config.yaml   # everything identical to the M2DGR preset - this file changes ONE knob
+#
+# keyframe_thresh 8.0 (default 4.0, from tum_config.yaml). A new keyframe is DROPPED online when its reprojected-flow
+# distance to the previous keyframe (0.3 x full flow + 0.7 x translation-only flow, averaged over every pixel through the
+# estimated depths) is below this AND its covisibility distance is below 0.1 (hard-coded in track_frontend.py). The same
+# threshold prunes too-close keyframes during initialisation. Higher = fewer keyframes.
+# Used by the street_01 keyframe test (2026-09-27): the adapted runs kept 906 keyframes against frozen VGGT's 1,210.
+Tracking:
+  frontend:
+    keyframe_thresh: 8.0

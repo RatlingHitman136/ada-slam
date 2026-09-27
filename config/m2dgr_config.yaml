@@ -1,0 +1,63 @@
+inherit_from: config/tum_config.yaml   # the real-sensor preset: mono_depth_alpha 0.01, pgba
+
+# M2DGR, RealSense d435i colour (the PINHOLE camera - the rig's other seven are 190-deg fisheyes).
+# 640x480 at ~14.4 Hz, 54.8 x 42.5 deg FoV, on a wheeled ground robot at ~0.8-1.2 m/s.
+#
+# The regime sits between TUM and KITTI and matches neither. Against KITTI: a tenth of the step
+# per frame (5-9 cm against 78), a much narrower FoV, scene depth of metres rather than tens of
+# metres, and real rotation - gate_01 spends 13.5% of its run driving in reverse. Against TUM:
+# outdoors, no ceiling, and depth running past 50 m. Treat every threshold below as INHERITED
+# rather than tuned; nothing here has been swept on this dataset.
+#
+# THE PRIOR WEIGHT IS UPSTREAM'S DEFAULT, deliberately. mono_depth_alpha 0.01 and
+# mono_depth_far_gain 1.0 (flat) are what tum_config.yaml sets, NOT the 0.05 / 2.0 the KITTI
+# campaign converged on. That setting was tuned against KITTI's far field - 100 m+ depth where BA
+# is weak and the prior is comparatively strong - and the argument does not transfer to a 55-deg
+# camera looking at a courtyard. Sweep it here separately if the prior turns out under-weighted;
+# config/kitti_fg2_a05_config.yaml is the template for how, and geom/ba.py's _report_alpha prints
+# alpha against the photometric Hessian for the first three JDSA solves.
+#
+# VGGT RUNS AT MORE TOKENS HERE THAN ON KITTI, but that turned out to cost little. The input size is
+# derived from the stream's aspect with the width pinned at 518 (adapt/config.py:vggt_hw_for): at 4:3
+# that is 392x518 = 28x37 = 1036 patch tokens per frame, against KITTI's 168x518 = 444, whose stream
+# is wider than VGGT's trained aspect band and so gets its height clamped.
+# MEASURED on the 4090 at 392x518 (VGGT-1B + rank-8 LoRA, bf16 autocast, gradient checkpointing, one
+# AdamW step): training peak 6.82 / 7.05 / 7.28 GiB at S = 1 / 2 / 3 frames, 339-370 ms a step;
+# serving 4.88-4.95 GiB at 88 / 102 / 130 ms. Against KITTI's 6.19 GiB and ~392 ms that is about 10%
+# more memory and the same step time, and adding context stays nearly flat in S. An earlier version
+# of this note predicted ~2.3x the memory and an attention-bound S^2 cost; the measurement says
+# otherwise. These are VGGT alone - the tracker, its keyframe buffer and the Omnidata normals model
+# share the same card.
+
+Tracking:
+  motion_filter:
+    skip_blur: False      # TUM sets this for handheld motion blur. This is a wheeled robot at
+                          # 5-9 cm per frame, so the 5-frame Laplacian cache would substitute
+                          # frames for no reason - the same argument KITTI makes. Worth
+                          # revisiting on the NIGHT sequences (gate_01 is one): the d435i's
+                          # auto-exposure lengthens in the dark and real smear becomes possible.
+  frontend:
+    mono_depth_alpha: 0.01    # upstream's default, inherited from the TUM preset; at Replica's
+                              # 0.001 the depth prior barely enters BA, which would make the
+                              # prior A/B a null by construction
+    mono_depth_far_gain: 1.0  # flat - the prior carries the same weight at every range
+  pgba:
+    active: False       # OFF, and for a different reason on each sequence prepared so far.
+                        # gate_01 returns to within 0.3 m of its start after 139 m and is within
+                        # 4.4 m of it by frame 2060, so it DOES close its loop inside the scored
+                        # window; pose-graph BA would there redistribute exactly the accumulated
+                        # scale error this campaign exists to measure, and the arms would be
+                        # scored on how well the loop closed rather than how little they drifted.
+                        # street_02 is the opposite case and the setting is simply inert: it never
+                        # revisits at all - zero pose pairs within 20 m that are more than 600
+                        # frames apart, in the scored window or in the full 1452 m sequence - so
+                        # there is nothing for PGBA to close either way. Set True only to study
+                        # the full system on a looping sequence; the drift numbers then stop being
+                        # comparable to the KITTI ones.
+
+opt_params:
+  position_lr_max_steps: 7000   # colour-refinement iterations. Kept ONLY because the refinement
+                                # also refines the keyframe poses (11.2) - the map is not a
+                                # deliverable here. TUM's 7000 is sized for ~1400 frames and
+                                # gate_01's scored window is 2060, so this is the same schedule at
+                                # roughly the same scale. Must be IDENTICAL across arms.

@@ -1,0 +1,18 @@
+inherit_from: config/m2dgr_config.yaml   # everything identical to the M2DGR preset - this file changes ONE knob
+
+# M2DGR with ONLINE LOOP CLOSURE (HI-SLAM2's pose-graph BA, "PGBA") switched on.
+#
+# m2dgr_config.yaml turns PGBA off on purpose, so drift is measured rather than how well a loop closes. That is right on
+# a route that never revisits itself (street_02), but on street_03 - which re-drives the same corridor, 80% of its frames
+# within 10 m of an earlier point - it leaves the scored ATE dominated by the one stretch the end-of-run global BA cannot
+# reach. Measured on frozen VGGT (2026-09-21): without PGBA ATE 7.13 m (repeat 7.19), the last 18 m expanded x0.32; with
+# PGBA 0.68 m and the end holds x1.03. Use this preset to ask whether online adaptation still helps once loop closure has
+# removed the drift. Compare it only against arms run with THIS preset.
+#
+# GPU memory: PGBA runs as a second process, and the end-of-run global BA on a heavily revisiting route is the peak of the
+# run. Two frozen street_03 runs ran out of memory in it on the 24 GB card; keep BUFFER close to the keyframes actually
+# kept, and export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True if it still does.
+
+Tracking:
+  pgba:
+    active: True          # overrides m2dgr_config.yaml's False; pgba_thresh etc. inherited from tum_config.yaml
