@@ -1,4 +1,4 @@
-a# Byte-compiled / optimized / DLL files
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -158,3 +158,6 @@ figures/*.pdf
 outputs
 *.safetensors
 pretrained_models/vggt/*
+
+# Claude Code worktrees and session notes
+.claude/
