@@ -20,6 +20,8 @@ setup(
                 'nvcc': ['-O3',
                     # CUDA 13 dropped Pascal/Volta: nvcc hard-errors on compute_60/61/70.
                     # Ada (RTX 40xx) is sm_89; the PTX line keeps forward compatibility.
+                    # Ampere (RTX 30xx / A40 / A6000, CC 8.6) needs its own SASS: compute_89 PTX cannot JIT down to 8.6.
+                    '-gencode=arch=compute_86,code=sm_86',
                     '-gencode=arch=compute_89,code=sm_89',
                     '-gencode=arch=compute_89,code=compute_89',
                 ]
@@ -48,6 +50,8 @@ setup(
                 'nvcc': ['-O2',
                     # CUDA 13 dropped Pascal/Volta: nvcc hard-errors on compute_60/61/70.
                     # Ada (RTX 40xx) is sm_89; the PTX line keeps forward compatibility.
+                    # Ampere (RTX 30xx / A40 / A6000, CC 8.6) needs its own SASS: compute_89 PTX cannot JIT down to 8.6.
+                    '-gencode=arch=compute_86,code=sm_86',
                     '-gencode=arch=compute_89,code=sm_89',
                     '-gencode=arch=compute_89,code=compute_89',
                 ]
