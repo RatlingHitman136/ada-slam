@@ -65,7 +65,10 @@ std::vector<torch::Tensor> ba_cuda(
     const int iterations,
     const float lm,
     const float ep,
-    const bool motion_only);
+    const bool motion_only,
+    torch::Tensor prior_disp,
+    torch::Tensor prior_w,
+    const bool use_prior);
 
 std::vector<torch::Tensor> pgba_cuda(
     torch::Tensor poses,
@@ -163,7 +166,46 @@ std::vector<torch::Tensor> ba(
   CHECK_INPUT(jj);
 
   return ba_cuda(poses, disps, intrinsics, targets, weights,
-                 eta, ii, jj, t0, t1, iterations, lm, ep, motion_only);
+                 eta, ii, jj, t0, t1, iterations, lm, ep, motion_only,
+                 torch::Tensor(), torch::Tensor(), false);
+
+}
+
+// ba() plus a per-pixel depth prior in the disparity block (DROID RGB-D style): prior_w > 0 replaces eta there
+// and pulls disps towards prior_disp; both are full video buffers shaped like disps.
+std::vector<torch::Tensor> ba_prior(
+    torch::Tensor poses,
+    torch::Tensor disps,
+    torch::Tensor intrinsics,
+    torch::Tensor targets,
+    torch::Tensor weights,
+    torch::Tensor eta,
+    torch::Tensor ii,
+    torch::Tensor jj,
+    const int t0,
+    const int t1,
+    const int iterations,
+    const float lm,
+    const float ep,
+    const bool motion_only,
+    torch::Tensor prior_disp,
+    torch::Tensor prior_w) {
+
+  CHECK_INPUT(targets);
+  CHECK_INPUT(weights);
+  CHECK_INPUT(poses);
+  CHECK_INPUT(disps);
+  CHECK_INPUT(intrinsics);
+  CHECK_INPUT(ii);
+  CHECK_INPUT(jj);
+  CHECK_INPUT(prior_disp);
+  CHECK_INPUT(prior_w);
+  TORCH_CHECK(prior_disp.sizes() == disps.sizes(), "prior_disp must be shaped like disps");
+  TORCH_CHECK(prior_w.sizes() == disps.sizes(), "prior_w must be shaped like disps");
+
+  return ba_cuda(poses, disps, intrinsics, targets, weights,
+                 eta, ii, jj, t0, t1, iterations, lm, ep, motion_only,
+                 prior_disp, prior_w, true);
 
 }
 
@@ -325,6 +367,7 @@ torch::Tensor depth_filter(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // bundle adjustment kernels
   m.def("ba", &ba, "bundle adjustment");
+  m.def("ba_prior", &ba_prior, "bundle adjustment with depth prior");
   m.def("pgba", &pgba, "pose graph bundle adjustment");
   m.def("proj_trans", &proj_trans, "projective transform");
   m.def("frame_distance", &frame_distance, "frame_distance");

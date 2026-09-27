@@ -1831,7 +1831,10 @@ std::vector<torch::Tensor> ba_cuda(
     const int iterations,
     const float lm,
     const float ep,
-    const bool motion_only)
+    const bool motion_only,
+    torch::Tensor prior_disp,
+    torch::Tensor prior_w,
+    const bool use_prior)
 {
   auto opts = poses.options();
   const int num = ii.size(0);
@@ -1900,7 +1903,19 @@ std::vector<torch::Tensor> ba_cuda(
     else {
       torch::Tensor C = accum_cuda(Cii, ii, kx);
       torch::Tensor w = accum_cuda(wi, ii, kx);
-      torch::Tensor Q = 1.0 / (C + eta.view({-1, ht*wd}));
+      torch::Tensor damp = eta.view({-1, ht*wd});
+      if (use_prior) {
+        // DROID RGB-D style depth prior inside the Schur complement: where prior_w > 0 the per-pixel weight
+        // replaces the eta damping and pulls the disparity towards prior_disp, so the prior reaches the pose solve.
+        torch::Tensor a = prior_w.index({kx, "..."}).view({-1, ht*wd});
+        torch::Tensor m = (a > 0).to(torch::kFloat32);
+        C = C + a + (1 - m) * damp;
+        w = w - a * (disps.index({kx, "..."}) - prior_disp.index({kx, "..."})).view({-1, ht*wd});
+      }
+      else {
+        C = C + damp;
+      }
+      torch::Tensor Q = 1.0 / C;
 
       torch::Tensor Ei = accum_cuda(Eii.view({num, 6*ht*wd}), ii, ts).view({t1-t0, 6, ht*wd});
       torch::Tensor E = torch::cat({Ei, Eij}, 0);
