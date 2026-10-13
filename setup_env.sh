@@ -10,7 +10,7 @@
 #
 # Knobs (environment variables):
 #   ADASLAM_VENV            venv location            (default: <repo>/.venv)
-#   TORCH_CUDA_ARCH_LIST    target GPU arch          (default: 8.9+PTX, i.e. RTX 40xx / Ada)
+#   TORCH_CUDA_ARCH_LIST    target GPU arch          (default: 8.6;8.9+PTX, i.e. RTX 30xx/A40 Ampere + RTX 40xx Ada)
 #   CUDA_MODULE             lmod module to load      (default: cuda/13.0.1)
 #
 # See new-udpate-env.md for why each piece is needed.
@@ -21,7 +21,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO"
 
 VENV="${ADASLAM_VENV:-$REPO/.venv}"
-export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9+PTX}"
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.6;8.9+PTX}"
 CUDA_MODULE="${CUDA_MODULE:-cuda/13.0.1}"
 
 WITH_WEIGHTS=0

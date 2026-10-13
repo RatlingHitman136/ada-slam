@@ -1,0 +1,15 @@
+inherit_from: config/m2dgr_config.yaml   # everything identical to the M2DGR preset - this file changes TWO knobs
+#
+# Depth prior INSIDE the bundle adjustment (DROID RGB-D style; droid_kernels.cu ba_cuda, droid.cpp ba_prior). Where the
+# prior is valid, ba_prior_alpha replaces the network's damping eta in the disparity block of the Schur complement and
+# alpha * (disp - prior) enters the disparity gradient, so the prior reaches the POSE solve - JDSA, which still runs
+# after every such BA, only moves disparities and dscales. Applied on the same calls as JDSA (use_mono: frontend
+# iters1 itr > 1, initialisation itr > 2); pgba and the backend stay prior-free.
+# ba_prior_mode 'aligned' = pull towards disps_prior x bilinear(dscales) (JDSA's target, in the map's scale);
+# 'raw' = towards disps_prior in the prior's own units (the DROID RGB-D snippet as written).
+# Alpha reference: JDSA's mono_depth_alpha is 0.01 here; DROID RGB-D uses 0.05. 0.1 = DOUBLE that: on street_01
+# aligned 0.05 won (adapting 35.3 -> 24.4 m) and 0.01 lost (40.8 m), so this asks whether the trend continues upward.
+Tracking:
+  frontend:
+    ba_prior_alpha: 0.1
+    ba_prior_mode: aligned

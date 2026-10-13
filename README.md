@@ -89,11 +89,11 @@ Useful knobs:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `TORCH_CUDA_ARCH_LIST` | `8.9+PTX` | Target GPU arch — `8.6+PTX` for A6000/3090, `9.0+PTX` for H100 |
+| `TORCH_CUDA_ARCH_LIST` | `8.6;8.9+PTX` | Target GPU arch — Ampere A40/A6000/3090 (8.6) + Ada (8.9) native, PTX for newer; `9.0+PTX` for H100 |
 | `ADASLAM_VENV` | `<repo>/.venv` | Where the venv is created |
 | `CUDA_MODULE` | `cuda/13.0.1` | lmod module to load when `nvcc` is not on `PATH` |
 
-On non-Ada GPUs, also change `compute_89` in `setup.py` and `patches/lietorch.patch`.
+`setup.py` and `patches/lietorch.patch` hard-code the same targets (sm_86 + sm_89 + compute_89 PTX); for another arch change the `-gencode` lines there too. PTX only JITs *up*, so an older card always needs its own `sm_XX` line.
 
 A CUDA toolkit (`nvcc`) is required to **build** the extensions, but not to run them — PyTorch
 ships its own CUDA runtime.

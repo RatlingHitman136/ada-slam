@@ -1,6 +1,6 @@
 # M2DGR street_01, FULL route (15,150 frames, 725 m), depth prior INSIDE BA (aligned, alpha 0.05): the Omnidata arm only.
 #
-#   python scripts/online_adapt_pipeline.py -c m2dgr/street01/live_m2dgr_street01_full_omni_baprior_aligned_a0p05
+#   sbatch scripts/train.sbatch m2dgr/street01/live_m2dgr_street01_full_omni_baprior_aligned_a0p05
 #
 # Needs a droid_backends build with ba_prior (droid.cpp) - built in place in the repo root.
 # The three configs of m2dgr_street01_baprior_aligned_a0p05 (omni / base / gauge_ctx0_warmvggt) share one outputs tree, write to

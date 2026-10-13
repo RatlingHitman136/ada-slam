@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=5
 #SBATCH --gres=gpu:1,VRAM:48G
-#SBATCH --constraint="GPU_CC:12.0|GPU_CC:9.0|GPU_CC:8.9"
+#SBATCH --constraint="GPU_CC:12.0|GPU_CC:9.0|GPU_CC:8.9|GPU_CC:8.6"
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
 #SBATCH --mail-type=ALL
